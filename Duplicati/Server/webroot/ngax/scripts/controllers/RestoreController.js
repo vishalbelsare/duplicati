@@ -27,8 +27,10 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
         var today     = dateStamp(now);
         var yesterday = dateStamp(new Date(new Date().setDate(now.getDate()   - 1)));
         var week      = dateStamp(new Date(new Date().setDate(now.getDate()   - 7)));
-        var thismonth = dateStamp(new Date(new Date().setMonth(now.getMonth() - 1)));
-        var lastmonth = dateStamp(new Date(new Date().setMonth(now.getMonth() - 2)));
+        // The months are calendar months, as the headings say. Counting a month back from
+        // the day instead would also land in the same month from the 29th to the 31st.
+        var thismonth = dateStamp(new Date(now.getFullYear(), now.getMonth(), 1));
+        var lastmonth = dateStamp(new Date(now.getFullYear(), now.getMonth() - 1, 1));
 
         var dateBuckets = [
             {text: gettextCatalog.getString('Today'), stamp: today},
@@ -83,9 +85,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
             },
 
             function(resp) {
-                var message = resp.statusText;
-                if (resp.data != null && resp.data.Message != null)
-                    message = resp.data.Message;
+                var message = AppService.responseErrorMessage(resp);
 
                 $scope.connecting = false;
                 $scope.ConnectionProgress = '';
@@ -112,9 +112,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
             $scope.connecting = false;
             $scope.ConnectionProgress = '';
 
-            var message = resp.statusText;
-            if (resp.data != null && resp.data.Message != null)
-                message = resp.data.Message;
+            var message = AppService.responseErrorMessage(resp);
             DialogService.dialog(gettextCatalog.getString('Error'), gettextCatalog.getString('Failed to fetch path information: {{message}}', { message: message }));
         };
 
@@ -124,7 +122,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
                 $scope.ConnectionProgress = gettextCatalog.getString('Fetching path information …');
                 inProgress[version] = true;
 
-                AppService.post('/backup/' + $scope.BackupID + '/repairupdate', { 'only-paths': true, 'time': filesetStamps[version + '']}).then(
+                AppService.postJson('/backup/' + $scope.BackupID + '/repairupdate', { 'only_paths': true, 'time': filesetStamps[version + '']}).then(
                     function(resp) {
 
                         var taskid = resp.data.ID;
@@ -163,7 +161,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
                 $scope.ConnectionProgress = gettextCatalog.getString('Fetching path information …');
                 inProgress[version] = true;
 
-                AppService.get('/backup/' + $scope.BackupID + '/files/*?prefix-only=true&folder-contents=false&time=' + encodeURIComponent(stamp)).then(
+                AppService.get('/backup/' + $scope.BackupID + '/files?prefix-only=true&folder-contents=false&time=' + encodeURIComponent(stamp)).then(
                     function(resp) {
                         delete inProgress[version];
                         $scope.connecting = false;
@@ -223,7 +221,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
         var version = $scope.RestoreVersion + '';
         var stamp = filesetStamps[version];
 
-        AppService.get('/backup/' + $scope.BackupID + '/files/*' + $scope.SearchFilter + '*?prefix-only=false&time=' + encodeURIComponent(stamp) + '&filter=*' + encodeURIComponent($scope.SearchFilter) + '*').then(
+        AppService.get('/backup/' + $scope.BackupID + '/files?prefix-only=false&time=' + encodeURIComponent(stamp) + '&filter=*' + encodeURIComponent($scope.SearchFilter) + '*').then(
             function(resp) {
                 $scope.Searching = false;
                 var searchNodes = [];
@@ -246,6 +244,10 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
                         if (cp.indexOf(compareablePath(sn.Path)) == 0) {
                             var curpath = sn.Path;
                             var parts = p.substr(sn.Path.length).split(dirsep);
+                            // Remove empty part if path had dirsep at end
+                            if (parts[parts.length - 1].length == 0) {
+                                parts.pop();
+                            }
                             var col = sn;
 
                             for(var k in parts) {
@@ -261,6 +263,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
                                     if (compareablePath(col.Children[m].Path) == compareablePath(curpath)) {
                                         found = true;
                                         col = col.Children[m];
+                                        break;
                                     }
                                 }
 
@@ -286,9 +289,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
             },
             function(resp) {
                 $scope.Searching = false;
-                var message = resp.statusText;
-                if (resp.data != null && resp.data.Message != null)
-                    message = resp.data.Message;
+                var message = AppService.responseErrorMessage(resp);
 
                 $scope.connecting = false;
                 $scope.ConnectionProgress = '';
@@ -325,9 +326,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
         $scope.restore_step = 2;
 
         function handleError(resp) {
-            var message = resp.statusText;
-            if (resp.data != null && resp.data.Message != null)
-                message = resp.data.Message;
+            var message = AppService.responseErrorMessage(resp);
 
             $scope.restore_step = 1;
             $scope.connecting = false;
@@ -337,7 +336,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
 
         var p = {
             'time': stamp,
-            'restore-path': $scope.RestoreLocation == 'custom' ? $scope.RestorePath : null,
+            'restore_path': $scope.RestoreLocation == 'custom' ? $scope.RestorePath : null,
             'overwrite': $scope.RestoreMode == 'overwrite',
             'permissions': $scope.RestorePermissions == null ? false : $scope.RestorePermissions,
             'passphrase' : $scope.passphrase
@@ -364,9 +363,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
             }
         }
 
-        if (paths.length > 0)
-            p.paths = JSON.stringify(paths);
-
+        p.paths = paths;
         if ($scope.IsBackupTemporary) {
 
             $scope.connecting = true;
@@ -386,7 +383,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
                             {
                                 AppService.post('/backup/' + backupid + '/restore', p).then(function(resp) {
                                     $scope.ConnectionProgress = gettextCatalog.getString('Restoring files …');
-                                    var t2 = $scope.taskid = resp.data.TaskID;
+                                    var t2 = $scope.taskid = resp.data.ID;
                                     ServerStatus.callWhenTaskCompletes(t2, function() { $scope.onRestoreComplete(t2); });
                                 }, handleError);
                             }
@@ -408,7 +405,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
             $scope.ConnectionProgress = gettextCatalog.getString('Starting the restore process …');
             AppService.post('/backup/' + $scope.BackupID + '/restore', p).then(function(resp) {
                 $scope.ConnectionProgress = gettextCatalog.getString('Restoring files …');
-                var t2 = $scope.taskid = resp.data.TaskID;
+                var t2 = $scope.taskid = resp.data.ID;
                 ServerStatus.callWhenTaskCompletes(t2, function() { $scope.onRestoreComplete(t2); });
             }, handleError);
         }
@@ -428,9 +425,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
                 DialogService.dialog(gettextCatalog.getString('Error'), gettextCatalog.getString('Failed to restore files: {{message}}', { message: resp.data.ErrorMessage }));
             }
         }, function(resp) {
-            var message = resp.statusText;
-            if (resp.data != null && resp.data.Message != null)
-                message = resp.data.Message;
+            var message = AppService.responseErrorMessage(resp);
 
             $scope.restore_step = 1;
             $scope.connecting = false;
@@ -453,7 +448,7 @@ backupApp.controller('RestoreController', function ($rootScope, $scope, $routePa
             return false;
         }
 
-        if (!'IsUnencryptedOrPassphraseStored' in this.Backup) {
+        if (!('IsUnencryptedOrPassphraseStored' in this.Backup)) {
             return false;
         }
 

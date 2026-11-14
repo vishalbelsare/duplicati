@@ -3,7 +3,9 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
     restrict: 'E',
     scope: {
         uri: '=uri',
-        setBuilduriFn: '&'
+        backupId: '=backupId',
+        setBuilduriFn: '&',
+        hide: '&?'
     },
     templateUrl: 'templates/edituri.html',
     controller: function($scope, AppService, AppUtils, SystemInfo, EditUriBackendConfig, DialogService, EditUriBuiltins) {
@@ -32,7 +34,6 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
 
             var hasTriedCreate = false;
             var hasTriedCert = false;
-            var hasTriedMozroots = false;
             var hasTriedHostkey = false;
             var dlg = null;
 
@@ -41,8 +42,8 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
                 if (dlg != null)
                     dlg.dismiss();
 
-                dlg = DialogService.dialog(gettextCatalog.getString('Testing ...'), gettextCatalog.getString('Testing connection ...'), [], null, function() {
-                    AppService.post('/remoteoperation/test', uri).then(function() {
+                dlg = DialogService.dialog(gettextCatalog.getString('Testing …'), gettextCatalog.getString('Testing connection …'), [], null, function() {
+                    AppService.postJson('/remoteoperation/test', { path: uri, backupId: scope.backupId }).then(function() {
                         scope.Testing = false;
                         dlg.dismiss();
 
@@ -61,7 +62,7 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
             var createFolder = function() {
                 hasTriedCreate = true;
                 scope.Testing = true;
-                AppService.post('/remoteoperation/create', uri).then(testConnection, handleError);
+                AppService.postJson('/remoteoperation/create', { path: uri }).then(testConnection, handleError);
             };
 
             var appendApprovedCert = function(hash)
@@ -118,7 +119,7 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
                 if (dlg != null)
                     dlg.dismiss();
 
-                var message = data.statusText;
+                var message = AppService.responseErrorMessage(data);
 
                 if (!hasTriedCreate && message == 'missing-folder')
                 {
@@ -144,48 +145,7 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
                         return;                         
                     }
 
-                    if ($scope.SystemInfo.MonoVersion != null && !hasTriedMozroots) {
-                        
-                        hasTriedMozroots = true;
-
-                        AppService.post('/webmodule/check-mono-ssl', {'mono-ssl-config': 'List'}).then(function(data) {
-                            if (data.data.Result.count == 0) {
-                                if (confirm(gettextCatalog.getString('You appear to be running Mono with no SSL certificates loaded.\nDo you want to import the list of trusted certificates from Mozilla?')))
-                                {
-                                    scope.Testing = true;
-                                    AppService.post('/webmodule/check-mono-ssl', {'mono-ssl-config': 'Install'}).then(function(data) {
-                                        scope.Testing = false;
-                                        if (data.data.Result.count == 0) {
-                                            DialogService.dialog(gettextCatalog.getString('Import failed'), gettextCatalog.getString('Import completed, but no certificates were found after the import'));
-                                        } else {
-                                            testConnection();
-                                        }
-                                    }, function(resp) {
-
-                                        scope.Testing = false;
-                                        message = resp.statusText;
-                                        if (data.data != null && data.data.Message != null)
-                                            message = data.data.Message;
-                                        
-                                        DialogService.dialog(gettextCatalog.getString('Error'), gettextCatalog.getString('Failed to import: ') + message);
-
-                                    });
-                                }
-                                else
-                                {
-                                    askApproveCert(hash);
-                                }
-                            } else {
-                                askApproveCert(hash);
-                            }
-
-                        }, AppUtils.connectionError);
-
-                    }
-                    else
-                    {
-                        askApproveCert(hash);
-                    }
+                    askApproveCert(hash);
                 }
                 else if (!hasTriedHostkey && message.indexOf('incorrect-host-key:') == 0)
                 {
@@ -244,6 +204,7 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
         }
 
         $scope.testConnection = function() {
+            console.log(scope);
             builduri(performConnectionTest);
         };
 
@@ -273,6 +234,8 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
             for(var n in scope.Backend.Options)
                 if (scope.Backend.Options[n].Name == 'use-ssl')
                     scope.SupportsSSL = true;
+
+            console.log('Backend changed to: ' + scope.Backend.Key, scope.SupportsSSL);
 
             scope.TemplateUrl = EditUriBackendConfig.templates[scope.Backend.Key];
             if (scope.TemplateUrl == null)
@@ -308,16 +271,15 @@ backupApp.directive('backupEditUri', function(gettextCatalog) {
 
                     if (hasssl) {
                         scope.Backend = bk;
-                        parts['--use-ssl'] = true;
+                        parts['--use-ssl'] = 'true';
                         break;
                     }
                 }
             }
 
-
             scope.Username = parts['--auth-username'];
             scope.Password = parts['--auth-password'];
-            scope.UseSSL = parts['--use-ssl'];
+            scope.UseSSL = AppUtils.parseBoolString(parts['--use-ssl']);
             scope.Port = parts['server-port'];
             scope.Server = parts['server-name'];
             scope.Path = parts['server-path'];

@@ -1,0 +1,1534 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using CoCoL;
+using Duplicati.Library.Common.IO;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Main.Database.Local;
+using Duplicati.Library.Utility;
+
+#nullable enable
+
+namespace Duplicati.Library.Main.Operation.Restore
+{
+
+    /// <summary>
+    /// Process that handles each file that needs to be restored. It starts by
+    /// identifying the blocks that need to be restored. Then it verifies the
+    /// which of the target file blocks are missing. Then it checks whether it
+    /// can use local blocks to restore the file. Finally, it restores the file
+    /// by downloading the missing blocks and writing them to the target file.
+    /// It also verifies the file hash and truncates the file if necessary.
+    /// If enabled, it also restores the metadata for the file.
+    /// </summary>
+    internal class FileProcessor
+    {
+        /// <summary>
+        /// The log tag for this class.
+        /// </summary>
+        private static readonly string LOGTAG = Logging.Log.LogTagFromType<FileProcessor>();
+        /// <summary>
+        /// The number of file processors that are still restoring files. It is set by the <see cref="RestoreHandler"/>.
+        /// </summary>
+        public static int file_processors_restoring_files;
+        public static object file_processor_continue_lock = new object();
+        public static TaskCompletionSource file_processor_continue = new();
+
+        /// <summary>
+        /// The number of file processors that have not yet reached the symbolic links to folders
+        /// with entries restored below them, which are sent last. It is set by the <see cref="RestoreHandler"/>.
+        /// </summary>
+        public static int file_processors_before_folder_links;
+        public static object folder_links_continue_lock = new object();
+        public static TaskCompletionSource folder_links_continue = new();
+        /// <summary>
+        /// Makes the symbolic links to folders with entries restored below them one at a time.
+        /// Such a link may lie below another, and making one while the other is replaced would
+        /// find its path missing.
+        /// </summary>
+        private static readonly SemaphoreSlim folder_links_one_at_a_time = new(1, 1);
+
+        /// <summary>
+        /// Synchronization for priority files processing.
+        /// FileProcessors wait until all priority files have been processed.
+        /// </summary>
+        public static int priority_files_remaining;
+        public static object priority_files_lock = new object();
+        public static TaskCompletionSource priority_files_completed = new();
+
+        /// <summary>
+        /// Faults the priority-file barrier if the given file is a priority file.
+        /// The barrier is only signaled on the success path, so a priority file that
+        /// fails terminally would otherwise leave the other processors waiting for it
+        /// forever, stalling the restore instead of failing with the real error.
+        /// The processors waiting on the barrier end the restore with its error, so the
+        /// error says that the restore stopped because of this file, and keeps the file's
+        /// own error as the inner exception.
+        /// </summary>
+        /// <param name="file">The file that failed.</param>
+        /// <param name="ex">The error that caused the failure.</param>
+        private static void FaultPriorityBarrierIfPriorityFile(FileRequest file, Exception ex)
+        {
+            if (!file.IsPriorityFile)
+                return;
+
+            var error = new UserInformationException(
+                $"The restore was stopped because the file \"{file.TargetPath}\", which has to be restored before the other files, could not be restored: {ex.Message}",
+                "RestorePriorityFileFailed",
+                ex);
+
+            lock (priority_files_lock)
+                priority_files_completed.TrySetException(error);
+        }
+        /// <summary>
+        /// The current file processor ID. Used for debugging.
+        /// </summary>
+        private static int processor_id = -1;
+
+        /// <summary>
+        /// Runs the file processor process that restores the files that need to be restored.
+        /// </summary>
+        /// <param name="channels">The named channels for the restore operation.</param>
+        /// <param name="db">The restore database, which is queried for blocks, corresponding volumes and metadata for the files.</param>
+        /// <param name="block_request">The channel to request blocks from the block manager.</param>
+        /// <param name="block_response">The channel to receive blocks from the block manager.</param>
+        /// <param name="options">The restore options.</param>
+        /// <param name="results">The restore results.</param>
+        /// <param name="modules">The loaded generic modules, used to dispatch restore callbacks. May be null.</param>
+        public static Task RunAsync(Channels channels, LocalRestoreDatabase db, IChannel<BlockRequest> block_request, IChannel<Task<DataBlock>> block_response, IRestoreDestinationProvider restoreDestination, Options options, RestoreResults results, IEnumerable<IGenericModule>? modules)
+        {
+            return AutomationExtensions.RunTask(
+            new
+            {
+                Input = channels.FilesToRestore.AsRead()
+            },
+            async self =>
+            {
+                Stopwatch? sw_file = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_block = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_meta = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_req = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_resp = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_verify_target = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_retarget = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_notify_local = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_verify_local = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_empty_file = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_hash = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_read = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_write = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_results = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_work_meta = options.InternalProfiling ? new() : null;
+
+                // Indicates whether this FileProcessor is still restoring files
+                var decremented = false;
+                // Indicates whether this FileProcessor has reached the symbolic links to folders
+                // with entries restored below them
+                var reached_folder_links = false;
+                // Indicates whether this FileProcessor is holding the turn to make such a link
+                var making_folder_link = false;
+                // ID for this file processor, used for debugging.
+                var my_id = Interlocked.Increment(ref processor_id);
+
+                // The file currently being restored, tracked so a terminal failure
+                // of a priority file can fault the priority barrier
+                FileRequest? current_file = null;
+
+                try
+                {
+                    using var filehasher = HashFactory.CreateHasher(options.FileHashAlgorithm);
+                    using var blockhasher = HashFactory.CreateHasher(options.BlockHashAlgorithm);
+                    var buffer = new byte[options.Blocksize];
+
+                    while (true)
+                    {
+                        if (making_folder_link)
+                        {
+                            folder_links_one_at_a_time.Release();
+                            making_folder_link = false;
+                        }
+
+                        // Get the next file to restore.
+                        sw_file?.Start();
+                        var file = await self.Input.ReadAsync().ConfigureAwait(false);
+                        sw_file?.Stop();
+                        current_file = file;
+
+                        // A stop means "finish the current file and stop", so the check sits at
+                        // the top of the loop: whatever was being restored when the stop arrived
+                        // has already completed, and this file is not started. Files still sitting
+                        // in the channel buffer are dropped for the same reason.
+                        //
+                        // Returning is enough to wind the network down: the finally below retires
+                        // the block channels and releases the folder-metadata barrier, which is
+                        // the same path retirement takes.
+                        if (results.TaskControl.StopToken.IsCancellationRequested)
+                        {
+                            Logging.Log.WriteVerboseMessage(LOGTAG, "StoppedProcess", null, "{0} File processor stopped", my_id);
+                            return;
+                        }
+
+                        // Check if this is a priority file and wait for all priority files to complete before processing non-priority files
+                        if (!await WaitForPriorityFilesIfNeededAsync(file, modules, results.TaskControl).ConfigureAwait(false))
+                        {
+                            Logging.Log.WriteVerboseMessage(LOGTAG, "StoppedProcess", null, "{0} File processor stopped while waiting for the priority files", my_id);
+                            return;
+                        }
+
+                        Logging.Log.WriteExplicitMessage(LOGTAG, "FileRestored", null, "{0} Restoring file {1}", my_id, file.TargetPath);
+
+                        // Alternate data streams, folder metadata and symbolic links to folders with
+                        // entries restored below them are restored only after all main file content
+                        // has been restored.
+                        // We rendezvous with all other processors to guarantee the main content is complete.
+                        if ((file.BlocksetID == LocalDatabase.FOLDER_BLOCKSET_ID && !options.SkipMetadata) || file.IsAlternateDataStream || file.HasRestoredEntriesBelow)
+                        {
+                            // Check if there are other FileProcessor's still restoring files
+                            if (!decremented)
+                            {
+                                if (file_processors_restoring_files <= 0 && !file_processor_continue.Task.IsCompleted)
+                                    file_processor_continue.SetResult();
+                                else
+                                    await RendezvousBeforeProcessingFolderMetadataAsync()
+                                        .ConfigureAwait(false);
+                                decremented = true;
+                            }
+
+                            // A symbolic link with entries restored below it also waits for the
+                            // folder metadata and the alternate data streams, which may be among them
+                            if (file.HasRestoredEntriesBelow)
+                            {
+                                if (!reached_folder_links)
+                                {
+                                    await RendezvousBeforeFolderLinksAsync().ConfigureAwait(false);
+                                    reached_folder_links = true;
+
+                                    if (results.TaskControl.StopToken.IsCancellationRequested)
+                                    {
+                                        Logging.Log.WriteVerboseMessage(LOGTAG, "StoppedProcess", null, "{0} File processor stopped while waiting to make the links to folders", my_id);
+                                        return;
+                                    }
+                                }
+
+                                // Such links are made one at a time, as one may lie below another
+                                await folder_links_one_at_a_time.WaitAsync(results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                making_folder_link = true;
+                            }
+
+                            if (file.BlocksetID == LocalDatabase.FOLDER_BLOCKSET_ID)
+                            {
+                                if (!options.SkipMetadata)
+                                    await RestoreMetadataAsync(db, file, restoreDestination, block_request, block_response, options, sw_meta, sw_work_meta, sw_req, sw_resp, results.TaskControl.ProgressToken)
+                                        .ConfigureAwait(false);
+
+                                continue;
+                            }
+
+                            // ADS stream or link with entries below it: fall through to normal file
+                            // restoration now that the host, or what is restored below the link, is restored.
+                        }
+
+                        // Get information about the blocks for the file
+                        // TODO rather than keeping all of the blocks in memory, we could do a single pass over the blocks using a cursor, only keeping the relevant block requests in memory. Maybe even only a single block request at a time.
+                        sw_block?.Start();
+                        var blocks = await db
+                            .GetBlocksFromFileAsync(file.BlocksetID, results.TaskControl.ProgressToken)
+                            .ToArrayAsync(results.TaskControl.ProgressToken)
+                            .ConfigureAwait(false);
+                        sw_block?.Stop();
+
+                        sw_work_verify_target?.Start();
+                        // Verify the target file blocks that may already exist.
+                        long bytes_verified;
+                        List<BlockRequest> missing_blocks, verified_blocks;
+                        bool target_differs, target_truncated;
+                        try
+                        {
+                            (bytes_verified, missing_blocks, verified_blocks, target_differs, target_truncated) = await VerifyTargetBlocksAsync(file, restoreDestination, blocks, filehasher, blockhasher, buffer, options, results, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                        }
+                        // Now that the reads observe the token, a shutdown reaches this handler.
+                        // Letting it through matters twice over: continuing would carry on with
+                        // the next file after being told to stop, and it would report the
+                        // interruption as an error against the target file.
+                        catch (Exception ex) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                        {
+                            Logging.Log.WriteErrorMessage(LOGTAG, "VerifyTargetBlocks", ex, "Error during checking the target file");
+                            FaultPriorityBarrierIfPriorityFile(file, ex);
+                            await ReleaseUnusedBlocksAsync(db, file, [.. blocks], 0, 0, block_request, block_response, options, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                            continue;
+                        }
+                        long bytes_written = 0;
+                        sw_work_verify_target?.Stop();
+                        if (blocks.Length != missing_blocks.Count + verified_blocks.Count)
+                        {
+                            var error = $"Block count mismatch for {file.TargetPath} - expected: {blocks.Length}, actual: {missing_blocks.Count + verified_blocks.Count}";
+                            lock (results)
+                            {
+                                results.BrokenLocalFiles.Add(file.TargetPath);
+                            }
+                            Logging.Log.WriteErrorMessage(LOGTAG, "BlockCountMismatch", null, error);
+                            FaultPriorityBarrierIfPriorityFile(file, new InvalidOperationException(error));
+                            await ReleaseUnusedBlocksAsync(db, file, [.. blocks], 0, 0, block_request, block_response, options, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                            continue;
+                        }
+
+                        sw_work_retarget?.Start();
+                        // Check if the target file needs to be retargeted
+                        if ((missing_blocks.Count > 0 || target_differs) && !options.Overwrite && await restoreDestination.FileExists(file.TargetPath, results.TaskControl.ProgressToken).ConfigureAwait(false))
+                        {
+                            var new_name = await GenerateNewNameAsync(file, db, restoreDestination, filehasher, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                            if (await restoreDestination.FileExists(new_name, results.TaskControl.ProgressToken).ConfigureAwait(false))
+                            {
+                                // The file already exists, which it only does when it matches the target hash. So we can skip the file.
+                                Logging.Log.WriteInformationMessage(LOGTAG, "FileAlreadyExists", "File {0} already exists and matches the target hash as a copy: {1}", file.TargetPath, new_name);
+                                // The copy holds the missing blocks too, so they are released
+                                // below along with the ones found in the target file.
+                                verified_blocks.AddRange(missing_blocks);
+                                missing_blocks.Clear();
+                            }
+                            else
+                            {
+                                Logging.Log.WriteVerboseMessage(LOGTAG, "RetargetingFile", "Retargeting file {0} to {1}", file.TargetPath, new_name);
+                                var new_file = new FileRequest(
+                                    ID: file.ID,
+                                    OriginalPath: file.OriginalPath,
+                                    TargetPath: new_name,
+                                    Hash: file.Hash,
+                                    Length: file.Length,
+                                    BlocksetID: file.BlocksetID,
+                                    HasRestoredEntriesBelow: file.HasRestoredEntriesBelow,
+                                    IsPriorityFile: file.IsPriorityFile,
+                                    IsAlternateDataStream: file.IsAlternateDataStream,
+                                    Version: file.Version,
+                                    BackupTimestamp: file.BackupTimestamp);
+                                if (options.UseLocalBlocks)
+                                {
+                                    if (options.Dryrun)
+                                    {
+                                        Logging.Log.WriteDryrunMessage(LOGTAG, "DryrunRestore", @$"Would have copied {verified_blocks.Count} blocks ({verified_blocks.Count * options.Blocksize} bytes) from ""{file.TargetPath}"" to ""{new_file.TargetPath}""");
+                                    }
+                                    else
+                                    {
+                                        try
+                                        {
+                                            await CopyOldTargetBlocksToNewTargetAsync(file, new_file, restoreDestination, buffer, options.Blocksize, verified_blocks, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                        }
+                                        // Swallowing a requested shutdown here would carry on with
+                                        // the rest of the file instead of stopping, so the filter
+                                        // lets it through to the handler that ends the process.
+                                        catch (Exception ex) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                                        {
+                                            Logging.Log.WriteErrorMessage(LOGTAG, "CopyOldTargetToNew", ex, "Error when trying to copy {0} to {1}", file, new_file);
+                                            // The list is shared by the file processors and is not
+                                            // safe for concurrent use, so it takes the same lock as
+                                            // the other places that add to it.
+                                            lock (results)
+                                            {
+                                                results.BrokenLocalFiles.Add(file.TargetPath);
+                                            }
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    verified_blocks.Clear();
+                                    missing_blocks = [.. blocks.Select(x => { x.RequestType = BlockRequestType.Download; return x; })];
+                                }
+                                file = new_file;
+                            }
+                        }
+                        sw_work_retarget?.Stop();
+
+                        sw_work_notify_local?.Start();
+                        // Notify to the cache that we use local blocks.
+                        foreach (var block in verified_blocks)
+                        {
+                            sw_req?.Start();
+                            await block_request.WriteAsync(
+                                new BlockRequest(
+                                    block.BlockID,
+                                    block.BlockOffset,
+                                    block.BlockHash,
+                                    block.BlockSize,
+                                    block.VolumeID,
+                                    BlockRequestType.CacheEvict
+                                )
+                            ).ConfigureAwait(false);
+                            sw_req?.Stop();
+                        }
+                        sw_work_notify_local?.Stop();
+
+                        sw_work_verify_local?.Start();
+                        if (missing_blocks.Count > 0 && options.UseLocalBlocks)
+                        {
+                            // Verify the local blocks at the original restore path that may be used to restore the file.
+                            (bytes_written, missing_blocks) = await VerifyLocalBlocksAsync(file, restoreDestination, missing_blocks, blocks.Length, filehasher, blockhasher, buffer, options, results, block_request, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                        }
+                        sw_work_verify_local?.Stop();
+
+                        bool empty_file_or_symlink = false;
+                        if (file.BlocksetID != LocalDatabase.SYMLINK_BLOCKSET_ID && (blocks.Length == 0 || (blocks.Length == 1 && blocks[0].BlockSize == 0)))
+                        {
+                            sw_work_empty_file?.Start();
+                            empty_file_or_symlink = true;
+                            if (options.Dryrun)
+                            {
+                                Logging.Log.WriteDryrunMessage(LOGTAG, "DryrunRestore", @$"Would have created empty file ""{file.TargetPath}""");
+                            }
+                            else
+                            {
+                                var foldername = SystemIO.IO_OS.PathGetDirectoryName(file.TargetPath);
+                                try
+                                {
+                                    if (await restoreDestination.CreateFolderIfNotExists(foldername, results.TaskControl.ProgressToken).ConfigureAwait(false))
+                                        Logging.Log.WriteVerboseMessage(LOGTAG, "CreateMissingFolder", @$"Creating missing folder ""{foldername}"" for file ""{file.TargetPath}""");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Logging.Log.WriteErrorMessage(LOGTAG, "CreateMissingFolder", ex, @$"Error when trying to create missing folder ""{foldername}"" for file ""{file.TargetPath}""");
+                                }
+
+                                // Create an empty file, or truncate to 0
+                                try
+                                {
+                                    using var fs = await restoreDestination.OpenWrite(file.TargetPath, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                    fs.SetLength(0);
+                                }
+                                // A stop or an abort is let through, as the file did not fail to
+                                // restore in any sense the user needs told.
+                                catch (Exception ex) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                                {
+                                    lock (results)
+                                    {
+                                        results.BrokenLocalFiles.Add(file.TargetPath);
+                                    }
+                                    Logging.Log.WriteErrorMessage(LOGTAG, "CreateEmptyFile", ex, "Error when creating empty file {0}", file.TargetPath);
+                                    FaultPriorityBarrierIfPriorityFile(file, ex);
+                                    await ReleaseUnusedBlocksAsync(db, file, missing_blocks, 0, 0, block_request, block_response, options, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                    continue;
+                                }
+
+                                if (missing_blocks.Count != 0)
+                                {
+                                    await block_request.WriteAsync(
+                                        new BlockRequest(
+                                            blocks[0].BlockID,
+                                            blocks[0].BlockOffset,
+                                            blocks[0].BlockHash,
+                                            blocks[0].BlockSize,
+                                            blocks[0].VolumeID,
+                                            BlockRequestType.CacheEvict
+                                        )
+                                    ).ConfigureAwait(false);
+                                }
+                            }
+                            sw_work_empty_file?.Stop();
+                        }
+                        else if (missing_blocks.Count > 0)
+                        {
+                            if (missing_blocks.Any(x => x.VolumeID < 0))
+                            {
+                                Logging.Log.WriteWarningMessage(LOGTAG, "NegativeVolumeID", null, $"{file.TargetPath} has a negative volume ID, skipping");
+                                // The file is not restored, so it counts as broken like the other skipped files
+                                lock (results)
+                                    results.BrokenLocalFiles.Add(file.TargetPath);
+                                FaultPriorityBarrierIfPriorityFile(file, new InvalidOperationException($"{file.TargetPath} has a negative volume ID"));
+                                await ReleaseUnusedBlocksAsync(db, file, missing_blocks, 0, 0, block_request, block_response, options, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                continue;
+                            }
+
+                            sw_work_hash?.Start();
+                            filehasher.Initialize();
+                            sw_work_hash?.Stop();
+
+                            Stream? fs = null;
+                            // How far the file got through its missing blocks: the download
+                            // requests sent, the responses read and the blocks released. A file
+                            // that fails part way uses these to leave the channels as the next
+                            // file expects them.
+                            int requested = 0, received = 0, released = 0;
+                            try
+                            {
+                                // Open the target file
+                                if (options.Dryrun)
+                                {
+                                    // If dryrun, open the file for read only to verify the file hash.
+                                    if (await restoreDestination.FileExists(file.TargetPath, results.TaskControl.ProgressToken).ConfigureAwait(false))
+                                    {
+                                        fs = await restoreDestination.OpenRead(file.TargetPath, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                    }
+                                    else
+                                    {
+                                        Logging.Log.WriteDryrunMessage(LOGTAG, "DryrunRestore", @$"Tried opening ""{file.TargetPath}"" for reading, but it doesn't exist.");
+                                    }
+                                }
+                                else
+                                {
+                                    var foldername = SystemIO.IO_OS.PathGetDirectoryName(file.TargetPath);
+                                    try
+                                    {
+                                        if (await restoreDestination.CreateFolderIfNotExists(foldername, results.TaskControl.ProgressToken).ConfigureAwait(false))
+                                            Logging.Log.WriteVerboseMessage(LOGTAG, "CreateMissingFolder", @$"Creating missing folder ""{foldername}"" for file ""{file.TargetPath}""");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Logging.Log.WriteErrorMessage(LOGTAG, "CreateMissingFolder", ex, @$"Error when trying to create missing folder ""{foldername}"" for file ""{file.TargetPath}""");
+                                    }
+
+                                    fs = await restoreDestination.OpenReadWrite(file.TargetPath, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                }
+
+                                sw_req?.Start();
+                                // Burst the block requests to speed up the restore
+                                int burst = (int)Math.Max(options.RestoreChannelBufferSize, 1);
+                                int j = 0;
+                                for (int i = 0; i < (int)Math.Min(missing_blocks.Count, burst); i++)
+                                {
+                                    await block_request.WriteAsync(
+                                        new BlockRequest(
+                                            missing_blocks[i].BlockID,
+                                            missing_blocks[i].BlockOffset,
+                                            missing_blocks[i].BlockHash,
+                                            missing_blocks[i].BlockSize,
+                                            missing_blocks[i].VolumeID,
+                                            BlockRequestType.Download
+                                        )
+                                    ).ConfigureAwait(false);
+                                    requested++;
+                                }
+                                sw_req?.Stop();
+
+                                if (!options.Dryrun && options.RestorePreAllocate)
+                                {
+                                    // Preallocate the file size to avoid fragmentation / help the operating system / filesystem.
+                                    fs!.SetLength(file.Length);
+                                }
+
+                                for (int i = 0; i < blocks.Length; i++)
+                                {
+                                    // Each response block is not verified against the block hash, as the processes downloading the blocks should do that.
+                                    if (j < missing_blocks.Count && missing_blocks[j].BlockOffset == i)
+                                    {
+                                        // Read the block from the response and issue a new request, if more blocks are missing
+                                        sw_resp?.Start();
+                                        var response = await block_response.ReadAsync().ConfigureAwait(false);
+                                        received++;
+                                        using var datablock = await response.ConfigureAwait(false);
+                                        if (datablock.Data == null)
+                                            throw new Exception($"Received null data block from request {missing_blocks[j].BlockID} for file {file.TargetPath}");
+
+                                        sw_resp?.Stop();
+
+                                        sw_req?.Start();
+                                        if (j < missing_blocks.Count - burst)
+                                        {
+                                            await block_request.WriteAsync(
+                                                new BlockRequest(
+                                                    missing_blocks[j + burst].BlockID,
+                                                    missing_blocks[j + burst].BlockOffset,
+                                                    missing_blocks[j + burst].BlockHash,
+                                                    missing_blocks[j + burst].BlockSize,
+                                                    missing_blocks[j + burst].VolumeID,
+                                                    BlockRequestType.Download
+                                                )
+                                            ).ConfigureAwait(false);
+                                            requested++;
+                                        }
+                                        sw_req?.Stop();
+
+                                        // Hash the block to verify the file hash
+                                        sw_work_hash?.Start();
+                                        filehasher.TransformBlock(datablock.Data, 0, (int)blocks[i].BlockSize, datablock.Data, 0);
+                                        sw_work_hash?.Stop();
+                                        if (options.Dryrun)
+                                        {
+                                            // Simulate writing the block
+                                            fs?.Seek(fs.Position + blocks[i].BlockSize, SeekOrigin.Begin);
+                                        }
+                                        else
+                                        {
+                                            // Write the block to the file
+                                            sw_work_write?.Start();
+                                            await fs!.WriteAsync(datablock.Data.AsMemory(0, (int)blocks[i].BlockSize), results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                            sw_work_write?.Stop();
+                                        }
+
+                                        // Keep track of metrics
+                                        bytes_written += blocks[i].BlockSize;
+                                        j++;
+                                        sw_req?.Start();
+                                        await block_request.WriteAsync(
+                                            new BlockRequest(
+                                                blocks[i].BlockID,
+                                                blocks[i].BlockOffset,
+                                                blocks[i].BlockHash,
+                                                blocks[i].BlockSize,
+                                                blocks[i].VolumeID,
+                                                BlockRequestType.CacheEvict
+                                            )
+                                        ).ConfigureAwait(false);
+                                        released++;
+                                        sw_req?.Stop();
+                                    }
+                                    else
+                                    {
+                                        // Not a missing block, so read from the file
+                                        if (fs != null)
+                                        {
+                                            sw_work_read?.Start();
+                                            var read = await fs
+                                                .ReadAsync(buffer, 0, buffer.Length, results.TaskControl.ProgressToken)
+                                                .ConfigureAwait(false);
+                                            sw_work_read?.Stop();
+                                            sw_work_hash?.Start();
+                                            filehasher.TransformBlock(buffer, 0, read, buffer, 0);
+                                            sw_work_hash?.Stop();
+                                        }
+                                    }
+                                }
+
+                                if (options.Dryrun)
+                                {
+                                    Logging.Log.WriteDryrunMessage(LOGTAG, "DryrunRestore", @$"Would have restored {bytes_written} bytes of ""{file.TargetPath}""");
+                                }
+
+                                // Verify the file hash
+                                sw_work_hash?.Start();
+                                filehasher.TransformFinalBlock([], 0, 0);
+                                sw_work_hash?.Stop();
+
+                                sw_work?.Start();
+                                if (filehasher.Hash != null && Convert.ToBase64String(filehasher.Hash) != file.Hash)
+                                {
+                                    Logging.Log.WriteErrorMessage(LOGTAG, "FileHashMismatch", null, $"File hash mismatch for {file.TargetPath} - expected: {file.Hash}, actual: {Convert.ToBase64String(filehasher.Hash)}");
+                                    throw new Exception("File hash mismatch");
+                                }
+
+                                // Truncate the file if it is larger than the expected size.
+                                if (fs?.Length > file.Length)
+                                {
+                                    if (options.Dryrun)
+                                    {
+                                        Logging.Log.WriteDryrunMessage(LOGTAG, "DryrunRestore", @$"Would have truncated ""{file.TargetPath}"" from {fs.Length} to {file.Length}");
+                                    }
+                                    else
+                                    {
+                                        fs.SetLength(file.Length);
+                                    }
+                                }
+                                sw_work?.Stop();
+                            }
+                            // A requested shutdown stops the file wherever it happened to be, so
+                            // it did not "fail to restore" in any sense the user needs told. The
+                            // channels still have to be retired to tear the network down.
+                            catch (Exception) when (RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                            {
+                                block_request.Retire();
+                                await block_response.RetireAsync(true).ConfigureAwait(false);
+                                throw;
+                            }
+                            // Only this file failed, for instance because it could not be created or
+                            // written. It is reported and the processor carries on with the next
+                            // file, as it does when checking the target file fails. A retirement is
+                            // a failure of the restore itself and ends the processor below.
+                            catch (Exception ex) when (ex is not RetiredException)
+                            {
+                                lock (results)
+                                {
+                                    results.BrokenLocalFiles.Add(file.TargetPath);
+                                }
+                                Logging.Log.WriteErrorMessage(LOGTAG, "FailedToRestoreFile", ex, "Failed to restore file {0}: {1}", file.TargetPath, ex.Message);
+                                FaultPriorityBarrierIfPriorityFile(file, ex);
+
+                                // Closed here rather than in the finally, so that a file that also
+                                // fails to close, as it can when flushing to a full disk, does not
+                                // end the processor either.
+                                try
+                                {
+                                    await (fs?.DisposeAsync().AsTask() ?? Task.CompletedTask).ConfigureAwait(false);
+                                }
+                                catch (Exception dex) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                                {
+                                    Logging.Log.WriteWarningMessage(LOGTAG, "FailedToCloseFile", dex, "Failed to close file {0}: {1}", file.TargetPath, dex.Message);
+                                }
+                                fs = null;
+
+                                await ReleaseUnusedBlocksAsync(db, file, missing_blocks, requested - received, released, block_request, block_response, options, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                                continue;
+                            }
+                            catch (Exception)
+                            {
+                                lock (results)
+                                {
+                                    results.BrokenLocalFiles.Add(file.TargetPath);
+                                }
+                                block_request.Retire();
+                                await block_response.RetireAsync(true).ConfigureAwait(false);
+                                throw;
+                            }
+                            finally
+                            {
+                                await (fs?.DisposeAsync().AsTask() ?? Task.CompletedTask).ConfigureAwait(false);
+                            }
+                        }
+
+                        var symlink_restored = false;
+                        if (!options.SkipMetadata)
+                        {
+                            var metadata_restored = await RestoreMetadataAsync(db, file, restoreDestination, block_request, block_response, options, sw_meta, sw_work_meta, sw_req, sw_resp, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                            empty_file_or_symlink |= metadata_restored;
+                            symlink_restored = metadata_restored && file.BlocksetID == LocalDatabase.SYMLINK_BLOCKSET_ID;
+                            sw_work_meta?.Stop();
+                        }
+
+                        // TODO legacy restore doesn't count metadata restore as a restored file.
+
+                        // Mark the file's data as verified in the prepared restore file list.
+                        // The --restore-all-files=unique feature harvests only DataVerified=1
+                        // files for cross-version de-duplication, so files that failed to
+                        // restore (which leave above and never reach here) are not recorded and
+                        // remain eligible for restore in subsequent versions. A failure to mark
+                        // is non-fatal: it only affects de-dup, not the restore itself.
+                        try
+                        {
+                            await db.MarkFileDataVerifiedAsync(file.ID, results.TaskControl.ProgressToken).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logging.Log.WriteWarningMessage(LOGTAG, "MarkFileDataVerifiedFailed", ex, "Failed to mark file as data verified: {0}", ex.Message);
+                        }
+
+                        sw_work_results?.Start();
+                        // A file that was cut back to the restored content has changed,
+                        // although nothing was written to it
+                        if (empty_file_or_symlink || bytes_written > 0 || target_truncated)
+                        {
+                            // Keep track of the restored files and their sizes
+                            lock (results)
+                            {
+                                results.RestoredFiles++;
+                                if (symlink_restored)
+                                    results.RestoredSymlinks++;
+                                results.SizeOfRestoredFiles += file.Length;
+                                results.SizeOfRestoredData += bytes_written;
+                            }
+                        }
+                        else
+                        {
+                            // Keep track of the existing files and their sizes
+                            lock (results)
+                            {
+                                results.UnmodifiedFiles++;
+                                results.SizeOfUnmodifiedFiles += file.Length;
+                            }
+                        }
+                        sw_work_results?.Stop();
+
+                        await SignalIfPriorityFilesAreDone(file, modules, results.TaskControl);
+                        await RestoreHandler.InvokeFileRestoredAsync(modules, file.Version, file.TargetPath, file.BackupTimestamp, results.TaskControl.ProgressToken).ConfigureAwait(false);
+
+                        Logging.Log.WriteVerboseMessage(LOGTAG, "RestoredFile", $"{my_id} Restored file {{0}}", file.TargetPath);
+                    }
+                }
+                catch (RetiredException)
+                {
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "RetiredProcess", null, "File processor retired");
+
+                    if (options.InternalProfiling)
+                    {
+                        Logging.Log.WriteProfilingMessage(LOGTAG, "InternalTimings", $"File: {sw_file!.ElapsedMilliseconds}ms, Block: {sw_block!.ElapsedMilliseconds}ms, Meta: {sw_meta!.ElapsedMilliseconds}ms, Req: {sw_req!.ElapsedMilliseconds}ms, Resp: {sw_resp!.ElapsedMilliseconds}ms, Work: {sw_work!.ElapsedMilliseconds}ms, VerifyTarget: {sw_work_verify_target!.ElapsedMilliseconds}ms, Retarget: {sw_work_retarget!.ElapsedMilliseconds}ms, NotifyLocal: {sw_work_notify_local!.ElapsedMilliseconds}ms, VerifyLocal: {sw_work_verify_local!.ElapsedMilliseconds}ms, EmptyFile: {sw_work_empty_file!.ElapsedMilliseconds}ms, Hash: {sw_work_hash!.ElapsedMilliseconds}ms, Read: {sw_work_read!.ElapsedMilliseconds}ms, Write: {sw_work_write!.ElapsedMilliseconds}ms, Results: {sw_work_results!.ElapsedMilliseconds}ms, Meta Work: {sw_work_meta?.ElapsedMilliseconds}ms");
+                    }
+                    return;
+                }
+                catch (Exception) when (RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                {
+                    // An abort is an orderly shutdown that arrived by a different signal than
+                    // retirement, so it is reported the same way retirement is.
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "CancelledProcess", null, "File processor cancelled");
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // A priority file that fails terminally must fault the priority
+                    // barrier: it is only signaled on the success path, so without this
+                    // the other processors would wait for it forever and the restore
+                    // would stall instead of failing with the real error.
+                    if (current_file != null)
+                        FaultPriorityBarrierIfPriorityFile(current_file, ex);
+
+                    Logging.Log.WriteErrorMessage(LOGTAG, "FileProcessingError", ex, "Error during file processing");
+                    throw;
+                }
+                finally
+                {
+                    if (!decremented)
+                        lock (file_processor_continue_lock)
+                        {
+                            file_processors_restoring_files--;
+                            if (file_processors_restoring_files <= 0 && !file_processor_continue.Task.IsCompleted)
+                                file_processor_continue.SetResult();
+                        }
+
+                    if (!reached_folder_links)
+                        ArriveAtFolderLinks();
+
+                    if (making_folder_link)
+                        folder_links_one_at_a_time.Release();
+
+                    block_request.Retire();
+                    // The block handler can still be writing responses to the requests sent ahead of
+                    // this one, and with this processor gone nothing reads them. A plain `Retire` waits
+                    // for the buffer to be read first, so the handler would wait forever.
+                    await block_response.RetireAsync(true).ConfigureAwait(false);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Copies the blocks that were verified in the old target to the new target file.
+        /// </summary>
+        /// <param name="old_file">The old target file.</param>
+        /// <param name="new_file">The new target file.</param>
+        /// <param name="restoreDestination">The restore destination provider.</param>
+        /// <param name="buffer">The buffer used for copying (must be at least <paramref name="blocksize"/> bytes).</param>
+        /// <param name="blocksize">The fixed block size to used for calculating the byte offsets.</param>
+        /// <param name="verified_blocks">The blocks in the old file that were verified.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        private static async Task CopyOldTargetBlocksToNewTargetAsync(FileRequest old_file, FileRequest new_file, IRestoreDestinationProvider restoreDestination, byte[] buffer, long blocksize, List<BlockRequest> verified_blocks, CancellationToken cancellationToken)
+        {
+            using var fs_old = await restoreDestination.OpenRead(old_file.TargetPath, cancellationToken).ConfigureAwait(false);
+            using var fs_new = await restoreDestination.OpenWrite(new_file.TargetPath, cancellationToken).ConfigureAwait(false);
+
+            foreach (var block in verified_blocks)
+            {
+                // BlockOffset is the block index in the file, so the byte offset
+                // is the index multiplied by the fixed block size.
+                // Note that block.BlockSize is the size of the actual block, not the
+                // fixed block size.
+                fs_old.Seek(block.BlockOffset * blocksize, SeekOrigin.Begin);
+                fs_new.Seek(block.BlockOffset * blocksize, SeekOrigin.Begin);
+
+                var length = await Library.Utility.Utility.ForceStreamReadAsync(fs_old, buffer, buffer.Length, cancellationToken).ConfigureAwait(false);
+                await fs_new.WriteAsync(buffer, 0, length, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Generates a new name for the target file. It starts by appending
+        /// the restore time to the file name. If that name is also already
+        /// taken, it appends a number to the name. It keeps incrementing the
+        /// number until it finds a name that is not taken. If it encounters a
+        /// file with the same name and the correct hash, it will retarget the
+        /// filename to that file, assuming that the file is the correct one.
+        /// </summary>
+        /// <param name="request">The original target file.</param>
+        /// <param name="database">The restore database.</param>
+        /// <param name="restoreDestination">The restore destination provider.</param>
+        /// <param name="filehasher">The file hasher used to verify whether any of the </param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The new filename. If the file already exists, its file hash matches the target hash.</returns>
+        private static async Task<string> GenerateNewNameAsync(FileRequest request, LocalRestoreDatabase database, IRestoreDestinationProvider restoreDestination, System.Security.Cryptography.HashAlgorithm filehasher, CancellationToken cancellationToken)
+        {
+            var ext = SystemIO.IO_OS.PathGetExtension(request.TargetPath) ?? "";
+            if (!string.IsNullOrEmpty(ext) && !ext.StartsWith(".", StringComparison.Ordinal))
+                ext = "." + ext;
+
+            // First we try with a simple date append, assuming that there are not many conflicts there
+            var newname = SystemIO.IO_OS.PathChangeExtension(request.TargetPath, null) + "." + database.RestoreTime.ToLocalTime().ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+            var tr = newname + ext;
+            var c = 0;
+            var max_tries = 100;
+            while (await restoreDestination.FileExists(tr, cancellationToken).ConfigureAwait(false) && c < max_tries)
+            {
+                try
+                {
+                    // If we have a file with the correct name,
+                    // it is most likely the file we want
+                    filehasher.Initialize();
+
+                    string key;
+                    using (var file = await restoreDestination.OpenRead(tr, cancellationToken).ConfigureAwait(false))
+                        key = Convert.ToBase64String(filehasher.ComputeHash(file));
+
+                    if (key == request.Hash)
+                    {
+                        //TODO: Also needs metadata check to make correct decision.
+                        //      We stick to the policy to restore metadata in place, if data ok. So, metadata block may be restored.
+                        break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logging.Log.WriteWarningMessage(LOGTAG, "FailedToReadRestoreTarget", ex, "Failed to read candidate restore target {0}", tr);
+                }
+                tr = newname + " (" + (c++).ToString() + ")" + ext;
+            }
+
+            if (c >= max_tries)
+            {
+                Logging.Log.WriteErrorMessage(LOGTAG, "TooManyConflicts", null, "Too many conflicts when trying to find a new name for the target file");
+                throw new Exception("Too many conflicts when trying to find a new name for the target file");
+            }
+
+            newname = tr;
+
+            return newname;
+        }
+
+        /// <summary>
+        /// Rendezvous with the other FileProcessor's before processing folder metadata.
+        /// </summary>
+        /// <returns>An awaitable task that completes once all of the FileProcessor's have rendezvoused.</returns>
+        private static async Task RendezvousBeforeProcessingFolderMetadataAsync()
+        {
+            var should_wait = false;
+            lock (file_processor_continue_lock)
+            {
+                file_processors_restoring_files--;
+                if (file_processors_restoring_files <= 0 && !file_processor_continue.Task.IsCompleted)
+                    file_processor_continue.SetResult();
+                should_wait = file_processors_restoring_files > 0;
+            }
+
+            if (should_wait)
+            {
+                await file_processor_continue.Task.ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Counts this FileProcessor as having reached the symbolic links to folders with entries
+        /// restored below them, or as done.
+        /// </summary>
+        /// <returns><c>true</c> if other FileProcessor's have not reached them yet.</returns>
+        private static bool ArriveAtFolderLinks()
+        {
+            lock (folder_links_continue_lock)
+            {
+                file_processors_before_folder_links--;
+                if (file_processors_before_folder_links <= 0 && !folder_links_continue.Task.IsCompleted)
+                    folder_links_continue.SetResult();
+                return file_processors_before_folder_links > 0;
+            }
+        }
+
+        /// <summary>
+        /// Rendezvous with the other FileProcessor's before making a symbolic link to a folder with
+        /// entries restored below it. The links are sent last, so once every FileProcessor has taken
+        /// one or is done, nothing else is being restored. Making a link that replaces another
+        /// removes its path for a moment, and anything restored below it at that moment would fail.
+        /// </summary>
+        /// <returns>An awaitable task that completes once all of the FileProcessor's have rendezvoused.</returns>
+        private static async Task RendezvousBeforeFolderLinksAsync()
+        {
+            if (ArriveAtFolderLinks())
+                await folder_links_continue.Task.ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Waits for all priority files to be processed before allowing non-priority files to be processed.
+        /// If the current file is a priority file, it decrements the counter and signals completion when all priority files are done.
+        /// If the current file is not a priority file, it waits until all priority files have been processed.
+        /// When the last priority file is processed, <see cref="RestoreHandler.InvokeBulkRestoreStartAsync"/> is
+        /// invoked to notify restore callback modules that the bulk restore is starting.
+        /// </summary>
+        /// <param name="file">The file request being processed.</param>
+        /// <param name="modules">The loaded generic modules, used to dispatch the bulk-restore-start callback. May be null.</param>
+        /// <param name="taskReader">The task reader, used to abandon the wait if a shutdown is requested.</param>
+        /// <returns><c>true</c> if the caller should carry on with the file; <c>false</c> if the wait was abandoned because the restore is stopping.</returns>
+        private static async Task SignalIfPriorityFilesAreDone(FileRequest file, IEnumerable<IGenericModule>? modules, Common.ITaskReader taskReader)
+        {
+            if (!file.IsPriorityFile)
+                return;
+
+            // This is a priority file - decrement the counter
+            var shouldSignal = false;
+            lock (priority_files_lock)
+            {
+                priority_files_remaining--;
+                if (priority_files_remaining <= 0 && !priority_files_completed.Task.IsCompleted)
+                    shouldSignal = true;
+            }
+
+            if (shouldSignal)
+            {
+                // All priority files have been restored and the bulk restore is starting.
+                // The first processor to detect completion notifies the restore callback
+                // modules before signaling the other processors to continue.
+                try
+                {
+                    await RestoreHandler.InvokeBulkRestoreStartAsync(modules, taskReader.ProgressToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    // TrySetResult: the barrier may already have been faulted by a
+                    // terminally failed priority file, in which case SetResult would
+                    // throw and mask the real error
+                    priority_files_completed.TrySetResult();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Waits for all priority files to be processed before allowing non-priority files to be processed.
+        /// If the current file is a priority file, it decrements the counter and signals completion when all priority files are done.
+        /// If the current file is not a priority file, it waits until all priority files have been processed.
+        /// When the last priority file is processed, <see cref="RestoreHandler.InvokeBulkRestoreStartAsync"/> is
+        /// invoked to notify restore callback modules that the bulk restore is starting.
+        /// </summary>
+        /// <param name="file">The file request being processed.</param>
+        /// <param name="modules">The loaded generic modules, used to dispatch the bulk-restore-start callback. May be null.</param>
+        /// <param name="taskReader">The task reader, used to abandon the wait if a shutdown is requested.</param>
+        /// <returns><c>true</c> if the caller should carry on with the file; <c>false</c> if the wait was abandoned because the restore is stopping.</returns>
+        private static async Task<bool> WaitForPriorityFilesIfNeededAsync(FileRequest file, IEnumerable<IGenericModule>? modules, Common.ITaskReader taskReader)
+        {
+            if (file.IsPriorityFile)
+                return true;
+
+            // This is not a priority file - wait for all priority files to complete
+            // Only wait if there are still priority files remaining
+            bool shouldWait;
+            lock (priority_files_lock)
+                shouldWait = priority_files_remaining > 0;
+
+            if (shouldWait)
+            {
+                // The completion source is only ever signalled by a processor that handles a
+                // priority file, so if the restore stops or is aborted before every priority
+                // file has been emitted, nothing will release this wait. Without a token the
+                // processor would sit here forever, and the restore's Task.WhenAll over the
+                // process network would never return.
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(taskReader.ProgressToken, taskReader.StopToken);
+                try
+                {
+                    await priority_files_completed.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Leaves the block channels as the next file expects them, after a file failed part way
+        /// through its missing blocks or was skipped before it started on them.
+        /// </summary>
+        /// <param name="db">The restore database, which is queried for the metadata blocks.</param>
+        /// <param name="file">The file that failed.</param>
+        /// <param name="missing_blocks">The blocks the file was restoring, in the order they were requested.</param>
+        /// <param name="outstanding">The number of download requests sent whose responses have not been read.</param>
+        /// <param name="released">The number of blocks, from the start of <paramref name="missing_blocks"/>, already released.</param>
+        /// <param name="block_request">The channel to request blocks from the block manager.</param>
+        /// <param name="block_response">The channel to receive blocks from the block manager.</param>
+        /// <param name="options">The restore options.</param>
+        /// <param name="cancellationToken">The cancellation token to cancel the operation.</param>
+        /// <returns>An awaitable `Task`.</returns>
+        private static async Task ReleaseUnusedBlocksAsync(LocalRestoreDatabase db, FileRequest file, List<BlockRequest> missing_blocks, int outstanding, int released, IChannel<BlockRequest> block_request, IChannel<Task<DataBlock>> block_response, Options options, CancellationToken cancellationToken)
+        {
+            // The responses to the requests sent ahead are read and dropped, or the next file
+            // would take them for its own blocks.
+            for (var i = 0; i < outstanding; i++)
+            {
+                using var datablock = await (await block_response.ReadAsync().ConfigureAwait(false)).ConfigureAwait(false);
+            }
+
+            // The block manager counts every block a file needs, its metadata included, and keeps
+            // a block and its volume until the count reaches zero. The blocks this file will not
+            // use are released so that they are not held until the end of the restore and then
+            // reported as never used.
+            foreach (var block in missing_blocks.Skip(released))
+                await block_request.WriteAsync(
+                    new BlockRequest(
+                        block.BlockID,
+                        block.BlockOffset,
+                        block.BlockHash,
+                        block.BlockSize,
+                        block.VolumeID,
+                        BlockRequestType.CacheEvict
+                    )
+                ).ConfigureAwait(false);
+
+            if (options.SkipMetadata)
+                return;
+
+            await foreach (var block in db.GetMetadataBlocksFromFileAsync(file.ID, cancellationToken).ConfigureAwait(false))
+                await block_request.WriteAsync(
+                    new BlockRequest(
+                        block.BlockID,
+                        block.BlockOffset,
+                        block.BlockHash,
+                        block.BlockSize,
+                        block.VolumeID,
+                        BlockRequestType.CacheEvict
+                    )
+                ).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Restores the metadata for a file.
+        /// </summary>
+        /// <param name="db">The restore database, which is queried for the metadata blocks.</param>
+        /// <param name="file">The file to restore.</param>
+        /// <param name="restoreDestination">The restore destination provider.</param>
+        /// <param name="block_request">The channel to request blocks from the block manager.</param>
+        /// <param name="block_response">The channel to receive blocks from the block manager.</param>
+        /// <param name="options">The restore options.</param>
+        /// <param name="sw_meta">The stopwatch for internal profiling of the metadata processing.</param>
+        /// <param name="sw_work">The stopwatch for internal profiling of the general processing.</param>
+        /// <param name="sw_req">The stopwatch for internal profiling of the block requests.</param>
+        /// <param name="sw_resp">The stopwatch for internal profiling of the block responses.</param>
+        /// <param name="cancellationToken">The cancellation token to cancel the operation.</param>
+        /// <returns>An awaitable `Task`, which returns `true` if the metadata was restored successfully, `false` otherwise.</returns>
+        private static async Task<bool> RestoreMetadataAsync(LocalRestoreDatabase db, FileRequest file, IRestoreDestinationProvider restoreDestination, IChannel<BlockRequest> block_request, IChannel<Task<DataBlock>> block_response, Options options, Stopwatch? sw_meta, Stopwatch? sw_work, Stopwatch? sw_req, Stopwatch? sw_resp, CancellationToken cancellationToken)
+        {
+            sw_meta?.Start();
+            // Since each FileProcessor should have its own connection, it's ok
+            // to keep the lock associated with the read transaction for a long
+            // time, as the other processes should still be able to read.
+            // Therefore, we don't need to read the entire result set into
+            // memory.
+            var blocks = db.GetMetadataBlocksFromFileAsync(file.ID, cancellationToken);
+            sw_meta?.Stop();
+
+            using var ms = new MemoryStream();
+
+            await foreach (var block in blocks.ConfigureAwait(false))
+            {
+                sw_work?.Stop();
+                sw_req?.Start();
+                await block_request.WriteAsync(
+                    new BlockRequest(
+                        block.BlockID,
+                        block.BlockOffset,
+                        block.BlockHash,
+                        block.BlockSize,
+                        block.VolumeID,
+                        BlockRequestType.Download
+                    )
+                ).ConfigureAwait(false);
+                sw_req?.Stop();
+
+                sw_resp?.Start();
+                using var datablock = await (await block_response.ReadAsync().ConfigureAwait(false)).ConfigureAwait(false);
+                if (datablock.Data == null)
+                {
+                    throw new Exception($"Received null data block from request {block.BlockID} when restoring metadata for file {file.TargetPath}");
+                }
+                sw_resp?.Stop();
+
+                sw_work?.Start();
+                await ms.WriteAsync(datablock.Data, 0, (int)block.BlockSize);
+                sw_work?.Stop();
+
+                sw_req?.Start();
+                await block_request.WriteAsync(
+                    new BlockRequest(
+                        block.BlockID,
+                        block.BlockOffset,
+                        block.BlockHash,
+                        block.BlockSize,
+                        block.VolumeID,
+                        BlockRequestType.CacheEvict
+                    )
+                ).ConfigureAwait(false);
+                sw_req?.Stop();
+
+                sw_work?.Start();
+            }
+            ms.Seek(0, SeekOrigin.Begin);
+
+            try
+            {
+                return await RestoreHandler.ApplyMetadataAsync(file.TargetPath, ms, options, restoreDestination, file.HasRestoredEntriesBelow, Util.GuessDirSeparator(file.OriginalPath) == "\\", cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Logging.Log.WriteWarningMessage(LOGTAG, "MetadataWriteFailed", ex, "Failed to apply metadata to file: \"{0}\", message: {1}", file.TargetPath, ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Verifies the target blocks of a file that may already exist.
+        /// </summary>
+        /// <param name="file">The target file.</param>
+        /// <param name="restoreDestination">The restore destination provider.</param>
+        /// <param name="blocks">The metadata about the blocks that make up the file.</param>
+        /// <param name="filehasher">A hasher for the file.</param>
+        /// <param name="blockhasher">A hasher for a data block.</param>
+        /// <param name="buffer">A buffer to read and write data blocks.</param>
+        /// <param name="options">The Duplicati configuration options.</param>
+        /// <param name="results">The restoration results.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>An awaitable `Task`, which returns the number of bytes verified, the data blocks that are missing, the data blocks that are verified, whether the file that is there is a different file although every block matches, and whether the file was cut back to the restored content, which is all it needed.</returns>
+        private static async Task<(long, List<BlockRequest>, List<BlockRequest>, bool, bool)> VerifyTargetBlocksAsync(FileRequest file, IRestoreDestinationProvider restoreDestination, BlockRequest[] blocks, System.Security.Cryptography.HashAlgorithm filehasher, System.Security.Cryptography.HashAlgorithm blockhasher, byte[] buffer, Options options, RestoreResults results, CancellationToken cancellationToken)
+        {
+            long bytes_read = 0;
+            List<BlockRequest> missing_blocks = [];
+            List<BlockRequest> verified_blocks = [];
+            var target_differs = false;
+            var target_truncated = false;
+
+            // Check if the file exists. A symbolic link has no content to compare: it is
+            // made from its metadata. What is at its path may be a link as well, and reading
+            // it would read what that points to, which need not exist.
+            if (file.BlocksetID != LocalDatabase.SYMLINK_BLOCKSET_ID
+                && await restoreDestination.FileExists(file.TargetPath, cancellationToken).ConfigureAwait(false))
+            {
+                filehasher.Initialize();
+                try
+                {
+                    using var f = await restoreDestination.OpenRead(file.TargetPath, cancellationToken).ConfigureAwait(false);
+                    for (int i = 0; i < blocks.Length; i++)
+                    {
+                        var read = await f.ReadAsync(buffer, 0, (int)blocks[i].BlockSize, cancellationToken).ConfigureAwait(false);
+                        if (read == blocks[i].BlockSize)
+                        {
+                            // Block is present
+                            filehasher.TransformBlock(buffer, 0, read, buffer, 0);
+                            var blockhash = Convert.ToBase64String(blockhasher.ComputeHash(buffer, 0, read));
+                            if (blockhash == blocks[i].BlockHash)
+                            {
+                                // Block matches
+                                bytes_read += read;
+                                verified_blocks.Add(blocks[i]);
+                            }
+                            else
+                            {
+                                // Block mismatch
+                                missing_blocks.Add(blocks[i]);
+                            }
+                        }
+                        else
+                        {
+                            // Block is missing
+                            missing_blocks.Add(blocks[i]);
+                            if (f.Position == f.Length)
+                            {
+                                // No more file - the rest of the blocks are missing.
+                                missing_blocks.AddRange(blocks.Skip(i + 1));
+                                break;
+                            }
+                        }
+                    }
+                }
+                // The file is only recorded as having failed when something actually went wrong.
+                // A stop or an abort ends the work wherever it stands, and the files that happen
+                // to be in flight at that moment are not evidence of anything: the next restore
+                // verifies them block by block and repairs whatever is short.
+                catch (Exception) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                {
+                    lock (results)
+                    {
+                        results.BrokenLocalFiles.Add(file.TargetPath);
+                    }
+                    throw;
+                }
+
+                // If all of the individual blocks have been verified.
+                if (missing_blocks.Count == 0)
+                {
+                    // Verify the file hash
+                    filehasher.TransformFinalBlock([], 0, 0);
+                    if (filehasher.Hash != null && Convert.ToBase64String(filehasher.Hash) == file.Hash)
+                    {
+                        // Truncate the file if it is larger than the expected size.
+                        var currentLength = await restoreDestination.GetFileLength(file.TargetPath, cancellationToken).ConfigureAwait(false);
+                        if (file.Length < currentLength)
+                        {
+                            if (!options.Overwrite)
+                            {
+                                // The file starts with the restored content but goes on after
+                                // it, so it is not that file: most likely it was appended to
+                                // after the backup. Without --overwrite it is left as it is,
+                                // and the file is restored under a new name, as a file that
+                                // differs in any other way is. None of its blocks are used for
+                                // that, as the copy reads whole blocks and would pick up what
+                                // follows the last one.
+                                Logging.Log.WriteVerboseMessage(LOGTAG, "TargetFileIsLonger", "The file {0} starts with the restored content but is longer ({1} bytes, not {2}), so it is not overwritten", file.TargetPath, currentLength, file.Length);
+                                missing_blocks.AddRange(verified_blocks);
+                                verified_blocks.Clear();
+                                bytes_read = 0;
+                                target_differs = true;
+                            }
+                            else if (options.Dryrun)
+                            {
+                                Logging.Log.WriteDryrunMessage(LOGTAG, "DryrunRestore", @$"Would have truncated ""{file.TargetPath}"" from {currentLength} to {file.Length}");
+                                target_truncated = true;
+                            }
+                            else
+                            {
+                                // Reopen file with write permission
+                                // The metadata handler will revert this back later.
+                                if (await restoreDestination.HasReadOnlyAttribute(file.TargetPath, cancellationToken).ConfigureAwait(false))
+                                    await restoreDestination.ClearReadOnlyAttribute(file.TargetPath, cancellationToken).ConfigureAwait(false);
+                                try
+                                {
+                                    using var f = await restoreDestination.OpenWrite(file.TargetPath, cancellationToken).ConfigureAwait(false);
+                                    f.SetLength(file.Length);
+                                    target_truncated = true;
+                                }
+                                catch (Exception) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                                {
+                                    lock (results)
+                                    {
+                                        results.BrokenLocalFiles.Add(file.TargetPath);
+                                    }
+                                    throw;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // The file doesn't exist, so all blocks are missing.
+                missing_blocks.AddRange(blocks);
+            }
+
+            return (bytes_read, missing_blocks, verified_blocks, target_differs, target_truncated);
+        }
+
+        /// <summary>
+        /// Verifies the local blocks at the original restore path that may be used to restore the file.
+        /// </summary>
+        /// <param name="file">The file to restore. Contains both the target and original paths.</param>
+        /// <param name="restoreDestination">The restore destination provider.</param>
+        /// <param name="blocks">The collection of blocks that are currently missing.</param>
+        /// <param name="total_blocks">The total number of blocks for the file.</param>
+        /// <param name="filehasher">A hasher for the file.</param>
+        /// <param name="blockhasher">A hasher for the data block.</param>
+        /// <param name="buffer">A buffer to read and write data blocks.</param>
+        /// <param name="options">The Duplicati configuration options.</param>
+        /// <param name="results">The restoration results.</param>
+        /// <param name="block_request">The channel to request blocks from the block manager. Used to inform the block manager which blocks are already present.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>An awaitable `Task`, which returns a collection of data blocks that are missing.</returns>
+        private static async Task<(long, List<BlockRequest>)> VerifyLocalBlocksAsync(FileRequest file, IRestoreDestinationProvider restoreDestination, List<BlockRequest> blocks, long total_blocks, System.Security.Cryptography.HashAlgorithm filehasher, System.Security.Cryptography.HashAlgorithm blockhasher, byte[] buffer, Options options, RestoreResults results, IChannel<BlockRequest> block_request, CancellationToken cancellationToken)
+        {
+            if (file.TargetPath == file.OriginalPath)
+            {
+                // The original file is the same as the target file, so no new blocks can be used.
+                return (0, blocks);
+            }
+
+            List<BlockRequest> missing_blocks = [];
+            List<BlockRequest> verified_blocks = [];
+
+            // Check if the file exists (ignore if this was a remote source)
+            if (SystemIO.IO_OS.FileExists(file.OriginalPath))
+            {
+                filehasher.Initialize();
+
+                // Open both files, as the target file is still being read to produce the overall file hash, if all the blocks are present across both the target and original files.
+                // Note: The original file is the source file on the local system (not within the restore destination),
+                // and only a shortcut, as every block can also come from the backup. Another program may hold it,
+                // as it can while the file is backed up from a snapshot, so a file that cannot be read is skipped.
+                Stream? opened_original;
+                try
+                {
+                    opened_original = SystemIO.IO_OS.FileOpenRead(file.OriginalPath);
+                }
+                catch (Exception ex) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                {
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "OriginalFileNotReadable", ex, "Cannot read the original file {0}, its blocks are restored from the backup", file.OriginalPath);
+                    return (0, blocks);
+                }
+                using var f_original = opened_original;
+                using var f_target = options.Dryrun ?
+                    (await restoreDestination.FileExists(file.TargetPath, cancellationToken).ConfigureAwait(false) ?
+                        await restoreDestination.OpenRead(file.TargetPath, cancellationToken).ConfigureAwait(false) :
+                        null) :
+                    await restoreDestination.OpenReadWrite(file.TargetPath, cancellationToken).ConfigureAwait(false);
+                long bytes_read = 0;
+                long bytes_written = 0;
+
+                int j = 0;
+                for (long i = 0; i < total_blocks; i++)
+                {
+                    int read = 0;
+                    if (j < blocks.Count && blocks[j].BlockOffset == i)
+                    {
+                        // The current block is a missing block
+                        try
+                        {
+                            f_original.Seek(i * options.Blocksize, SeekOrigin.Begin);
+                            read = await f_original.ReadAsync(buffer, 0, (int)blocks[j].BlockSize, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (Exception ex) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                        {
+                            // Another program may have locked a range of the original, so the rest of
+                            // the blocks are restored from the backup
+                            Logging.Log.WriteVerboseMessage(LOGTAG, "OriginalFileNotReadable", ex, "Cannot read the original file {0}, its remaining blocks are restored from the backup", file.OriginalPath);
+                            missing_blocks.AddRange(blocks.Skip(j));
+                            break;
+                        }
+
+                        if (read == blocks[j].BlockSize)
+                        {
+                            var blockhash = Convert.ToBase64String(blockhasher.ComputeHash(buffer, 0, read));
+                            if (blockhash != blocks[j].BlockHash)
+                            {
+                                missing_blocks.Add(blocks[j]);
+                            }
+                            else
+                            {
+                                if (!options.Dryrun)
+                                {
+                                    if (f_target != null)
+                                    {
+                                        try
+                                        {
+                                            f_target.Seek(blocks[j].BlockOffset * options.Blocksize, SeekOrigin.Begin);
+                                            await f_target
+                                                .WriteAsync(buffer, 0, read, cancellationToken)
+                                                .ConfigureAwait(false);
+                                        }
+                                        catch (Exception) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                                        {
+                                            lock (results)
+                                            {
+                                                results.BrokenLocalFiles.Add(file.TargetPath);
+                                            }
+                                            throw;
+                                        }
+                                    }
+                                }
+                                bytes_read += read;
+                                bytes_written += read;
+                                await block_request.WriteAsync(
+                                    new BlockRequest(
+                                        blocks[j].BlockID,
+                                        blocks[j].BlockOffset,
+                                        blocks[j].BlockHash,
+                                        blocks[j].BlockSize,
+                                        blocks[j].VolumeID,
+                                        BlockRequestType.CacheEvict
+                                    )
+                                ).ConfigureAwait(false);
+                                verified_blocks.Add(blocks[j]);
+                            }
+                        }
+                        else
+                        {
+                            missing_blocks.Add(blocks[j]);
+                            if (f_original.Position == f_original.Length)
+                            {
+                                missing_blocks.AddRange(blocks.Skip(j + 1));
+                                break;
+                            }
+                        }
+
+                        j++;
+                    }
+                    else
+                    {
+                        // The current block is not a missing block - read from the target file.
+                        if (f_target != null)
+                        {
+                            try
+                            {
+                                f_target.Seek(i * options.Blocksize, SeekOrigin.Begin);
+                                read = await f_target
+                                    .ReadAsync(buffer, 0, options.Blocksize, cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+                            catch (Exception) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                            {
+                                lock (results)
+                                {
+                                    results.BrokenLocalFiles.Add(file.TargetPath);
+                                }
+                                throw;
+                            }
+                        }
+                    }
+                    filehasher.TransformBlock(buffer, 0, read, buffer, 0);
+                }
+
+                if (missing_blocks.Count == 0)
+                {
+                    // No more blocks are missing, so check the file hash.
+                    filehasher.TransformFinalBlock([], 0, 0);
+                    if (filehasher.Hash != null && Convert.ToBase64String(filehasher.Hash) == file.Hash)
+                    {
+                        // Truncate the file if it is larger than the expected size.
+                        if (file.Length < f_target?.Length)
+                        {
+                            if (options.Dryrun)
+                            {
+                                Logging.Log.WriteDryrunMessage(LOGTAG, "DryrunRestore", @$"Would have truncated ""{file.TargetPath}"" from {f_target.Length} to {file.Length}");
+                            }
+                            else
+                            {
+                                try
+                                {
+                                    f_target.SetLength(file.Length);
+                                }
+                                catch (Exception) when (!RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                                {
+                                    lock (results)
+                                    {
+                                        results.BrokenLocalFiles.Add(file.TargetPath);
+                                    }
+                                    throw;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        Logging.Log.WriteErrorMessage(LOGTAG, "FileHashMismatch", null, $"File hash mismatch for {file.TargetPath} - expected: {file.Hash}, actual: {Convert.ToBase64String(filehasher.Hash ?? [0])}");
+                        lock (results)
+                        {
+                            results.BrokenLocalFiles.Add(file.TargetPath);
+                        }
+                    }
+                }
+
+                if (options.Dryrun)
+                {
+                    Logging.Log.WriteDryrunMessage(LOGTAG, "DryrunRestore", @$"Would have restored {verified_blocks.Count} blocks ({bytes_written} bytes) from ""{file.OriginalPath}"" to ""{file.TargetPath}""");
+                }
+
+                return (bytes_written, missing_blocks);
+            }
+            else
+            {
+                // The original file is no longer present, so all blocks are missing.
+                return (0, blocks);
+            }
+        }
+    }
+
+}

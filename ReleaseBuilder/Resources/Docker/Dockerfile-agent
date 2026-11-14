@@ -1,0 +1,49 @@
+FROM debian:latest
+
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+RUN apt update -y && \
+    apt install -y libssl3t64 ca-certificates libicu76 gnupg tini curl unzip && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN case "${TARGETARCH}" in \
+        "amd64")  RCLONE_ARCH="amd64" ;; \
+        "arm64")  RCLONE_ARCH="arm64" ;; \
+        "arm") \
+            case "${TARGETVARIANT}" in \
+                "v6") RCLONE_ARCH="arm-v6" ;; \
+                "v7") RCLONE_ARCH="arm-v7" ;; \
+                *)    RCLONE_ARCH="arm" ;; \
+            esac ;; \
+        "386")    RCLONE_ARCH="386" ;; \
+        *)        RCLONE_ARCH="${TARGETARCH}" ;; \
+    esac && \
+    curl -fsSL "https://downloads.rclone.org/rclone-current-linux-${RCLONE_ARCH}.zip" -o /tmp/rclone.zip && \
+    unzip -q /tmp/rclone.zip -d /tmp && \
+    cp /tmp/rclone-*/rclone /usr/bin/rclone && \
+    chmod +x /usr/bin/rclone && \
+    rm -rf /tmp/rclone*
+
+ENTRYPOINT [ "/usr/bin/tini", "--", "/run-as-user.sh" ]
+
+ENV XDG_CONFIG_HOME=/data
+VOLUME /data
+
+# Pass Duplicati version/channel as build arguments (not used by Duplicati itself)
+ARG CHANNEL=
+ARG VERSION=
+ENV DUPLICATI_CHANNEL=${CHANNEL}
+ENV DUPLICATI_VERSION=${VERSION}
+
+# Copy in the Duplicati binaries for the target architecture
+ARG TARGETARCH
+COPY ./${TARGETARCH} /opt/duplicati
+COPY run-as-user.sh /run-as-user.sh
+RUN chmod +x /run-as-user.sh
+
+# Set the PATH to include the Duplicati binaries
+ENV PATH="/opt/duplicati:${PATH}"
+
+CMD ["duplicati-agent"]

@@ -1,0 +1,140 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using System;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using CoCoL;
+using Duplicati.Library.Main.Volumes;
+
+#nullable enable
+
+namespace Duplicati.Library.Main.Operation.Restore
+{
+
+    /// <summary>
+    /// Process that decrypts the volumes that the `VolumeDownloader` process has downloaded.
+    /// </summary>
+    internal class VolumeDecryptor
+    {
+        /// <summary>
+        /// The log tag for this class.
+        /// </summary>
+        private static readonly string LOGTAG = Logging.Log.LogTagFromType<VolumeDecryptor>();
+
+        /// <summary>
+        /// Runs the volume decryptor process.
+        /// </summary>
+        /// <param name="channels">The named channels for the restore operation.</param>
+        /// <param name="backend">The backend manager.</param>
+        /// <param name="options">The restore options.</param>
+        public static Task RunAsync(Channels channels, IBackendManager backend, Options options)
+        {
+            return AutomationExtensions.RunTask(
+            new
+            {
+                Input = channels.DecryptRequest.AsRead(),
+                Output = channels.VolumeResponse.AsWrite()
+            },
+            async self =>
+            {
+                Stopwatch? sw_read = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_write = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_decrypt = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_bvr = options.InternalProfiling ? new() : null;
+                Stopwatch? sw_vw = options.InternalProfiling ? new() : null;
+
+                try
+                {
+                    while (true)
+                    {
+                        // Get the block request and volume from the `VolumeDownloader` process.
+                        sw_read?.Start();
+                        var (volume_id, volume_name, volume) = await self.Input.ReadAsync().ConfigureAwait(false);
+                        sw_read?.Stop();
+                        Logging.Log.WriteExplicitMessage(LOGTAG, "DecryptVolume", null, "Decrypting volume {0} (ID: {1})", volume_name, volume_id);
+
+                        // Decrypt the volume.
+                        sw_decrypt?.Start();
+                        var tmpfile = backend.DecryptFile(volume, volume_name, options, dispose: true);
+                        sw_decrypt?.Stop();
+                        Logging.Log.WriteExplicitMessage(LOGTAG, "DecryptVolume", null, "Decrypted volume {0} (ID: {1})", volume_name, volume_id);
+
+                        // TODO These two steps could be moved to another process to allow even more parallelism.
+                        sw_bvr?.Start();
+                        var bvr = new BlockVolumeReader(options.CompressionModule, tmpfile, options);
+                        sw_bvr?.Stop();
+                        sw_vw?.Start();
+                        var volume_wrapper = new VolumeWrapper(tmpfile, bvr);
+                        sw_vw?.Stop();
+                        Logging.Log.WriteExplicitMessage(LOGTAG, "BlockVolumeReader", null, "Created BlockVolumeReader for volume {0} (ID: {1})", volume_name, volume_id);
+
+                        sw_write?.Start();
+                        try
+                        {
+                            // Pass the decrypted volume to the `VolumeDecompressor` process.
+                            await self.Output.WriteAsync((volume_id, volume_wrapper)).ConfigureAwait(false);
+                        }
+                        catch (Exception)
+                        {
+                            // The handoff failed, so no other process took ownership and nothing
+                            // else will dispose the volume. Without this the decrypted temporary
+                            // file stays open and is left behind, because the volume reader holds
+                            // it without `FileShare.Delete` and `TempFile`'s finalizer therefore
+                            // cannot delete it.
+                            volume_wrapper.Dispose();
+                            throw;
+                        }
+                        sw_write?.Stop();
+                        Logging.Log.WriteExplicitMessage(LOGTAG, "DecryptVolume", null, "Passed decrypted volume {0} (ID: {1}) to next stage", volume_name, volume_id);
+                    }
+                }
+                catch (RetiredException)
+                {
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "RetiredProcess", null, "Volume decryptor retired");
+
+                    // When the retirement came from downstream, a downloader can still be waiting to hand
+                    // over its next item, and nothing will read it now. On a normal end the input is
+                    // already retired and read empty, so this does nothing.
+                    await self.Input.RetireAsync(true).ConfigureAwait(false);
+
+                    if (options.InternalProfiling)
+                    {
+                        Logging.Log.WriteProfilingMessage(LOGTAG, "InternalTimings", $"Read: {sw_read!.ElapsedMilliseconds}ms, Decrypt: {sw_decrypt!.ElapsedMilliseconds}ms, BlockVolumeReader: {sw_bvr!.ElapsedMilliseconds}ms, VolumeWrapper: {sw_vw!.ElapsedMilliseconds}ms, Write: {sw_write!.ElapsedMilliseconds}ms");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logging.Log.WriteErrorMessage(LOGTAG, "DecryptionError", ex, "Error during decryption");
+                    // A downloader may be waiting to hand over its next volume, and a plain `Retire`
+                    // waits for the buffered volumes to be read first. With the decryptors gone
+                    // nothing reads them, so the downloader would wait forever.
+                    await self.Input.RetireAsync(true).ConfigureAwait(false);
+                    self.Output.Retire();
+                    throw;
+                }
+            });
+        }
+    }
+
+}

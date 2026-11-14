@@ -1,7 +1,7 @@
 {
-    "name": "Bouncy Castle",
-    "description": "A lightweight cryptography API for Java and C#",
-    "link": "http://www.bouncycastle.org/csharp",
+    "name": "BouncyCastle.NET",
+    "description": "A cryptography library for .NET, used by MimeKit and SSH.NET.",
+    "link": "https://www.bouncycastle.org/",
     "license": "MIT",
     "notes": ""
 }

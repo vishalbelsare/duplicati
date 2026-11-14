@@ -1,257 +1,252 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
-// 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-// 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
-// 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-#endregion
+﻿// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+#nullable enable
+
 using System;
-using System.IO;
-using Duplicati.Library.Common;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Threading.Tasks;
+using Duplicati.Library.Common.IO;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Utility;
 
 namespace Duplicati.Library.SQLiteHelper
 {
+    /// <summary>
+    /// Provides methods to load and manage SQLite connections, including handling encrypted databases.
+    /// </summary>
     public static class SQLiteLoader
     {
         /// <summary>
-        /// The tag used for logging
+        /// The tag used for logging.
         /// </summary>
         private static readonly string LOGTAG = Logging.Log.LogTagFromType(typeof(SQLiteLoader));
 
         /// <summary>
-        /// A cached copy of the type
+        /// The default busy timeout (in milliseconds) applied to every connection opened by
+        /// <see cref="OpenSQLiteFileAsync"/> by issuing a <c>PRAGMA busy_timeout</c> statement
+        /// after opening. This is a defense-in-depth measure that ensures an active reader
+        /// does not cause failed commits.
         /// </summary>
-        private static Type m_type = null;
+        private const int DefaultBusyTimeoutMs = 10000;
 
         /// <summary>
-        /// Helper method with logic to handle opening a database in possibly encrypted format
+        /// Helper method with logic to handle opening a database in possibly encrypted format.
         /// </summary>
-        /// <param name="con">The SQLite connection object</param>
+        /// <param name="con">The SQLite connection object.</param>
         /// <param name="databasePath">The location of Duplicati's database.</param>
-        /// <param name="useDatabaseEncryption">Specify if database is encrypted</param>
-        /// <param name="password">Encryption password</param>
-        public static void OpenDatabase(System.Data.IDbConnection con, string databasePath, bool useDatabaseEncryption, string password)
+        /// <param name="decryptionPassword">The password to use for decryption.</param>
+        /// <returns>A task that completes when the database is opened.</returns>
+        /// <exception cref="UserInformationException">Thrown if the database cannot be opened or decrypted.</exception>
+        public static async Task OpenDatabaseAsync(Microsoft.Data.Sqlite.SqliteConnection con, string databasePath, string? decryptionPassword)
         {
-            var setPwdMethod = con.GetType().GetMethod("SetPassword", new[] { typeof(string) });
-            string attemptedPassword;
-
-            if (!useDatabaseEncryption || string.IsNullOrEmpty(password))
-                attemptedPassword = null; //No encryption specified, attempt to open without
-            else
-                attemptedPassword = password; //Encryption specified, attempt to open with
-
-            if (setPwdMethod != null)
-                setPwdMethod.Invoke(con, new object[] { attemptedPassword });
+            if (!string.IsNullOrWhiteSpace(decryptionPassword) && SQLiteRC4Decrypter.IsDatabaseEncrypted(databasePath))
+            {
+                Logging.Log.WriteWarningMessage(LOGTAG, "SQLiteRC4Decrypter", null, "Database is encrypted, attempting to decrypt...");
+                try
+                {
+                    SQLiteRC4Decrypter.DecryptSQLiteFile(databasePath, decryptionPassword);
+                    Logging.Log.WriteInformationMessage(LOGTAG, "SQLiteRC4Decrypter", "Database decrypted successfully.");
+                }
+                catch (Exception ex)
+                {
+                    Logging.Log.WriteErrorMessage(LOGTAG, "SQLiteRC4Decrypter", ex, "Failed to decrypt database");
+                    throw new UserInformationException($"The database appears to be encrypted, but the decrypting failed. Please check the password. Error message: {ex.Message}", "RC4DecryptionFailed", ex);
+                }
+            }
 
             try
             {
                 //Attempt to open in preferred state
-                OpenSQLiteFile(con, databasePath);
-                TestSQLiteFile(con);
+                await OpenSQLiteFileAsync(con, databasePath)
+                    .ConfigureAwait(false);
+                await TestSQLiteFileAsync(con).ConfigureAwait(false);
             }
             catch
             {
-                try
-                {
-                    //We can't try anything else without a password
-                    if (string.IsNullOrEmpty(password))
-                        throw;
+                try { await con.DisposeAsync().ConfigureAwait(false); }
+                catch { }
 
-                    //Open failed, now try the reverse
-                    attemptedPassword = attemptedPassword == null ? password : null;
-
-                    con.Close();
-                    if (setPwdMethod != null)
-                        setPwdMethod.Invoke(con, new object[] { attemptedPassword });
-                    OpenSQLiteFile(con, databasePath);
-
-                    TestSQLiteFile(con);
-                }
-                catch
-                {
-                    try { con.Close(); }
-                    catch (Exception ex) { Logging.Log.WriteExplicitMessage(LOGTAG, "OpenDatabaseFailed", ex, "Failed to open the SQLite database: {0}", databasePath); }
-                }
-
-                //If the db is not open now, it won't open
-                if (con.State != System.Data.ConnectionState.Open)
-                    throw; //Report original error
-
-                //The open method succeeded with the non-default method, now change the password
-                var changePwdMethod = con.GetType().GetMethod("ChangePassword", new[] { typeof(string) });
-                changePwdMethod.Invoke(con, new object[] { useDatabaseEncryption ? password : null });
+                throw;
             }
+
+            if (con.State != System.Data.ConnectionState.Open)
+                throw new UserInformationException("Failed to open database for unknown reason, check the logs to see error messages", "DatabaseOpenFailed");
         }
 
         /// <summary>
-        /// Loads an SQLite connection instance and opening the database
+        /// Loads an SQLite connection instance and opening the database.
         /// </summary>
         /// <returns>The SQLite connection instance.</returns>
-        public static System.Data.IDbConnection LoadConnection()
+        /// <remarks>
+        /// This method is synchronous and should be used when you need to load the connection immediately. It calls the asynchronous version and waits for it to complete.
+        /// </remarks>
+        public static Microsoft.Data.Sqlite.SqliteConnection LoadConnection()
         {
-            System.Data.IDbConnection con = null;
+            return LoadConnectionAsync().Await();
+        }
+
+        /// <summary>
+        /// Loads an SQLite connection instance and opening the database.
+        /// </summary>
+        /// <returns>A task that when awaited returns the SQLite connection instance.</returns>
+        public static async Task<Microsoft.Data.Sqlite.SqliteConnection> LoadConnectionAsync()
+        {
+            Microsoft.Data.Sqlite.SqliteConnection? con = null;
             SetEnvironmentVariablesForSQLiteTempDir();
 
             try
             {
-                con = (System.Data.IDbConnection)Activator.CreateInstance(Duplicati.Library.SQLiteHelper.SQLiteLoader.SQLiteConnectionType);
+                con = new Microsoft.Data.Sqlite.SqliteConnection();
             }
             catch (Exception ex)
             {
                 Logging.Log.WriteErrorMessage(LOGTAG, "FailedToLoadConnectionSQLite", ex, "Failed to load connection.");
-                DisposeConnection(con);
+                await DisposeConnectionAsync(con).ConfigureAwait(false);
 
                 throw;
             }
 
+            return con ?? throw new InvalidOperationException("Failed to load connection");
+        }
+
+        /// <summary>
+        /// Applies user-supplied custom pragmas to the SQLite connection.
+        /// </summary>
+        /// <param name="con">The connection to apply the pragmas to.</param>
+        /// <returns>A task that when awaited returns the connection with the pragmas applied.</returns>
+        public static async Task<Microsoft.Data.Sqlite.SqliteConnection> ApplyCustomPragmasAsync(Microsoft.Data.Sqlite.SqliteConnection con)
+        {
+            Dictionary<string, string> customOptions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "synchronous", "NORMAL" }, // NORMAL is more performant than FULL (the default), but less safe, as it no longer blocks until the disk sync syscall to the OS has completed.
+                { "temp_store", "MEMORY" }, // Use memory for temporary storage to improve performance.
+                { "journal_mode", "WAL" }, // Use Write-Ahead Logging for better concurrency and performance.
+                { "cache_size", "-65536" }, // Set cache size to 64 MB (negative value means in KB, so -64000 = 64 MB). Default is 2000 pages, which is 2 MB (2000 * 1024 bytes).
+                { "mmap_size", "67108864" }, // 64 MB.
+                { "threads", "8" }, // Use 8 threads for parallel processing where applicable.
+                { "shared_cache", "true" } //
+            };
+            // Override the default options with any custom options set in the environment variable.
+            var customOptionsEnv = Environment.GetEnvironmentVariable("CUSTOMSQLITEOPTIONS_DUPLICATI") ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(customOptionsEnv))
+            {
+                foreach (var opt in customOptionsEnv.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var parts = opt.Split(new[] { '=' }, 2);
+                    if (parts.Length == 2)
+                        customOptions[parts[0].Trim()] = parts[1].Trim();
+                }
+            }
+
+            using (var cmd = con.CreateCommand())
+            {
+                foreach (var (key, value) in customOptions)
+                {
+                    var opt = $"{key}={value}";
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "CustomSQLiteOption", @"Setting custom SQLite option '{0}'.", opt);
+                    try
+                    {
+                        cmd.CommandText = string.Format(CultureInfo.InvariantCulture, "PRAGMA {0}", opt);
+                        await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logging.Log.WriteWarningMessage(LOGTAG, "CustomSQLiteOption", ex, @"Error setting custom SQLite option '{0}'.", opt);
+                    }
+                }
+            }
             return con;
         }
 
         /// <summary>
-        /// Loads an SQLite connection instance and opening the database
+        /// Loads an SQLite connection instance and opening the database with a specified page cache size.
         /// </summary>
-        /// <returns>The SQLite connection instance.</returns>
         /// <param name="targetpath">The optional path to the database.</param>
-        public static System.Data.IDbConnection LoadConnection(string targetpath)
+        /// <returns>The SQLite connection instance.</returns>
+        /// <remarks>
+        /// This method is synchronous and should be used when you need to load the connection immediately. It calls the asynchronous version and waits for it to complete.
+        /// </remarks>
+        public static Microsoft.Data.Sqlite.SqliteConnection LoadConnection(string targetpath)
+        {
+            return LoadConnectionAsync(targetpath).Await();
+        }
+
+        /// <summary>
+        /// Loads an SQLite connection instance and opening the database.
+        /// </summary>
+        /// <param name="targetpath">The optional path to the database.</param>
+        /// <returns>A task that when waited returns the SQLite connection instance.</returns>
+        public static async Task<Microsoft.Data.Sqlite.SqliteConnection> LoadConnectionAsync(string targetpath)
         {
             if (string.IsNullOrWhiteSpace(targetpath))
                 throw new ArgumentNullException(nameof(targetpath));
-                
-            System.Data.IDbConnection con = LoadConnection();
+
+            var con = await LoadConnectionAsync().ConfigureAwait(false);
 
             try
             {
-                OpenSQLiteFile(con, targetpath);
+                await OpenSQLiteFileAsync(con, targetpath).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 Logging.Log.WriteErrorMessage(LOGTAG, "FailedToLoadConnectionSQLite", ex, @"Failed to load connection with path '{0}'.", targetpath);
-                DisposeConnection(con);
+                await DisposeConnectionAsync(con).ConfigureAwait(false);
 
                 throw;
             }
 
-	    // set custom Sqlite options
-            var opts = Environment.GetEnvironmentVariable("CUSTOMSQLITEOPTIONS_DUPLICATI");
-            if (opts != null) {
-                var topts = opts.Split(new char[]{';'}, StringSplitOptions.RemoveEmptyEntries);
-                if (topts.Length > 0) {
-                    using (var cmd = con.CreateCommand()) {
-                        foreach (var opt in topts) {
-                            Logging.Log.WriteVerboseMessage(LOGTAG, "CustomSQLiteOption", @"Setting custom SQLite option '{0}'.", opt);
-                            try
-                            {
-                                cmd.CommandText = string.Format("pragma {0}", opt);
-                                cmd.ExecuteNonQuery();
-                            }
-			    catch (Exception ex)
-                            {
-                               Logging.Log.WriteErrorMessage(LOGTAG, "CustomSQLiteOption", ex, @"Error setting custom SQLite option '{0}'.", opt);
-                            }
-	                }
-                    }
-                }
-            }
-
-            return con;
+            // set custom Sqlite options
+            return await ApplyCustomPragmasAsync(con)
+                .ConfigureAwait(false);
         }
 
         /// <summary>
-        /// Returns the SQLiteCommand type for the current architecture
+        /// Returns the SQLiteCommand type for the current architecture.
         /// </summary>
         public static Type SQLiteConnectionType
         {
             get
             {
-                if (m_type != null)
-                    return m_type;
+                return typeof(Microsoft.Data.Sqlite.SqliteConnection);
+            }
+        }
 
-                var filename = "System.Data.SQLite.dll";
-                var basePath = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "SQLite");
-
-                // Set this to make SQLite preload automatically
-                Environment.SetEnvironmentVariable("PreLoadSQLite_BaseDirectory", basePath);
-
-                //Default is to use the pinvoke version which requires a native .dll/.so
-                var assemblyPath = Path.Combine(basePath, "pinvoke");
-                var loadMixedModeAssembly = false;
-
-                if (!Duplicati.Library.Utility.Utility.IsMono)
+        /// <summary>
+        /// Returns the version string from the SQLite type.
+        /// </summary>
+        public static string? SQLiteVersion
+        {
+            get
+            {
+                var versionString = SQLiteConnectionType.GetProperty("SQLiteVersion")?.GetValue(null, null) as string;
+                if (string.IsNullOrWhiteSpace(versionString))
                 {
-                    //If we run with MS.Net we can use the mixed mode assemblies
-                    if (Environment.Is64BitProcess)
-                    {
-                        if (File.Exists(Path.Combine(Path.Combine(basePath, "win64"), filename)))
-                        {
-                            assemblyPath = Path.Combine(basePath, "win64");
-                            loadMixedModeAssembly = true;
-                        }
-                    }
-                    else
-                    {
-                        if (File.Exists(Path.Combine(Path.Combine(basePath, "win32"), filename)))
-                        {
-                            assemblyPath = Path.Combine(basePath, "win32");
-                            loadMixedModeAssembly = true;
-                        }
-                    }
-
-                    // If we have a new path, try to force load the mixed-mode assembly for the current architecture
-                    // This can be avoided if the preload in SQLite works, but it is easy to do it here as well
-                    if (loadMixedModeAssembly)
-                    {
-                        try { PInvoke.LoadLibraryEx(Path.Combine(assemblyPath, "SQLite.Interop.dll"), IntPtr.Zero, 0); }
-                        catch (Exception ex) { Logging.Log.WriteExplicitMessage(LOGTAG, "LoadMixedModeSQLiteError", ex, "Failed to load the mixed mode SQLite database: {0}", Path.Combine(assemblyPath, "SQLite.Interop.dll")); }
-                    }
+                    // Support for Microsoft.Data.SQLite
+                    // NOTE: Has an issue with ? as position parameters
+                    var inst = Activator.CreateInstance(SQLiteConnectionType);
+                    versionString = SQLiteConnectionType.GetProperty("ServerVersion")?.GetValue(inst, null) as string;
                 }
-                else
-                {
-                    //On Mono, we try to find the Mono version of SQLite
-
-                    //This secret environment variable can be used to support older installations
-                    var envvalue = System.Environment.GetEnvironmentVariable("DISABLE_MONO_DATA_SQLITE");
-                    if (!Utility.Utility.ParseBool(envvalue, envvalue != null))
-                    {
-                        foreach (var asmversion in new[] { "4.0.0.0", "2.0.0.0" })
-                        {
-                            var name = string.Format("Mono.Data.Sqlite, Version={0}, Culture=neutral, PublicKeyToken=0738eb9f132ed756", asmversion);
-                            try
-                            {
-                                Type t = System.Reflection.Assembly.Load(name).GetType("Mono.Data.Sqlite.SqliteConnection");
-                                if (t != null && t.GetInterface("System.Data.IDbConnection", false) != null)
-                                {
-                                    Version v = new Version((string)t.GetProperty("SQLiteVersion").GetValue(null, null));
-                                    if (v >= new Version(3, 6, 3))
-                                    {
-                                        return m_type = t;
-                                    }
-                                }
-                            }
-                            catch(Exception ex)
-                            {
-                                Logging.Log.WriteExplicitMessage(LOGTAG, "FailedToLoadSQLiteAssembly", ex, "Failed to load the SQLite assembly: {0}", name);
-                            }
-                        }
-
-                        Logging.Log.WriteVerboseMessage(LOGTAG, "FailedToLoadSQLite", "Failed to load Mono.Data.Sqlite.SqliteConnection, reverting to built-in.");
-                    }
-                }
-
-                m_type = System.Reflection.Assembly.LoadFile(Path.Combine(assemblyPath, filename)).GetType("System.Data.SQLite.SQLiteConnection");
-
-                return m_type;
+                return versionString;
             }
         }
 
@@ -262,88 +257,72 @@ namespace Duplicati.Library.SQLiteHelper
         /// </summary>
         private static void SetEnvironmentVariablesForSQLiteTempDir()
         {
-            System.Environment.SetEnvironmentVariable("SQLITE_TMPDIR", Library.Utility.TempFolder.SystemTempPath);
-            System.Environment.SetEnvironmentVariable("TMP", Library.Utility.TempFolder.SystemTempPath);
-            System.Environment.SetEnvironmentVariable("TEMP", Library.Utility.TempFolder.SystemTempPath);
+            // Allow the user to override the temp folder for SQLite
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SQLITE_TMPDIR")))
+                Environment.SetEnvironmentVariable("SQLITE_TMPDIR", Utility.TempFolder.SystemTempPath);
+            Environment.SetEnvironmentVariable("TMPDIR", Utility.TempFolder.SystemTempPath);
+            Environment.SetEnvironmentVariable("TMP", Utility.TempFolder.SystemTempPath);
+            Environment.SetEnvironmentVariable("TEMP", Utility.TempFolder.SystemTempPath);
         }
 
         /// <summary>
-        /// Wrapper to dispose the SQLite connection
+        /// Wrapper to dispose the SQLite connection.
         /// </summary>
         /// <param name="con">The connection to close.</param>
-        private static void DisposeConnection(System.Data.IDbConnection con)
+        /// <returns>A task that completes when the connection is disposed.</returns>
+        private static async Task DisposeConnectionAsync(Microsoft.Data.Sqlite.SqliteConnection? con)
         {
             if (con != null)
-                try { con.Dispose(); }
+                try { await con.DisposeAsync().ConfigureAwait(false); }
                 catch (Exception ex) { Logging.Log.WriteExplicitMessage(LOGTAG, "ConnectionDisposeError", ex, "Failed to dispose connection"); }
         }
 
         /// <summary>
-        /// Opens the SQLite file in the given connection, creating the file if required
+        /// Opens the SQLite file in the given connection, creating the file if required.
         /// </summary>
         /// <param name="con">The connection to use.</param>
         /// <param name="path">Path to the file to open, which may not exist.</param>
-        private static void OpenSQLiteFile(System.Data.IDbConnection con, string path)
+        /// <returns>A task that completes when the file is opened.</returns>
+        private static async Task OpenSQLiteFileAsync(Microsoft.Data.Sqlite.SqliteConnection con, string path)
         {
-            // Check if SQLite database exists before opening a connection to it.
-            // This information is used to 'fix' permissions on a newly created file.
-            var fileExists = false;
-            if (!Platform.IsClientWindows)
-                fileExists = File.Exists(path);
+            // Capture whether the file already existed BEFORE opening (which creates it),
+            // so we can distinguish a database we create from a pre-existing one.
+            var fileExistedBefore = System.IO.File.Exists(path);
 
-            con.ConnectionString = "Data Source=" + path;
-            con.Open();
+            con.ConnectionString = $"Data Source={path};Pooling=false";
+            await con.OpenAsync().ConfigureAwait(false);
 
-            // If we are non-Windows, make the file only accessible by the current user
-            if (!Platform.IsClientWindows && !fileExists)
-                SetUnixPermissionUserRWOnly(path);
-        }
-
-        /// <summary>
-        /// Sets the unix permission user read-write Only.
-        /// </summary>
-        /// <param name="path">The file to set permissions on.</param>
-        /// <remarks> Make sure we do not inline this, as we might eventually load Mono.Posix, which is not present on Windows</remarks>
-        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-        private static void SetUnixPermissionUserRWOnly(string path)
-        {
-            var fi = UnixSupport.File.GetUserGroupAndPermissions(path);
-            UnixSupport.File.SetUserGroupAndPermissions(
-                    path, 
-                    fi.UID, 
-                    fi.GID, 
-                    0x180 /* FilePermissions.S_IRUSR | FilePermissions.S_IWUSR*/
-                );
-        }
-
-        /// <summary>
-        /// Tests the SQLite connection, throwing an exception if the connection does not work
-        /// </summary>
-        /// <param name="con">The connection to test.</param>
-        private static void TestSQLiteFile(System.Data.IDbConnection con)
-        {
-            // Do a dummy query to make sure we have a working db
             using (var cmd = con.CreateCommand())
             {
-                cmd.CommandText = "SELECT COUNT(*) FROM SQLITE_MASTER";
-                cmd.ExecuteScalar();
+                cmd.CommandText = $"PRAGMA busy_timeout={DefaultBusyTimeoutMs}";
+                await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
             }
-        }
-    }
 
-    /// <summary>
-    /// Helper class with PInvoke methods
-    /// </summary>
-    internal static class PInvoke
-    {
+            // A database file we create is always locked down. For a pre-existing file we skip
+            // the lockdown when the operator has opted in to an insecure data folder, mirroring
+            // the data-folder behavior (a deliberately shared folder must not have its contents
+            // forced closed). On filesystems that do not support restrictive permissions
+            // (e.g. FAT32) this throws and is logged as a warning rather than failing. The
+            // containing data folder is separately verified and locked down (see
+            // DataFolderManager), so this is defense-in-depth on the file itself.
+            if (fileExistedBefore && Util.AllowInsecureDataFolder())
+                return;
+
+            try { SystemIO.IO_OS.FileSetPermissionUserRWOnly(path); }
+            catch (Exception ex) { Logging.Log.WriteWarningMessage(LOGTAG, "SQLiteFilePermissionError", ex, "Failed to set permissions on SQLite file '{0}'", path); }            
+        }
+
         /// <summary>
-        /// Loads the specified module into the address space of the calling process.
+        /// Tests the SQLite connection, throwing an exception if the connection does not work.
         /// </summary>
-        /// <returns>The library ex.</returns>
-        /// <param name="lpFileName">The filename of the module to load.</param>
-        /// <param name="hReservedNull">Reserved for future use.</param>
-        /// <param name="dwFlags">Action to take on load.</param>
-        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
-        public static extern IntPtr LoadLibraryEx(string lpFileName, IntPtr hReservedNull, uint dwFlags);
+        /// <param name="con">The connection to test.</param>
+        /// <returns>A task that completes when the test query is executed.</returns>
+        private static async Task TestSQLiteFileAsync(Microsoft.Data.Sqlite.SqliteConnection con)
+        {
+            // Do a dummy query to make sure we have a working db
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM SQLITE_MASTER";
+            await cmd.ExecuteScalarAsync().ConfigureAwait(false);
+        }
     }
 }

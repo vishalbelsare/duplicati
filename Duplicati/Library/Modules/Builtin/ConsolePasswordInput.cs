@@ -1,29 +1,32 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
-// 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-// 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
-// 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-#endregion
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using System.Collections.Generic;
-using System.Text;
-using Duplicati.Library.Common;
 
 namespace Duplicati.Library.Modules.Builtin
 {
+    /// <summary>
+    /// Module for handling console-based password input.
+    /// </summary>
     public class ConsolePasswordInput : Duplicati.Library.Interface.IGenericModule
     {
         /// <summary>
@@ -39,15 +42,34 @@ namespace Duplicati.Library.Modules.Builtin
 
         #region IGenericModule Members
 
+        /// <summary>
+        /// Gets the key identifier for this module.
+        /// </summary>
         public string Key { get { return "console-password-input"; } }
+        /// <summary>
+        /// Gets the display name for this module.
+        /// </summary>
         public string DisplayName { get { return Strings.ConsolePasswordInput.Displayname; } }
+        /// <summary>
+        /// Gets the description of this module.
+        /// </summary>
         public string Description { get { return Strings.ConsolePasswordInput.Description; } }
+        /// <summary>
+        /// Gets whether this module should be loaded by default.
+        /// </summary>
         public bool LoadAsDefault { get { return true; } }
-        public IList<Duplicati.Library.Interface.ICommandLineArgument> SupportedCommands
-            => new Duplicati.Library.Interface.ICommandLineArgument[] {
-                    new Duplicati.Library.Interface.CommandLineArgument(FORCE_PASSPHRASE_FROM_STDIN_OPTION, Interface.CommandLineArgument.ArgumentType.Boolean, Strings.ConsolePasswordInput.ForcepassphrasefromstdinShort, Strings.ConsolePasswordInput.ForcepassphrasefromstdinLong)
-                };
+        /// <summary>
+        /// Gets the list of supported command line arguments.
+        /// </summary>
+        public IList<Interface.ICommandLineArgument> SupportedCommands
+            => [
+                new Interface.CommandLineArgument(FORCE_PASSPHRASE_FROM_STDIN_OPTION, Interface.CommandLineArgument.ArgumentType.Boolean, Strings.ConsolePasswordInput.ForcepassphrasefromstdinShort, Strings.ConsolePasswordInput.ForcepassphrasefromstdinLong)
+            ];
 
+        /// <summary>
+        /// Configures the module with the provided command line options.
+        /// </summary>
+        /// <param name="commandlineOptions">The command line options dictionary.</param>
         public void Configure(IDictionary<string, string> commandlineOptions)
         {
             //Ensure the setup is valid, could throw an exception
@@ -60,16 +82,13 @@ namespace Duplicati.Library.Modules.Builtin
                     return;
 
             //See if a password is already present or encryption is disabled
-            if (!commandlineOptions.ContainsKey("passphrase") && !Duplicati.Library.Utility.Utility.ParseBoolOption(commandlineOptions, "no-encryption"))
+            if (!commandlineOptions.ContainsKey("passphrase") && !Duplicati.Library.Utility.Utility.ParseBoolOption(commandlineOptions.AsReadOnly(), "no-encryption"))
             {
-                // Print a banner
-                Console.Write("\n" + Strings.ConsolePasswordInput.EnterPassphrasePrompt + ": ");
-
                 // Check if we need confirmation
                 var confirm = string.Equals(commandlineOptions["main-action"], "backup", StringComparison.OrdinalIgnoreCase);
 
                 // Bypass the TTY input if requested
-                if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, FORCE_PASSPHRASE_FROM_STDIN_OPTION))
+                if (Library.Utility.Utility.ParseBoolOption(commandlineOptions.AsReadOnly(), FORCE_PASSPHRASE_FROM_STDIN_OPTION))
                 {
                     commandlineOptions["passphrase"] = ReadPassphraseFromStdin(confirm);
                 }
@@ -83,7 +102,7 @@ namespace Duplicati.Library.Modules.Builtin
                     catch (InvalidOperationException)
                     {
                         // Handle redirect issues on Windows only
-                        if (!Platform.IsClientWindows)
+                        if (!OperatingSystem.IsWindows())
                             throw;
 
                         commandlineOptions["passphrase"] = ReadPassphraseFromStdin(confirm);
@@ -94,7 +113,11 @@ namespace Duplicati.Library.Modules.Builtin
 
         #endregion
 
-
+        /// <summary>
+        /// Reads the passphrase from standard input.
+        /// </summary>
+        /// <param name="confirm">Whether to confirm the passphrase.</param>
+        /// <returns>The passphrase.</returns>
         private static string ReadPassphraseFromStdin(bool confirm)
         {
             var passphrase = Console.ReadLine();
@@ -113,58 +136,29 @@ namespace Duplicati.Library.Modules.Builtin
             return passphrase;
         }
 
+        /// <summary>
+        /// Reads the passphrase from the console.
+        /// </summary>
+        /// <param name="confirm">Whether to confirm the passphrase.</param>
+        /// <returns>The passphrase.</returns>
         private static string ReadPassphraseFromConsole(bool confirm)
         {
-            StringBuilder passphrase = new StringBuilder();
-
-            while (true)
-            {
-                ConsoleKeyInfo k = Console.ReadKey(true);
-                if (k.Key == ConsoleKey.Enter)
-                    break;
-
-                if (k.Key == ConsoleKey.Escape)
-                    throw new Library.Interface.CancelException("");
-
-                if (k.KeyChar != '\0') passphrase.Append(k.KeyChar);
-
-                //Unix/Linux user know that there is no feedback, Win user gets scared :)
-                if (System.Environment.OSVersion.Platform != PlatformID.Unix)
-                    Console.Write("*");
-            }
-
-            Console.WriteLine();
+            // First entry (includes prompt and masking)
+            var passphrase = Utility.Utility.ReadSecretFromConsole("\n" + Strings.ConsolePasswordInput.EnterPassphrasePrompt + ": ");
 
             if (confirm)
             {
-                Console.Write("\n" + Strings.ConsolePasswordInput.ConfirmPassphrasePrompt + ": ");
-                StringBuilder password2 = new StringBuilder();
+                // Confirmation entry
+                var password2 = Utility.Utility.ReadSecretFromConsole(Strings.ConsolePasswordInput.ConfirmPassphrasePrompt + ": ");
 
-                while (true)
-                {
-                    ConsoleKeyInfo k = Console.ReadKey(true);
-                    if (k.Key == ConsoleKey.Enter)
-                        break;
-
-                    if (k.Key == ConsoleKey.Escape)
-                        return null;
-
-                    password2.Append(k.KeyChar);
-
-                    //Unix/Linux user know that there is no feedback, Win user gets scared :)
-                    if (System.Environment.OSVersion.Platform != PlatformID.Unix)
-                        Console.Write("*");
-                }
-                Console.WriteLine();
-
-                if (passphrase.ToString() != password2.ToString())
-                    throw new Duplicati.Library.Interface.UserInformationException(Strings.ConsolePasswordInput.PassphraseMismatchError, "PassphraseMismatch");
+                if (!string.Equals(passphrase, password2, StringComparison.Ordinal))
+                    throw new Interface.UserInformationException(Strings.ConsolePasswordInput.PassphraseMismatchError, "PassphraseMismatch");
             }
 
-            if (string.IsNullOrWhiteSpace(passphrase.ToString()))
-                throw new Duplicati.Library.Interface.UserInformationException(Strings.ConsolePasswordInput.EmptyPassphraseError, "EmptyPassphrase");
+            if (string.IsNullOrWhiteSpace(passphrase))
+                throw new Interface.UserInformationException(Strings.ConsolePasswordInput.EmptyPassphraseError, "EmptyPassphrase");
 
-            return passphrase.ToString();
+            return passphrase;
         }
     }
 }

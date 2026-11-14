@@ -1,0 +1,78 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+#nullable enable
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Duplicati.Library.Utility;
+
+public static class RetryHelper
+{
+    public static async Task<T> Retry<T>(Func<Task<T>> action, Action<Exception, int>? errorCallback, int maxRetries, TimeSpan delay, CancellationToken token)
+        => await Retry(action, errorCallback, maxRetries, _ => delay, token);
+
+    /// <summary>
+    /// Retries an action, using a delay that depends on the number of failed attempts so far
+    /// </summary>
+    /// <param name="action">The action to run</param>
+    /// <param name="errorCallback">Callback invoked with the exception and the attempt number after each failure</param>
+    /// <param name="maxRetries">The maximum number of attempts</param>
+    /// <param name="delay">Returns the delay to wait after the given failed attempt number</param>
+    /// <param name="token">The cancellation token</param>
+    /// <returns>The result of the action</returns>
+    public static async Task<T> Retry<T>(Func<Task<T>> action, Action<Exception, int>? errorCallback, int maxRetries, Func<int, TimeSpan> delay, CancellationToken token)
+    {
+        var attempt = 0;
+
+        while (true)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (Exception ex)
+            {
+                attempt++;
+                errorCallback?.Invoke(ex, attempt);
+
+                if (token.IsCancellationRequested)
+                    throw;
+                if (attempt >= maxRetries)
+                    throw;
+            }
+
+            await Task.Delay(delay(attempt), token);
+        }
+    }
+
+    public static async Task<T> Retry<T>(Func<Task<T>> action, int maxRetries, TimeSpan delay, CancellationToken token)
+        => await Retry(action, null, maxRetries, delay, token);
+    public static async Task Retry(Func<Task> action, Action<Exception, int>? errorCallback, int maxRetries, TimeSpan delay, CancellationToken token)
+        => await Retry(async () => { await action(); return true; }, errorCallback, maxRetries, delay, token);
+    public static async Task Retry(Func<Task> action, int maxRetries, TimeSpan delay, CancellationToken token)
+        => await Retry(async () => { await action(); return true; }, null, maxRetries, delay, token);
+    public static async Task Retry(Func<Task> action, Action<Exception, int>? errorCallback, int maxRetries, Func<int, TimeSpan> delay, CancellationToken token)
+        => await Retry(async () => { await action(); return true; }, errorCallback, maxRetries, delay, token);
+
+}

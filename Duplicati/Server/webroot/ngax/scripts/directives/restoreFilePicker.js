@@ -21,6 +21,7 @@ backupApp.directive('restoreFilePicker', function() {
 
             $scope.systeminfo = SystemInfo.watch($scope);
             $scope.treedata = [];
+            $scope.AppUtils = AppUtils;
 
             function compareablePath(path) {
                 return scope.systeminfo.CaseSensitiveFilesystem ? path : path.toLowerCase();
@@ -38,7 +39,7 @@ backupApp.directive('restoreFilePicker', function() {
                     // Prefix filter with "@" to prevent Duplicati from
                     // mistaking literal '*' and '?' characters in paths
                     // for glob wildcard characters
-                    AppService.get('/backup/' + $scope.ngBackupId + '/files/' + encodeURIComponent(node.id) + '?prefix-only=false&folder-contents=true&time=' + encodeURIComponent($scope.ngTimestamp) + '&filter=' + encodeURIComponent('@' + node.id)).then(function(data) {
+                    AppService.get('/backup/' + $scope.ngBackupId + '/files?prefix-only=false&folder-contents=true&time=' + encodeURIComponent($scope.ngTimestamp) + '&filter=' + encodeURIComponent('@' + node.id)).then(function(data) {
                         var children = []
 
                          for(var n in data.data.Files)
@@ -204,11 +205,14 @@ backupApp.directive('restoreFilePicker', function() {
                         var map = buildSelectedMap();
                         map[c] = true;
 
-                        for (var i = p.children.length - 1; i >= 0; i--)
-                            if (!map[compareablePath(p.children[i].id)]) {
-                                all = false;
-                                break;
-                            }
+                        // A root has no parent, so p is the node itself, and its children
+                        // are only loaded once it is expanded. It is added as it is below.
+                        if (p != node)
+                            for (var i = p.children.length - 1; i >= 0; i--)
+                                if (!map[compareablePath(p.children[i].id)]) {
+                                    all = false;
+                                    break;
+                                }
 
                         if (!all  || p == node || $scope.ngSearchMode) {
                             $scope.ngSelected.push(cur.id);
@@ -218,8 +222,17 @@ backupApp.directive('restoreFilePicker', function() {
                         cur = p;
                         p = findParent(p);
 
-                        if (p == null && all && !$scope.ngSearchMode)
+                        if (p == null && all && !$scope.ngSearchMode) {
+                            // The root now covers everything below it. Remove the entries below
+                            // it, as the loop does for a folder with a parent, or they stay
+                            // selected when the root is unchecked.
+                            var rc = compareablePath(cur.id);
+                            for (var i = $scope.ngSelected.length - 1; i >= 0; i--)
+                                if (compareablePath($scope.ngSelected[i]).indexOf(rc) == 0)
+                                    $scope.ngSelected.splice(i, 1);
+
                             $scope.ngSelected.push(cur.id);
+                        }
                     }
 
                 } else {

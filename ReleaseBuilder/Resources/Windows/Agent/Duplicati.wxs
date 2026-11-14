@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?include UpgradeData.wxi ?>
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <!-- Various nice-to-have shorthands for x64/x32 -->
+  <?if $(sys.BUILDARCH) = "x64" ?>
+    <?define SystemFolder = "System64Folder" ?>
+    <?define SystemFolderX86 = "SystemFolder" ?>
+    <?define SoftwareKey = "Software" ?>
+    <?define SoftwareKeyX86 = "Software\Wow6432Node" ?>
+    <?define ProgramFilesFolder = "ProgramFiles64Folder" ?>
+    <?define ProgramFilesFolderX86 = "ProgramFilesFolder" ?>
+    <?define Suffix = "_X64" ?>
+  <?else?>
+    <?define SystemFolder = "SystemFolder" ?>
+    <?define SystemFolderX86 = "SystemFolder" ?>
+    <?define SoftwareKey = "Software" ?>
+    <?define SoftwareKeyX86 = "Software" ?>
+    <?define ProgramFilesFolder = "ProgramFilesFolder" ?>
+    <?define Suffix = "_X86" ?>
+  <?endif?>
+
+  <?define DisplayName = "Duplicati Agent" ?>
+
+  <Product Id="$(var.ProductCode)" Name="$(var.DisplayName)" Language="1033" Version="$(var.ProductVersion)" Manufacturer="$(var.Manufacturer)" UpgradeCode="$(var.UpgradeCode)">
+    <Package InstallerVersion="405" Compressed="yes" Id="$(var.PackageCode)" InstallScope="perMachine" />
+    <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" />
+
+    <!-- Pull in the custom UI flow defined below in the AgentInstallUI fragment. -->
+    <UIRef Id="DuplicatiAgentInstallUI"/>
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLLOCATION" />
+
+    <!-- Install directory of the previous version, as recorded by
+         InstallLocationComponent. SetInstallLocationFromPrevious uses it
+         to keep a custom install directory on upgrade.
+         Note: this only works when the InstallUISequence runs. In a silent
+         install AppSearch runs after the early RemoveExistingProducts has
+         removed the previous version, and with it the recorded value. -->
+    <Property Id="PREVIOUS_INSTALLLOCATION" Secure="yes">
+      <RegistrySearch Id="SearchPreviousInstallLocation"
+                      Root="HKLM"
+                      Key="$(var.SoftwareKey)\DuplicatiTeam\DuplicatiAgent\InstallState"
+                      Name="InstallLocation"
+                      Type="directory" />
+    </Property>
+
+    <Property Id="FORSERVICE" Value="false" Secure="yes" />
+    <Property Id="NOSCRIPT" Value="false" Secure="yes" />
+
+    <!-- Opt-in switch for installing a preload.json -->
+    <Property Id="INSTALL_PRELOAD" Secure="yes" />
+
+    <!-- Property from SetPreloadSource pointing to [SourceDir] -->
+    <Property Id="PRELOAD_SOURCE" Secure="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramMenuFolder" Name="Programs"/>
+      <Directory Id="DesktopFolder" Name="Desktop"/>
+    
+      <Directory Id="$(var.ProgramFilesFolder)">
+        <Directory Id="INSTALLLOCATION" Name="Duplicati Agent" >
+          <Component Id="SecureInstallDirComp" Guid="7C52A563-7182-411E-8B57-79F881775E9B">
+              <CreateFolder>
+              <!-- WiX supports permssions, wixl uses a .idt table -->
+<?if $(var.BuildEnv) = "Windows" ?>
+                <util:PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRFX;;;BU)" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension"/>
+<?endif?>
+              </CreateFolder>
+          </Component>
+
+          <!-- Always-installed component that records the install directory,
+               so the next upgrade can default to the same directory. -->
+          <Component Id="InstallLocationComponent" Guid="CE7BC761-FF8B-4E63-AE8B-6624A073DE07">
+            <RegistryKey Root="HKLM" Key="$(var.SoftwareKey)\DuplicatiTeam\DuplicatiAgent\InstallState">
+              <RegistryValue Id="InstallLocationValue" Name="InstallLocation" Value="[INSTALLLOCATION]" Type="string" KeyPath="yes" />
+            </RegistryKey>
+          </Component>
+
+          <!--Manage the Agent service. -->
+          <Component Id="DuplicatiAgentServiceComponent" Guid="9D3E5F71-2B40-4C18-8A6D-EF725B9D0413">
+            <File Id="Duplicati.WindowsService.exe"
+                  Name="Duplicati.WindowsService.exe"
+                  KeyPath="yes"
+                  DefaultVersion="$(var.ProductVersion)"
+                  Source="$(var.HarvestPath)Duplicati.WindowsService.exe" />
+
+            <ServiceInstall Id="DuplicatiAgentServiceInstall"
+                            Name="Duplicati.Agent"
+                            DisplayName="Duplicati Agent service"
+                            Description="The Duplicati Agent service"
+                            Type="ownProcess"
+                            Start="auto"
+                            ErrorControl="normal"
+                            Arguments="AGENT run"
+                            Vital="yes">
+              <!-- Register the service as Automatic (Delayed Start). Only the
+                   real WiX toolchain (Windows build) understands ServiceConfig;
+                   wixl builds get the equivalent MsiServiceConfig row injected
+                   from InstallTables.sql instead. -->
+<?if $(var.BuildEnv) = "Windows" ?>
+              <ServiceConfig DelayedAutoStart="yes" OnInstall="yes" OnReinstall="yes" />
+<?endif?>
+            </ServiceInstall>
+
+            <ServiceControl Id="DuplicatiAgentServiceControl"
+                            Name="Duplicati.Agent"
+                            Start="install"
+                            Stop="both"
+                            Remove="uninstall"
+                            Wait="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="DuplicatiCore" Title="Duplicati Agent files" Level="1" Description="Installs the required files for the Duplicati Agent." AllowAdvertise="no" Absent="disallow" ConfigurableDirectory="INSTALLLOCATION" >
+      <ComponentRef Id="SecureInstallDirComp" />
+      <ComponentRef Id="InstallLocationComponent" />
+      <ComponentRef Id="DuplicatiAgentServiceComponent" />
+      <ComponentGroupRef Id="DUPLICATIBIN" />
+    </Feature>
+     
+    <!-- Not suppored by wixl, so we do not validate the path -->
+    <!-- <CustomAction Id="WixUIValidatePath$(var.Suffix)" BinaryRef="WixUiCa$(var.Suffix)" DllEntry="ValidatePath" Return="ignore" Execute="immediate" /> -->
+    <Property Id="WIXUI_DONTVALIDATEPATH" Value="true" />
+
+    <!-- Set the Add/Remove icon -->
+    <Property Id="ARPPRODUCTICON" Value="DuplicatiIcon.exe" />
+
+    <!-- Remove old versions -->
+    <InstallExecuteSequence>
+      <!-- Note: This is suboptimal, but the ref counting is not working, so we use Early REP -->
+      <RemoveExistingProducts After="FindRelatedProducts" />
+
+      <!-- Keep the install directory of the previous version, unless one
+           was given on the command line. -->
+      <Custom Action="SetInstallLocationFromPrevious" After="AppSearch">PREVIOUS_INSTALLLOCATION AND NOT INSTALLLOCATION AND NOT Installed</Custom>
+
+      <!-- Resolves [SourceDir] into PRELOAD_SOURCE -->
+      <Custom Action="SetPreloadSource" After="CostFinalize">INSTALL_PRELOAD="true" AND NOT Installed</Custom>
+    </InstallExecuteSequence>
+
+    <InstallUISequence>
+      <!-- Pre-fill the install directory shown in InstallDirDlg with the
+           one used by the previous version. -->
+      <Custom Action="SetInstallLocationFromPrevious" After="AppSearch">PREVIOUS_INSTALLLOCATION AND NOT INSTALLLOCATION AND NOT Installed</Custom>
+    </InstallUISequence>
+
+    <Property Id="PREVIOUSVERSIONSINSTALLED" Secure="yes" />
+    <Upgrade Id="$(var.UpgradeCode)">
+      <UpgradeVersion Minimum="2.0.0.0" Property="PREVIOUSVERSIONSINSTALLED"  Maximum="99.0.0.0" IncludeMinimum="yes" IncludeMaximum="no" />
+    </Upgrade>
+
+    <Icon Id="DuplicatiIcon.exe" SourceFile="$(var.HarvestPath)Duplicati.Agent.exe" />
+
+    <!-- Resolves [SourceDir] into the PRELOAD_SOURCE property -->
+    <CustomAction Id="SetPreloadSource"
+              Property="PRELOAD_SOURCE"
+              Value="[SourceDir]"
+              Execute="immediate"
+              Return="check" />
+
+    <CustomAction Id="SetInstallLocationFromPrevious"
+              Property="INSTALLLOCATION"
+              Value="[PREVIOUS_INSTALLLOCATION]"
+              Execute="immediate"
+              Return="check" />
+  </Product>
+
+  <!--
+    Custom UI flow for the Duplicati Agent installer.
+
+    There are no install options, so the standard install-directory dialog is
+    used instead of the feature tree (WixUI_FeatureTree) or the TrayIcon's
+    InstallOptionsDlg checkbox dialog.
+
+    Dialog sequence on a fresh install:
+       WelcomeDlg -> LicenseAgreementDlg -> InstallDirDlg -> VerifyReadyDlg -> ProgressDlg -> ExitDialog
+
+    Maintenance:
+       MaintenanceWelcomeDlg -> MaintenanceTypeDlg
+         + Change   -> InstallDirDlg -> VerifyReadyDlg
+         + Repair   -> VerifyReadyDlg
+         + Remove   -> VerifyReadyDlg
+  -->
+  <Fragment>
+    <UI Id="DuplicatiAgentInstallUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="WixUI_Mode" Value="InstallDir" />
+
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="InstallDirDlg" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Condition="LicenseAccepted = &quot;1&quot;" />
+
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" Order="1" Condition="NOT Installed" />
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg"   Order="2" Condition="Installed" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="2" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg"     Order="1" Condition="NOT Installed OR WixUI_InstallMode = &quot;Change&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg"          Order="3" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="InstallDirDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back"         Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+    </UI>
+
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+</Wix>

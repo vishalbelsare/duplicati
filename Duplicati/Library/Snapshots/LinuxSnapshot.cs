@@ -1,28 +1,33 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 // 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
 // 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
 // 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-#endregion
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
+using System.Runtime.Versioning;
 using System.Text;
 using Duplicati.Library.Common.IO;
+using Duplicati.Library.Interface;
 
 namespace Duplicati.Library.Snapshots
 {
@@ -33,17 +38,24 @@ namespace Duplicati.Library.Snapshots
     /// The class presents all files and folders with their regular filenames to the caller,
     /// and internally handles the conversion to the snapshot path.
     /// </summary>
+    [SupportedOSPlatform("linux")]
+    [SupportedOSPlatform("macOS")]
     public sealed class LinuxSnapshot : SnapshotBase
     {
-		/// <summary>
+        /// <summary>
         /// The tag used for logging messages
         /// </summary>
-        public static readonly string LOGTAG = Logging.Log.LogTagFromType<WindowsSnapshot>();
+        public static readonly string LOGTAG = Logging.Log.LogTagFromType(typeof(WindowsSnapshot));
 
         /// <summary>
-        /// This is a lookup, mapping each source folder to the corresponding snapshot
+        /// This is a lookup, mapping each source folder, and each extra snapshot path, to the corresponding snapshot
         /// </summary>
         private readonly List<KeyValuePair<string, SnapShot>> m_entries;
+
+        /// <summary>
+        /// The source folders, which are the entries that are enumerated
+        /// </summary>
+        private readonly List<string> m_sourceEntries;
 
         /// <summary>
         /// This is the list of the snapshots we have created, which must be disposed
@@ -54,15 +66,19 @@ namespace Duplicati.Library.Snapshots
         /// Constructs a new snapshot module using LVM
         /// </summary>
         /// <param name="sources">The list of folders to create snapshots for</param>
-        public LinuxSnapshot(IEnumerable<string> sources)
+        /// <param name="extraSnapshotPaths">Paths that are not sources, but must be readable through the snapshot</param>
+        /// <param name="followSymlinks">A flag indicating if symlinks should be followed</param>
+        public LinuxSnapshot(IEnumerable<string> sources, IEnumerable<string> extraSnapshotPaths, bool followSymlinks)
+            : base(followSymlinks)
         {
             try
             {
                 m_entries = new List<KeyValuePair<string, SnapShot>>();
+                m_sourceEntries = sources.ToList();
 
                 // Make sure we do not create more snapshots than we have to
                 var snaps = new Dictionary<string, SnapShot>();
-                foreach (var path in sources)
+                foreach (var path in m_sourceEntries.Concat(extraSnapshotPaths))
                 {
                     var tmp = new SnapShot(path);
                     if (!snaps.TryGetValue(tmp.DeviceName, out var snap))
@@ -74,7 +90,7 @@ namespace Duplicati.Library.Snapshots
                     m_entries.Add(new KeyValuePair<string, SnapShot>(path, snap));
                 }
 
-                m_snapShots = new List<SnapShot>(snaps.Values);
+                m_snapShots = [.. snaps.Values];
 
                 // We have all the snapshots that we need, lets activate them
                 foreach (var snap in m_snapShots)
@@ -89,12 +105,32 @@ namespace Duplicati.Library.Snapshots
                 {
                     Dispose();
                 }
-				catch (Exception ex)
+                catch (Exception ex)
                 {
-					Logging.Log.WriteVerboseMessage(LOGTAG, "SnapshotCleanupError", ex, "Failed to clean up after error");
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "SnapshotCleanupError", ex, "Failed to clean up after error");
                 }
 
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// Gets the source folders
+        /// </summary>
+        public override IEnumerable<string> SourceEntries => m_sourceEntries;
+
+        /// <summary>
+        /// Enumerates the root source files and folders
+        /// </summary>
+        /// <returns>The source files and folders</returns>
+        public override IEnumerable<ISourceProviderEntry> EnumerateFilesystemEntries()
+        {
+            foreach (var sourceEntry in SourceEntries)
+            {
+                if (DirectoryExists(sourceEntry) || sourceEntry.EndsWith(System.IO.Path.DirectorySeparatorChar))
+                    yield return new SnapshotSourceFileEntry(this, Util.AppendDirSeparator(sourceEntry), true, true, false);
+                else
+                    yield return new SnapshotSourceFileEntry(this, sourceEntry, false, true, false);
             }
         }
 
@@ -106,10 +142,10 @@ namespace Duplicati.Library.Snapshots
                 if (disposing)
                 {
                     // Attempt to clean out as many as possible
-                    foreach(var s in m_snapShots)
+                    foreach (var s in m_snapShots)
                     {
                         try { s.Dispose(); }
-						catch (Exception ex) { Logging.Log.WriteVerboseMessage(LOGTAG, "SnapshotCloseError", ex, "Failed to close a snapshot"); }
+                        catch (Exception ex) { Logging.Log.WriteVerboseMessage(LOGTAG, "SnapshotCloseError", ex, "Failed to close a snapshot"); }
                     }
                 }
 
@@ -216,7 +252,7 @@ namespace Duplicati.Library.Snapshots
             /// <returns>A string with the combined output of the stdout and stderr</returns>
             private static string ExecuteCommand(string program, string commandline, int expectedExitCode)
             {
-                program = System.IO.Path.Combine(System.IO.Path.Combine(AutoUpdater.UpdaterManager.InstalledBaseDir, "lvm-scripts"), program);
+                program = System.IO.Path.Combine(System.IO.Path.Combine(Duplicati.Library.AutoUpdater.UpdaterManager.INSTALLATIONDIR, "lvm-scripts"), program);
                 var inf = new ProcessStartInfo(program, commandline)
                 {
                     CreateNoWindow = true,
@@ -461,7 +497,7 @@ namespace Duplicati.Library.Snapshots
         /// <returns>The symlink target</returns>
         public override string GetSymlinkTarget(string localPath)
         {
-            return SystemIO.IO_SYS.GetSymlinkTarget(ConvertToSnapshotPath(localPath));
+            return SystemIO.IO_OS.GetSymlinkTarget(ConvertToSnapshotPath(localPath));
         }
 
         /// <summary>
@@ -470,33 +506,33 @@ namespace Duplicati.Library.Snapshots
         /// <returns>The metadata for the given file or folder</returns>
         /// <param name="localPath">The file or folder to examine</param>
         /// <param name="isSymlink">A flag indicating if the target is a symlink</param>
-        /// <param name="followSymlink">A flag indicating if a symlink should be followed</param>
-        public override Dictionary<string, string> GetMetadata(string localPath, bool isSymlink, bool followSymlink)
+        public override Dictionary<string, string> GetMetadata(string localPath, bool isSymlink)
         {
-            return SystemIO.IO_SYS.GetMetadata(ConvertToSnapshotPath(localPath), isSymlink, followSymlink);
+            return SystemIO.IO_OS.GetMetadata(ConvertToSnapshotPath(localPath), isSymlink, FollowSymlinks);
         }
 
         /// <summary>
-        /// Gets a value indicating if the path points to a block device
+        /// Gets a value indicating if the path points to a special file: anything that is not a
+        /// regular file, a folder or a symlink, so block and character devices, FIFOs and sockets
         /// </summary>
-        /// <returns><c>true</c> if this instance is a block device; otherwise, <c>false</c>.</returns>
+        /// <returns><c>true</c> if the path is a special file; otherwise, <c>false</c>.</returns>
         /// <param name="localPath">The file or folder to examine</param>
         public override bool IsBlockDevice(string localPath)
         {
             try
             {
-                var n = UnixSupport.File.GetFileType(SystemIOLinux.NormalizePath(localPath));
+                var n = PosixFile.GetFileType(SystemIOLinux.NormalizePath(localPath));
                 switch (n)
                 {
-                    case UnixSupport.File.FileType.Directory:
-                    case UnixSupport.File.FileType.Symlink:
-                    case UnixSupport.File.FileType.File:
+                    case PosixFile.FileType.Directory:
+                    case PosixFile.FileType.Symlink:
+                    case PosixFile.FileType.File:
                         return false;
                     default:
                         return true;
                 }
-            } 
-            catch 
+            }
+            catch
             {
                 if (!System.IO.File.Exists(SystemIOLinux.NormalizePath(localPath)))
                     return false;
@@ -504,7 +540,7 @@ namespace Duplicati.Library.Snapshots
                 throw;
             }
         }
-        
+
         /// <summary>
         /// Gets a unique hardlink target ID
         /// </summary>
@@ -513,11 +549,11 @@ namespace Duplicati.Library.Snapshots
         public override string HardlinkTargetID(string localPath)
         {
             var snapshotPath = ConvertToSnapshotPath(localPath);
-            
-            if (UnixSupport.File.GetHardlinkCount(snapshotPath) <= 1)
+
+            if (PosixFile.GetHardlinkCount(snapshotPath) <= 1)
                 return null;
-            
-            return UnixSupport.File.GetInodeTargetID(snapshotPath);
+
+            return PosixFile.GetInodeTargetID(snapshotPath);
         }
 
         /// <inheritdoc />
@@ -531,9 +567,6 @@ namespace Duplicati.Library.Snapshots
         {
             return FindSnapshotByLocalPath(localPath).ConvertToSnapshotPath(localPath);
         }
-
-        /// <inheritdoc />
-        public override bool IsSnapshot => true;
 
         #endregion
     }

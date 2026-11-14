@@ -1,35 +1,42 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2019, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 //
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
 //
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
 //
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-//
-#endregion
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using Duplicati.Library.Utility;
 using Duplicati.Library.Common.IO;
-using Duplicati.Library.Common;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Main.Database;
+using System.Threading.Tasks;
+using Duplicati.Library.Main.Operation.Common;
+using System.IO;
+using Duplicati.Library.Backends;
+using Duplicati.Library.Main.Database.Local;
+using Duplicati.Library.Main.Database.Sync;
 
 namespace Duplicati.Library.Main
 {
-    public class Controller : IDisposable
+    public class Controller : IDisposable, IController
     {
         /// <summary>
         /// The tag used for logging
@@ -38,323 +45,611 @@ namespace Duplicati.Library.Main
         /// <summary>
         /// The backend url
         /// </summary>
-        private string m_backend;
+        private string m_backendUrl;
         /// <summary>
         /// The parsed type-safe version of the commandline options
         /// </summary>
         private readonly Options m_options;
         /// <summary>
+        /// The optional secret provider, if none provided in options
+        /// </summary>
+        public ISecretProvider SecretProvider { get; private set; }
+        /// <summary>
         /// The destination for all output messages during execution
         /// </summary>
         private IMessageSink m_messageSink;
 
+        // TODO: The m_current* approach here prevents us from having multiple concurrent operations
+
         /// <summary>
         /// The current executing task
         /// </summary>
-        private ITaskControl m_currentTask = null;
+        private ITaskControl m_currentTaskControl = null;
 
         /// <summary>
-        /// The thread running the current task
+        /// Guards the current task control together with the requests kept for it
         /// </summary>
-        private System.Threading.Thread m_currentTaskThread = null;
+        private readonly object m_taskControlLock = new object();
 
         /// <summary>
-        /// The thread priority to reset to
+        /// Set once an operation has started on this controller
         /// </summary>
-        private System.Threading.ThreadPriority? m_resetPriority;
+        private bool m_operationStarted = false;
 
         /// <summary>
-        /// The localization culture to reset to
+        /// Set while an operation runs that reads a sync job's destination, such as listing
+        /// or restoring its snapshots. Such an operation uses the sync database of the job,
+        /// which has its own schema and must never be opened as a backup database.
         /// </summary>
-        private System.Globalization.CultureInfo m_resetLocale;
+        private bool m_syncDatabaseOperation;
 
         /// <summary>
-        /// The localization UI culture to reset to
+        /// Whether the current operation keeps its state in the sync database
         /// </summary>
-        private System.Globalization.CultureInfo m_resetLocaleUI;
+        private bool UsesSyncDatabase => m_options.MainAction == OperationMode.Sync || m_syncDatabaseOperation;
 
         /// <summary>
-        /// True if the locale should be reset
+        /// A stop asked for before the first operation started, applied when it starts
         /// </summary>
-        private bool m_doResetLocale;
+        private bool m_stopBeforeStart = false;
 
         /// <summary>
-        /// The multi-controller log target
+        /// An abort asked for before the first operation started, applied when it starts
         /// </summary>
-        private ControllerMultiLogTarget m_logTarget;
+        private bool m_abortBeforeStart = false;
 
         /// <summary>
-        /// The cancellation token for the running task
+        /// The current backend manager
         /// </summary>
-        private readonly CancellationTokenSource m_cancellationTokenSource = new CancellationTokenSource();
+        private IBackendManager m_currentBackendManager = null;
+
+        /// <summary>
+        /// If not null, active locale change that needs to be reset
+        /// </summary>
+        private LocaleChange m_localeChange = null;
+
+        /// <summary>
+        /// The handle for the report modules loaded for the current operation. Set in
+        /// <see cref="ReportModuleController.SetupAsync"/> and disposed in
+        /// <see cref="OperationCompleteAsync"/> so the completion callbacks fire before the
+        /// module instances themselves are disposed.
+        /// </summary>
+        private ReportModuleController.ReportModulesHandle ReportModulesHandler;
+
+        /// <summary>
+        /// The ID of the job log entry holding the results of the current operation, or -1 if none was written.
+        /// The reports are sent after the results are written, so a report that fails is added to the entry afterwards.
+        /// </summary>
+        private long m_resultLogId = -1;
+
+        /// <summary>
+        /// The number of warnings and errors the results held when they were written to the job log.
+        /// </summary>
+        private int m_resultLogIssueCount;
+
+        /// <summary>
+        /// Callback method invoked when an operation is started
+        /// </summary>
+        public Action<IBasicResults> OnOperationStarted { get; set; }
+
+        /// <summary>
+        /// Callback method invoked when an operation is completed
+        /// </summary>
+        public Action<IBasicResults, Exception> OnOperationCompleted { get; set; }
+
+        /// <summary>
+        /// The names of the options that stop the operation when they are not supported, instead of
+        /// being ignored with a warning. The command line sets it to the options that were typed, so
+        /// a misspelled option does not run the operation without it, while saved jobs and the
+        /// options of modules that are not loaded keep working elsewhere.
+        /// </summary>
+        public IReadOnlySet<string> RejectUnsupportedOptions { get; set; }
+
+        /// <summary>
+        /// The names of the options that the caller handles itself, such as the options of the
+        /// command line tool, so they are not reported as unsupported.
+        /// </summary>
+        public IReadOnlySet<string> OptionsHandledByCaller { get; set; }
 
         /// <summary>
         /// Constructs a new interface for performing backup and restore operations
         /// </summary>
-        /// <param name="backend">The url for the backend to use</param>
+        /// <param name="backendUrl">The url for the backend to use</param>
         /// <param name="options">All required options</param>
-        public Controller(string backend, Dictionary<string, string> options, IMessageSink messageSink)
+        public Controller(string backendUrl, Dictionary<string, string> options, IMessageSink messageSink)
         {
-            m_backend = backend;
+            m_backendUrl = backendUrl;
             m_options = new Options(options);
             m_messageSink = messageSink;
         }
 
-        /// <summary>
-        /// Appends another message sink to the controller
-        /// </summary>
-        /// <param name="sink">The sink to use.</param>
-        public void AppendSink(IMessageSink sink)
+        /// <inheritdoc />
+        public Task AppendSinkAsync(IMessageSink sink)
         {
             if (this.m_messageSink is MultiMessageSink messageSink)
                 messageSink.Append(sink);
             else
                 m_messageSink = new MultiMessageSink(m_messageSink, sink);
+            return Task.CompletedTask;
         }
 
-        public Duplicati.Library.Interface.IBackupResults Backup(string[] inputsources, IFilter filter = null)
+        /// <inheritdoc />
+        public Task SetSecretProviderAsync(ISecretProvider secretProvider)
         {
-            Library.UsageReporter.Reporter.Report("USE_BACKEND", new Library.Utility.Uri(m_backend).Scheme);
-            Library.UsageReporter.Reporter.Report("USE_COMPRESSION", m_options.CompressionModule);
-            Library.UsageReporter.Reporter.Report("USE_ENCRYPTION", m_options.EncryptionModule);
+            SecretProvider = secretProvider;
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// The provider that supplies a backup with the paths that changed since the previous backup, if any
+        /// </summary>
+        public IChangeListProvider ChangeListProvider { get; private set; }
+
+        /// <inheritdoc />
+        public Task SetChangeListProviderAsync(IChangeListProvider changeListProvider)
+        {
+            ChangeListProvider = changeListProvider;
+            return Task.CompletedTask;
+        }
+
+        /// <inheritdoc />
+        public async Task<IBackupResults> BackupAsync(string[] inputsources, IFilter inputFilter = null)
+        {
+            UsageReporter.Reporter.Report("USE_BACKEND", new Library.Utility.RelaxedUri(m_backendUrl).Scheme);
+            UsageReporter.Reporter.Report("USE_COMPRESSION", m_options.CompressionModule);
+            UsageReporter.Reporter.Report("USE_ENCRYPTION", m_options.EncryptionModule);
+
+            // Warn about experimental tar-based compression modules
+            if (m_options.CompressionModule.Equals("tzstd", StringComparison.OrdinalIgnoreCase) ||
+                m_options.CompressionModule.Equals("tgz", StringComparison.OrdinalIgnoreCase))
+            {
+                Logging.Log.WriteWarningMessage(LOGTAG, "ExperimentalCompressionModule", null, $"The compression module '{m_options.CompressionModule}' is experimental and for testing only.");
+            }
 
             CheckAutoCompactInterval();
             CheckAutoVacuumInterval();
+            SourceProviderFactory.EnableMetadataStorageIfRequiredBySources(inputsources, m_options.RawOptions);
+            SourceProviderFactory.EnableCaseSensitiveFiltersIfRequiredBySources(inputsources, m_options.RawOptions);
 
-            return RunAction(new BackupResults(), ref inputsources, ref filter, (result) => {
+            return await RunActionAsync(new BackupResults(), inputsources, inputFilter, new { lastRestoreTest = m_lastRestoreTest, changeListProvider = ChangeListProvider }, static async config =>
+            {
+                var (expandedSources, filter) = ExpandInputSources(config.Paths, config.Filter, config.Options);
+                using (var h = new Operation.BackupHandler(config.Options, config.Result, config.Context.changeListProvider))
+                    await h.RunAsync(expandedSources, config.BackendManager, filter)
+                        .ConfigureAwait(false);
 
-                using (var h = new Operation.BackupHandler(m_backend, m_options, result))
+                UsageReporter.Reporter.Report("BACKUP_FILECOUNT", config.Result.ExaminedFiles);
+                UsageReporter.Reporter.Report("BACKUP_FILESIZE", config.Result.SizeOfExaminedFiles);
+                UsageReporter.Reporter.Report("BACKUP_DURATION", (long)config.Result.Duration.TotalSeconds);
+
+                // The backup handler has released the database at this point, so the restore test can open it
+                await RunPostBackupRestoreTestAsync(config.Options, config.Result, config.BackendManager, config.LogTarget, config.Context.lastRestoreTest).ConfigureAwait(false);
+
+                using (var h = new Operation.RemoteSynchronizationHandler(config.BackendUrl, config.Options, config.Result))
+                    await h.RunAsync()
+                        .ConfigureAwait(false);
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Runs a restore test as the last step of a backup, when the interval given by
+        /// <c>--perform-restore-test-after</c> has passed since the previous restore test.
+        /// The time of the previous restore test is supplied by the server when available,
+        /// and is otherwise read from the operation log in the local database.
+        /// </summary>
+        /// <param name="options">The options</param>
+        /// <param name="result">The backup results to attach the restore test results to</param>
+        /// <param name="backendManager">The backend manager</param>
+        /// <param name="logTarget">The log target of the backup, which collects the restore test messages in the restore test results</param>
+        /// <param name="lastRestoreTest">The time of the previous restore test as supplied by the caller, or <see cref="DateTime.MinValue"/> if unknown</param>
+        private static async Task RunPostBackupRestoreTestAsync(Options options, BackupResults result, IBackendManager backendManager, ControllerMultiLogTarget logTarget, DateTime lastRestoreTest)
+        {
+            var interval = options.PerformRestoreTestAfter;
+            if (interval <= TimeSpan.Zero || options.Dryrun)
+                return;
+
+            var token = result.TaskControl.ProgressToken;
+            if (result.TaskControl.StopToken.IsCancellationRequested || token.IsCancellationRequested)
+                return;
+
+            if (lastRestoreTest <= DateTime.MinValue && !options.NoLocalDb && !string.IsNullOrWhiteSpace(options.Dbpath) && File.Exists(options.Dbpath))
+            {
+                try
                 {
-                    h.Run(ExpandInputSources(inputsources, filter), filter, m_cancellationTokenSource.Token);
+                    await using var db = await LocalDatabase.CreateLocalDatabaseAsync(options.Dbpath, null, true, null, token).ConfigureAwait(false);
+                    lastRestoreTest = await db.GetLastOperationTimeAsync(OperationMode.RestoreTest.ToString(), token).ConfigureAwait(false);
                 }
+                catch (Exception ex)
+                {
+                    Logging.Log.WriteWarningMessage(LOGTAG, "LastRestoreTestLookupFailed", ex, "Failed to look up the time of the last restore test: {0}", ex.Message);
+                }
+            }
 
-                Library.UsageReporter.Reporter.Report("BACKUP_FILECOUNT", result.ExaminedFiles);
-                Library.UsageReporter.Reporter.Report("BACKUP_FILESIZE", result.SizeOfExaminedFiles);
-                Library.UsageReporter.Reporter.Report("BACKUP_DURATION", (long)result.Duration.TotalSeconds);
-            });
-        }
-
-        public Library.Interface.IRestoreResults Restore(string[] paths, Library.Utility.IFilter filter = null)
-        {
-            return RunAction(new RestoreResults(), ref paths, ref filter, (result) => {
-                new Operation.RestoreHandler(m_backend, m_options, result).Run(paths, filter);
-
-                Library.UsageReporter.Reporter.Report("RESTORE_FILECOUNT", result.RestoredFiles);
-                Library.UsageReporter.Reporter.Report("RESTORE_FILESIZE", result.SizeOfRestoredFiles);
-                Library.UsageReporter.Reporter.Report("RESTORE_DURATION", (long)result.Duration.TotalSeconds);
-            });
-        }
-
-        public Duplicati.Library.Interface.IRestoreControlFilesResults RestoreControlFiles(IEnumerable<string> files = null, Library.Utility.IFilter filter = null)
-        {
-            return RunAction(new RestoreControlFilesResults(), ref filter, (result) => {
-                new Operation.RestoreControlFilesHandler(m_backend, m_options, result).Run(files, filter);
-            });
-        }
-
-        public Duplicati.Library.Interface.IDeleteResults Delete()
-        {
-            return RunAction(new DeleteResults(), (result) => {
-                new Operation.DeleteHandler(m_backend, m_options, result).Run();
-            });
-        }
-
-        public Duplicati.Library.Interface.IRepairResults Repair(Library.Utility.IFilter filter = null)
-        {
-            return RunAction(new RepairResults(), ref filter, (result) => {
-                new Operation.RepairHandler(m_backend, m_options, result).Run(filter);
-            });
-        }
-
-        public Duplicati.Library.Interface.IListResults List()
-        {
-            return List(null, null);
-        }
-
-        public Duplicati.Library.Interface.IListResults List(string filterstring)
-        {
-            return List(filterstring == null ? null : new string[] { filterstring }, null);
-        }
-
-        public Duplicati.Library.Interface.IListResults List(IEnumerable<string> filterstrings, Library.Utility.IFilter filter)
-        {
-            return RunAction(new ListResults(), ref filter, (result) => {
-                new Operation.ListFilesHandler(m_backend, m_options, result).Run(filterstrings, filter);
-            });
-        }
-
-        public Duplicati.Library.Interface.IListResults ListControlFiles(IEnumerable<string> filterstrings, Library.Utility.IFilter filter)
-        {
-            return RunAction(new ListResults(), ref filter, (result) => {
-                new Operation.ListControlFilesHandler(m_backend, m_options, result).Run(filterstrings, filter);
-            });
-        }
-
-        public Duplicati.Library.Interface.IListRemoteResults ListRemote()
-        {
-            return RunAction(new ListRemoteResults(), (result) =>
+            if (lastRestoreTest > DateTime.MinValue && lastRestoreTest.ToUniversalTime().Add(interval) > DateTime.UtcNow)
             {
-                using (var tf = System.IO.File.Exists(m_options.Dbpath) ? null : new Library.Utility.TempFile())
-                using (var db = new Database.LocalDatabase(((string)tf) ?? m_options.Dbpath, "list-remote", true))
-                using (var bk = new BackendManager(m_backend, m_options, result.BackendWriter, null))
-                    result.SetResult(bk.List());
-            });
+                Logging.Log.WriteInformationMessage(LOGTAG, "RestoreTestSkipped", "Skipping restore test until {0}", lastRestoreTest.ToLocalTime().Add(interval));
+                return;
+            }
+
+            result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_PostBackupRestoreTest);
+            var restoreTestResults = new RestoreTestResults(result);
+            result.RestoreTestResults = restoreTestResults;
+
+            // The restore test is reported on its own: its messages still reach the log files, sinks and the
+            // outer log scopes, but are collected in its own result and never in the backup's, so a failed test
+            // does not fail the backup
+            using (logTarget.CollectInNestedResult(restoreTestResults))
+            {
+                try
+                {
+                    await new Operation.RestoreTestHandler(options, restoreTestResults)
+                        .RunAsync(backendManager, null)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex) when (!ex.IsAbortOrCancelException())
+                {
+                    // The backup itself completed, so a restore test that cannot run is an error on the restore test, not on the backup
+                    Logging.Log.WriteErrorMessage(LOGTAG, "RestoreTestFailed", ex, "The restore test after the backup failed: {0}", ex.Message);
+                }
+                finally
+                {
+                    if (restoreTestResults.EndTime.Ticks == 0)
+                        restoreTestResults.EndTime = DateTime.UtcNow;
+                }
+            }
         }
 
-        public Duplicati.Library.Interface.IListRemoteResults DeleteAllRemoteFiles()
+        /// <inheritdoc />
+        public async Task<IRestoreResults> RestoreAsync(string[] paths, IFilter inputFilter = null)
         {
-            return RunAction(new ListRemoteResults(), (result) =>
+            return await RunActionAsync(new RestoreResults(), null, inputFilter, new { paths }, static async config =>
             {
-                result.OperationProgressUpdater.UpdatePhase(OperationPhase.Delete_Listing);
-                using (var bk = new BackendManager(m_backend, m_options, result.BackendWriter, null))
+                // Written as "--restore-path <folder>", the option has no value and the folder is taken as a path to restore
+                if (config.Options.RawOptions.ContainsKey("restore-path") && string.IsNullOrWhiteSpace(config.Options.Restorepath))
+                    throw new UserInformationException("The option --restore-path has no value. Write it as --restore-path=<folder>, or leave it out to restore to the original location.", "RestorePathHasNoValue");
+
+                using var restoreDestination =
+                    (config.Options.Restorepath ?? "").StartsWith("@")
+
+                    // Remote destination
+                    ? await DynamicLoader.RestoreDestinationProviderLoader.GetRestoreDestinationProvider(
+                        config.Options.Restorepath.Substring(1),
+                        config.Options.RawOptions,
+                        config.Result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false)
+
+                    // Local destination
+                    : new SourceProvider.FileRestoreDestinationProvider(config.Options.Restorepath ?? "", config.Options.AllowRestoreOutsideTargetDirectory, config.Options.Overwrite);
+
+                if (restoreDestination == null)
+                    throw new UserInformationException($"Could not find restore destination for path: {config.Options.Restorepath}", "InvalidRestoreDestination");
+
+                await new Operation.RestoreHandler(config.Options, config.Result)
+                    .RunAsync(config.Context.paths, config.BackendManager, config.Filter, restoreDestination, config.BackendUrl)
+                    .ConfigureAwait(false);
+
+                // A stopped restore, or one where files failed, returns normally; the
+                // destination is told, so it does not present the result as complete
+                var isComplete = !config.Result.TaskControl.StopToken.IsCancellationRequested
+                    && config.Result.BrokenLocalFiles.Count == 0
+                    && config.Result.BrokenRemoteFiles.Count == 0;
+
+                await restoreDestination.Finalize((pg) =>
+                {
+                    config.Result.OperationProgressUpdater.UpdateProgress((float)pg);
+                }, isComplete, config.Result.TaskControl.ProgressToken).ConfigureAwait(false);
+                config.Result.OperationProgressUpdater.UpdatePhase(OperationPhase.Restore_Complete);
+                config.Result.EndTime = DateTime.UtcNow;
+
+                UsageReporter.Reporter.Report("RESTORE_FILECOUNT", config.Result.RestoredFiles);
+                UsageReporter.Reporter.Report("RESTORE_FILESIZE", config.Result.SizeOfRestoredFiles);
+                UsageReporter.Reporter.Report("RESTORE_DURATION", (long)config.Result.Duration.TotalSeconds);
+            }).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<IRestoreControlFilesResults> RestoreControlFilesAsync(IEnumerable<string> files = null, IFilter inputFilter = null)
+        {
+            return await RunActionAsync(new RestoreControlFilesResults(), null, inputFilter, new { files }, static config =>
+                new Operation.RestoreControlFilesHandler(config.Options, config.Result)
+                    .RunAsync(config.Context.files?.ToArray(), config.BackendManager, config.Filter)
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<IDeleteResults> DeleteAsync()
+        {
+            return await RunActionAsync(new DeleteResults(), null, null, false, static config =>
+                new Operation.DeleteHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager)
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<IRepairResults> RepairAsync(IFilter inputFilter = null)
+        {
+            return await RunActionAsync(new RepairResults(), null, inputFilter, false, static config =>
+                new Operation.RepairHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager, config.Filter)
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<IListFilesetResults> ListFilesetsAsync()
+            => await RunActionAsync(new ListFilesetResults(), null, null, false, static config =>
+                Operation.ListFilesetsHandler.RunAsync(config.Options, config.Result, config.BackendManager)
+            ).ConfigureAwait(false);
+
+        /// <inheritdoc />
+        public async Task<ISetVersionLabelResults> SetVersionLabelAsync()
+            => await RunActionAsync(new SetVersionLabelResults(), null, null, false, static config =>
+                Operation.SetVersionLabelHandler.RunAsync(config.Options, config.Result)
+            ).ConfigureAwait(false);
+
+        /// <inheritdoc />
+        public async Task<IListFolderResults> ListFolderAsync(string[] folders, long offset, long limit, bool extendedData)
+            => await RunActionAsync(new ListFolderResults(), null, null, new { folders, offset, limit, extendedData }, static config =>
+                Operation.ListFolderHandler.RunAsync(config.Options, config.Result, config.Context.folders, config.Context.offset, config.Context.limit, config.Context.extendedData)
+            ).ConfigureAwait(false);
+
+        /// <inheritdoc />
+        public async Task<IListFileVersionsResults> ListFileVersionsAsync(string[] files, long offset, long limit)
+            => await RunActionAsync(new ListFileVersionsResults(), null, null, new { files, offset, limit }, static config =>
+                Operation.ListFileVersionsHandler.RunAsync(config.Options, config.Result, config.Context.files, config.Context.offset, config.Context.limit)
+            ).ConfigureAwait(false);
+
+        /// <inheritdoc />
+        public async Task<ISearchFilesResults> SearchEntriesAsync(string[] pathprefixes, IFilter inputFilter, bool caseSensitive, long offset, long limit, bool returnExtendedData, bool searchMetadata)
+            => await RunActionAsync(new SearchFilesResults(), null, inputFilter, new { pathprefixes, caseSensitive, offset, limit, returnExtendedData, searchMetadata }, static config =>
+                Operation.SearchEntriesHandler.RunAsync(config.Options, config.Result, config.Context.pathprefixes, config.Filter, config.Context.caseSensitive, config.Context.offset, config.Context.limit, config.Context.returnExtendedData, config.Context.searchMetadata)
+            ).ConfigureAwait(false);
+
+        /// <inheritdoc />
+        public Task<IListResults> ListAsync()
+            => ListAsync(null, null);
+
+        /// <inheritdoc />
+        public Task<IListResults> ListAsync(string filterstring)
+            => ListAsync(filterstring == null ? null : new string[] { filterstring }, null);
+
+        /// <inheritdoc />
+        public async Task<IListResults> ListAsync(IEnumerable<string> filterstrings, IFilter inputFilter)
+        {
+            return await RunActionAsync(new ListResults(), null, inputFilter, new { filterstrings }, static config =>
+                new Operation.ListFilesHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager, config.Context.filterstrings?.ToArray(), config.Filter)
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<IListResults> ListControlFilesAsync(IEnumerable<string> filterstrings, IFilter inputFilter)
+        {
+            return await RunActionAsync(new ListResults(), null, inputFilter, new { filterstrings }, static config =>
+                new Operation.ListControlFilesHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager, config.Context.filterstrings?.ToArray(), config.Filter)
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<IListRemoteResults> ListRemoteAsync()
+        {
+            return await RunActionAsync(new ListRemoteResults(), null, null, false, static async config =>
+            {
+                using var tf = File.Exists(config.Options.Dbpath) ? null : new TempFile();
+                await using var db = await LocalDatabase.CreateLocalDatabaseAsync(((string)tf) ?? config.Options.Dbpath, "list-remote", true, null, config.Result.TaskControl.ProgressToken).ConfigureAwait(false);
+                config.Result.SetResult(await config.BackendManager.ListAsync(null, CancellationToken.None).ConfigureAwait(false));
+            }).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<IListRemoteResults> DeleteAllRemoteFilesAsync()
+        {
+            return await RunActionAsync(new ListRemoteResults(), null, null, false, static async config =>
+            {
+                config.Result.OperationProgressUpdater.UpdatePhase(OperationPhase.Delete_Listing);
                 {
                     // Only delete files that match the expected pattern and prefix
-                    var list = bk.List()
+                    var list = (await config.BackendManager.ListAsync(null, config.Result.TaskControl.ProgressToken).ConfigureAwait(false))
                         .Select(x => Volumes.VolumeBase.ParseFilename(x))
                         .Where(x => x != null)
-                        .Where(x => x.Prefix == m_options.Prefix)
+                        .Where(x => x.Prefix == config.Options.Prefix)
                         .ToList();
 
                     // If the local database is available, we will use it to avoid deleting unrelated files
-                    // from the backend.  Otherwise, we may accidentally delete non-Duplicati files, or
+                    // from the backend. Otherwise, we may accidentally delete non-Duplicati files, or
                     // files from a different Duplicati configuration that points to the same backend location
                     // and uses the same prefix (see issues #2678, #3845, and #4244).
-                    if (System.IO.File.Exists(m_options.Dbpath))
+                    if (File.Exists(config.Options.Dbpath))
                     {
-                        using (LocalDatabase db = new LocalDatabase(m_options.Dbpath, "list-remote", true))
-                        {
-                            IEnumerable<RemoteVolumeEntry> dbRemoteVolumes = db.GetRemoteVolumes();
-                            HashSet<string> dbRemoteFiles = new HashSet<string>(dbRemoteVolumes.Select(x => x.Name));
-                            list = list.Where(x => dbRemoteFiles.Contains(x.File.Name)).ToList();
-                        }
+                        await using LocalDatabase db = await LocalDatabase.CreateLocalDatabaseAsync(config.Options.Dbpath, "list-remote", true, null, config.Result.TaskControl.ProgressToken).ConfigureAwait(false);
+                        var dbRemoteVolumes = db.GetRemoteVolumesAsync(config.Result.TaskControl.ProgressToken);
+                        var dbRemoteFiles = await dbRemoteVolumes
+                            .Select(x => x.Name)
+                            .ToHashSetAsync(cancellationToken: config.Result.TaskControl.ProgressToken)
+                            .ConfigureAwait(false);
+                        list = list.Where(x =>
+                            dbRemoteFiles.Contains(x.File.Name)
+                        ).ToList();
                     }
 
-                    result.OperationProgressUpdater.UpdatePhase(OperationPhase.Delete_Deleting);
-                    result.OperationProgressUpdater.UpdateProgress(0);
+                    config.Result.OperationProgressUpdater.UpdatePhase(OperationPhase.Delete_Deleting);
+                    config.Result.OperationProgressUpdater.UpdateProgress(0);
                     for (var i = 0; i < list.Count; i++)
                     {
                         try
                         {
-                            bk.Delete(list[i].File.Name, list[i].File.Size, true);
+                            if (config.Options.Dryrun)
+                            {
+                                Logging.Log.WriteDryrunMessage(LOGTAG, "WouldDeleteFile", "Would delete file: {0}", list[i].File.Name);
+                            }
+                            else
+                            {
+                                await config.BackendManager.DeleteAsync(list[i].File.Name, list[i].File.Size, true, config.Result.TaskControl.ProgressToken).ConfigureAwait(false);
+                            }
                         }
                         catch (Exception ex)
                         {
                             Logging.Log.WriteWarningMessage(LOGTAG, "DeleteFilesetError", ex, "Failed to delete remote file: {0}", list[i].File.Name);
                         }
-                        result.OperationProgressUpdater.UpdateProgress((float)i / list.Count);
+                        config.Result.OperationProgressUpdater.UpdateProgress((float)i / list.Count);
                     }
-                    result.OperationProgressUpdater.UpdateProgress(1);
+                    config.Result.OperationProgressUpdater.UpdateProgress(1);
                 }
-            });
+            }).ConfigureAwait(false);
         }
 
-        public Duplicati.Library.Interface.ICompactResults Compact()
+        /// <inheritdoc />
+        public async Task<ICompactResults> CompactAsync()
         {
             CheckAutoVacuumInterval();
 
-            return RunAction(new CompactResults(), (result) => {
-                new Operation.CompactHandler(m_backend, m_options, result).Run();
-            });
+            return await RunActionAsync(new CompactResults(), null, null, false, static config =>
+                new Operation.CompactHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager)
+            ).ConfigureAwait(false);
         }
 
-        public Duplicati.Library.Interface.IRecreateDatabaseResults UpdateDatabaseWithVersions(Library.Utility.IFilter filter = null)
+        /// <inheritdoc />
+        public async Task<ISetLockResults> SetLocksAsync()
         {
-            var filelistfilter = Operation.RestoreHandler.FilterNumberedFilelist(m_options.Time, m_options.Version, singleTimeMatch: true);
-
-            return RunAction(new RecreateDatabaseResults(), ref filter, (result) => {
-                using(var h = new Operation.RecreateDatabaseHandler(m_backend, m_options, result))
-                    h.RunUpdate(filter, filelistfilter);
-            });
+            return await RunActionAsync(new SetLockResults(), null, null, false, static config =>
+                new Operation.SetLocksHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager)
+            ).ConfigureAwait(false);
         }
 
-        public Duplicati.Library.Interface.ICreateLogDatabaseResults CreateLogDatabase(string targetpath)
+        /// <inheritdoc />
+        public async Task<IReadLockInfoResults> ReadLockInfoAsync()
         {
-            var t = new string[] { targetpath };
-
-            return RunAction(new CreateLogDatabaseResults(), ref t, (result) => {
-                new Operation.CreateBugReportHandler(t[0], m_options, result).Run();
-            });
+            return await RunActionAsync(new ReadLockInfoResults(), null, null, false, static config =>
+                new Operation.ReadLockInfoHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager)
+            ).ConfigureAwait(false);
         }
 
-        public Duplicati.Library.Interface.IListChangesResults ListChanges(string baseVersion, string targetVersion, IEnumerable<string> filterstrings = null, Library.Utility.IFilter filter = null, Action<Duplicati.Library.Interface.IListChangesResults, IEnumerable<Tuple<Library.Interface.ListChangesChangeType, Library.Interface.ListChangesElementType, string>>> callback = null)
+        /// <inheritdoc />
+        public async Task<IRecreateDatabaseResults> UpdateDatabaseWithVersionsAsync(IFilter inputFilter = null)
         {
-            var t = new string[] { baseVersion, targetVersion };
-
-            return RunAction(new ListChangesResults(), ref t, ref filter, (result) => {
-                new Operation.ListChangesHandler(m_backend, m_options, result).Run(t[0], t[1], filterstrings, filter, callback);
-            });
+            return await RunActionAsync(new RecreateDatabaseResults(), null, inputFilter, false, static async config =>
+            {
+                var filelistfilter = Operation.RestoreHandler.GetNumberedFilelistFilterDelegate(config.Options.Time, config.Options.Version, singleTimeMatch: true);
+                using (var h = new Operation.RecreateDatabaseHandler(config.Options, config.Result))
+                    await h.RunUpdateAsync(config.BackendManager, config.Filter, filelistfilter, null)
+                        .ConfigureAwait(false);
+            }).ConfigureAwait(false);
         }
 
-        public Duplicati.Library.Interface.IListAffectedResults ListAffected(List<string> args, Action<Duplicati.Library.Interface.IListAffectedResults> callback = null)
+        /// <inheritdoc />
+        public async Task<ICreateLogDatabaseResults> CreateLogDatabaseAsync(string targetpath)
         {
-            return RunAction(new ListAffectedResults(), (result) => {
-                new Operation.ListAffected(m_options, result).Run(args, callback);
-            });
+            return await RunActionAsync(new CreateLogDatabaseResults(), null, null, new { targetpath }, static async config =>
+                await new Operation.CreateBugReportHandler(config.Context.targetpath, config.Options, config.Result).RunAsync()
+            ).ConfigureAwait(false);
         }
 
-        public Duplicati.Library.Interface.ITestResults Test(long samples = 1)
+        /// <inheritdoc />
+        public async Task<IListChangesResults> ListChangesAsync(string baseVersion, string targetVersion, IEnumerable<string> filterstrings = null, IFilter inputFilter = null, Action<IListChangesResults, IEnumerable<Tuple<ListChangesChangeType, ListChangesElementType, string>>> callback = null)
+        {
+
+            return await RunActionAsync(new ListChangesResults(), null, inputFilter, new { baseVersion, targetVersion, filterstrings, callback }, async static config =>
+                await new Operation.ListChangesHandler(config.Options, config.Result)
+                    .RunAsync(config.Context.baseVersion, config.Context.targetVersion, config.BackendManager, config.Context.filterstrings, config.Filter, config.Context.callback)
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<IListAffectedResults> ListAffectedAsync(List<string> args, Action<IListAffectedResults> callback = null)
+        {
+            return await RunActionAsync(new ListAffectedResults(), null, null, new { args, callback }, static config =>
+                new Operation.ListAffected(config.Options, config.Result)
+                    .RunAsync(config.Context.args?.ToArray(), config.Context.callback)
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<ITestResults> TestAsync(long samples = 1)
         {
             if (!m_options.RawOptions.ContainsKey("full-remote-verification"))
                 m_options.RawOptions["full-remote-verification"] = "true";
-                
-            return RunAction(new TestResults(), (result) => {
-                new Operation.TestHandler(m_backend, m_options, result).Run(samples);
-            });
+
+            return await RunActionAsync(new TestResults(), null, null, new { samples }, static config =>
+                new Operation.TestHandler(config.Options, config.Result)
+                    .RunAsync(config.Context.samples, config.BackendManager)
+            ).ConfigureAwait(false);
         }
 
-        public Library.Interface.ITestFilterResults TestFilter(string[] paths, Library.Utility.IFilter filter = null)
+        /// <inheritdoc />
+        public async Task<IRestoreTestResults> RestoreTestAsync(IFilter inputFilter = null)
+        {
+            return await RunActionAsync(new RestoreTestResults(), null, inputFilter, false, static config =>
+                new Operation.RestoreTestHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager, config.Filter)
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
+        public async Task<ITestFilterResults> TestFilterAsync(string[] paths, IFilter inputFilter = null)
         {
             m_options.RawOptions["dry-run"] = "true";
             m_options.RawOptions["dbpath"] = "INVALID!";
+            SourceProviderFactory.EnableCaseSensitiveFiltersIfRequiredBySources(paths, m_options.RawOptions);
 
             // Redirect all messages from the filter to the message sink
             var filtertag = Logging.Log.LogTagFromType(typeof(Operation.Backup.FileEnumerationProcess));
             using (Logging.Log.StartScope(m_messageSink.WriteMessage, x => x.FilterTag.Contains(filtertag)))
             {
-                return RunAction(new TestFilterResults(), ref paths, ref filter, (result) =>
+                return await RunActionAsync(new TestFilterResults(), paths, inputFilter, false, static config =>
                 {
-                    new Operation.TestFilterHandler(m_options, result).Run(ExpandInputSources(paths, filter), filter, m_cancellationTokenSource.Token);
-                });
+                    var (expandedSources, filter) = ExpandInputSources(config.Paths, config.Filter, config.Options);
+                    return new Operation.TestFilterHandler(config.Options, config.Result)
+                        .RunAsync(expandedSources, filter);
+                }
+                ).ConfigureAwait(false);
             }
         }
 
-        public Library.Interface.ISystemInfoResults SystemInfo()
+        /// <inheritdoc />
+        public async Task<ISystemInfoResults> SystemInfoAsync()
         {
-            return RunAction(new SystemInfoResults(), result => {
-                Operation.SystemInfoHandler.Run(result);
-            });
+            return await RunActionAsync(new SystemInfoResults(), null, null, false, static config =>
+                Operation.SystemInfoHandler.RunAsync(config.Result)
+            ).ConfigureAwait(false);
         }
 
-        public Library.Interface.IPurgeFilesResults PurgeFiles(Library.Utility.IFilter filter)
+        /// <inheritdoc />
+        public async Task<IPurgeFilesResults> PurgeFilesAsync(IFilter inputFilter)
         {
-            return RunAction(new PurgeFilesResults(), result =>
-            {
-                new Operation.PurgeFilesHandler(m_backend, m_options, result).Run(filter);
-            });
+            return await RunActionAsync(new PurgeFilesResults(), null, inputFilter, false, static config =>
+                new Operation.PurgeFilesHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager, config.Filter)
+            ).ConfigureAwait(false);
         }
 
-        public Library.Interface.IListBrokenFilesResults ListBrokenFiles(Library.Utility.IFilter filter, Func<long, DateTime, long, string, long, bool> callbackhandler = null)
+        /// <inheritdoc />
+        public async Task<IListBrokenFilesResults> ListBrokenFilesAsync(IFilter inputFilter, Func<long, DateTime, long, string, long, bool> callbackhandler = null)
         {
-            return RunAction(new ListBrokenFilesResults(), result =>
-            {
-                new Operation.ListBrokenFilesHandler(m_backend, m_options, result).Run(filter, callbackhandler);
-            });
+            return await RunActionAsync(new ListBrokenFilesResults(), null, inputFilter, new { callbackhandler }, static config =>
+                new Operation.ListBrokenFilesHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager, config.Filter, config.Context.callbackhandler)
+            ).ConfigureAwait(false);
         }
 
-        public Library.Interface.IPurgeBrokenFilesResults PurgeBrokenFiles(Library.Utility.IFilter filter)
+        /// <inheritdoc />
+        public async Task<IPurgeBrokenFilesResults> PurgeBrokenFilesAsync(IFilter inputFilter)
         {
-            return RunAction(new PurgeBrokenFilesResults(), result =>
-            {
-                new Operation.PurgeBrokenFilesHandler(m_backend, m_options, result).Run(filter);
-            });
+            return await RunActionAsync(new PurgeBrokenFilesResults(), null, inputFilter, false, static config =>
+                new Operation.PurgeBrokenFilesHandler(config.Options, config.Result)
+                    .RunAsync(config.BackendManager, config.Filter)
+            ).ConfigureAwait(false);
         }
 
-        public Library.Interface.ISendMailResults SendMail()
+        /// <inheritdoc />
+        public async Task<ISendMailResults> SendMailAsync()
         {
             m_options.RawOptions["send-mail-level"] = "all";
             m_options.RawOptions["send-mail-any-operation"] = "true";
-            string targetmail;
-            m_options.RawOptions.TryGetValue("send-mail-to", out targetmail);
+            const string sendMailModuleKey = "sendmail";
+            m_options.RawOptions.TryGetValue("send-mail-to", out string targetmail);
             if (string.IsNullOrWhiteSpace(targetmail))
                 throw new Exception(string.Format("No email specified, please use --{0}", "send-mail-to"));
 
@@ -362,182 +657,525 @@ namespace Duplicati.Library.Main
                 ",",
                 DynamicLoader.GenericLoader.Modules
                          .Where(m =>
-                                !(m is Modules.Builtin.SendMail)
+                                !string.Equals(m.Key, sendMailModuleKey, StringComparison.OrdinalIgnoreCase)
                          )
                 .Select(x => x.Key)
             );
-                         
+
             /// Forward all messages from the email module to the message sink
-            var filtertag = Logging.Log.LogTagFromType<Modules.Builtin.SendMail>();
+            var filtertag = Logging.Log.LogTagFromType(DynamicLoader.GenericLoader.GetModule(sendMailModuleKey).GetType());
             using (Logging.Log.StartScope(m_messageSink.WriteMessage, x => x.FilterTag.Contains(filtertag)))
             {
-                return RunAction(new SendMailResults(), result =>
-                {
-                    result.Lines = new string[0];
-                    System.Threading.Thread.Sleep(5);
-                });
+                return await RunActionAsync(new SendMailResults(), null, null, false, static config =>
+                    Task.Run(() =>
+                    {
+                        config.Result.Lines = [];
+                        Thread.Sleep(5);
+                    })
+                ).ConfigureAwait(false);
             }
         }
 
-        public Library.Interface.IVacuumResults Vacuum()
+        public async Task<ISyncResults> SyncAsync(string[] sourcePaths, IFilter filter)
         {
-            return RunAction(new VacuumResults(), result => {
-                new Operation.VacuumHandler(m_options, result).Run();
-            });
+            SourceProviderFactory.EnableMetadataStorageIfRequiredBySources(sourcePaths, m_options.RawOptions);
+            SourceProviderFactory.EnableCaseSensitiveFiltersIfRequiredBySources(sourcePaths, m_options.RawOptions);
+
+            return await RunActionAsync(new SyncResults(), sourcePaths, filter, false, config =>
+                new Operation.Sync.SyncHandler(config.Paths, config.Options, config.Result, config.BackendUrl)
+                    .RunAsync(config.BackendManager, config.Filter)
+            );
         }
 
-        private T RunAction<T>(T result, Action<T> method)
-            where T : ISetCommonOptions, ITaskControl, Logging.ILogDestination
-        {
-            var tmp = new string[0];
-            IFilter tempfilter = null;
-            return RunAction<T>(result, ref tmp, ref tempfilter, method);
-        }
+        /// <inheritdoc />
+        public async Task<IListFilesetResults> ListSyncVersionsAsync()
+            => await RunSyncDatabaseActionAsync(() => RunActionAsync(new ListFilesetResults(), null, null, false, static config =>
+                Operation.Sync.SyncRestoreHandler.ListVersionsAsync(config.Options, config.Result, config.BackendManager)
+            )).ConfigureAwait(false);
 
-        private T RunAction<T>(T result, ref string[] paths, Action<T> method)
-            where T : ISetCommonOptions, ITaskControl, Logging.ILogDestination
-        {
-            IFilter tempfilter = null;
-            return RunAction<T>(result, ref paths, ref tempfilter, method);
-        }
+        /// <inheritdoc />
+        public async Task<IListFolderResults> ListSyncFolderAsync(string[] sourcePaths, string[] folders, long offset, long limit)
+            => await RunSyncDatabaseActionAsync(() => RunActionAsync(new ListFolderResults(), null, null, new { sourcePaths, folders, offset, limit }, static config =>
+                Operation.Sync.SyncRestoreHandler.ListFolderAsync(config.Options, config.Result, config.BackendManager, config.Context.sourcePaths, config.Context.folders, config.Context.offset, config.Context.limit)
+            )).ConfigureAwait(false);
 
-        private T RunAction<T>(T result, ref IFilter filter, Action<T> method)
-            where T : ISetCommonOptions, ITaskControl, Logging.ILogDestination
-        {
-            var tmp = new string[0];
-            return RunAction<T>(result, ref tmp, ref filter, method);
-        }
+        /// <inheritdoc />
+        public async Task<IRestoreResults> SyncRestoreAsync(string[] sourcePaths, string[] paths)
+            => await RunSyncDatabaseActionAsync(() => RunActionAsync(new RestoreResults(), null, null, new { sourcePaths, paths }, static config =>
+                Operation.Sync.SyncRestoreHandler.RestoreAsync(config.Options, config.Result, config.BackendManager, config.Context.sourcePaths, config.Context.paths)
+            )).ConfigureAwait(false);
 
-        private T RunAction<T>(T result, ref string[] paths, ref IFilter filter, Action<T> method)
-            where T : ISetCommonOptions, ITaskControl, Logging.ILogDestination
+        /// <summary>
+        /// Runs an operation that reads a sync job's destination, marking it as one that
+        /// uses the sync database for as long as it runs.
+        /// </summary>
+        /// <typeparam name="TRes">The result type</typeparam>
+        /// <param name="action">The operation</param>
+        /// <returns>The result of the operation</returns>
+        private async Task<TRes> RunSyncDatabaseActionAsync<TRes>(Func<Task<TRes>> action)
         {
-            m_logTarget = new ControllerMultiLogTarget(result, Logging.LogMessageType.Information, null);
-            using (Logging.Log.StartScope(m_logTarget, null))
+            m_syncDatabaseOperation = true;
+            try
             {
-                m_logTarget.AddTarget(m_messageSink, m_options.ConsoleLoglevel, m_options.ConsoleLogFilter);
-                result.MessageSink = m_messageSink;
+                return await action().ConfigureAwait(false);
+            }
+            finally
+            {
+                m_syncDatabaseOperation = false;
+            }
+        }
+
+        public async Task<IVacuumResults> VacuumAsync()
+        {
+            return await RunActionAsync(new VacuumResults(), null, null, false, static config =>
+                new Operation.VacuumHandler(config.Options, config.Result)
+                    .RunAsync()
+            ).ConfigureAwait(false);
+        }
+
+        private sealed record RunActionData<TRes, TCon>(
+            TRes Result,
+            TCon Context,
+            string BackendUrl,
+            string[] Paths,
+            Options Options,
+            IFilter Filter,
+            IBackendManager BackendManager,
+            ControllerMultiLogTarget LogTarget);
+
+        private async Task<TRes> RunActionAsync<TRes, TCon>(TRes result, string[] paths, IFilter filter, TCon context, Func<RunActionData<TRes, TCon>, Task> method)
+            where TRes : ISetCommonOptions, ITaskControlProvider, Logging.ILogDestination, IBasicResults, IBackendWriterProvider
+        {
+            OnOperationStarted?.Invoke(result);
+            var resultSetter = result as ISetCommonOptions;
+            using (var logTarget = new ControllerMultiLogTarget(result, Logging.LogMessageType.Information, null, m_options.SuppressWarningsFilter))
+            using (Logging.Log.StartScope(logTarget, null))
+            {
+                using var httpListener = m_options.LogHttpRequests || m_options.LogSocketData >= 0
+                    ? new NetworkTrafficLogger(m_options.LogHttpRequests, m_options.LogSocketData)
+                    : null;
 
                 try
                 {
-                    m_currentTask = result;
-                    m_currentTaskThread = System.Threading.Thread.CurrentThread;
+                    bool stopBeforeStart, abortBeforeStart;
+                    lock (m_taskControlLock)
+                    {
+                        m_currentTaskControl = result.TaskControl;
+                        m_resultLogId = -1;
+                        m_operationStarted = true;
+                        stopBeforeStart = m_stopBeforeStart;
+                        abortBeforeStart = m_abortBeforeStart;
+                        m_stopBeforeStart = m_abortBeforeStart = false;
+                    }
 
-                    SetupCommonOptions(result, ref paths, ref filter);
+                    // A request that came while the operation was being set up
+                    if (abortBeforeStart)
+                        result.TaskControl.Terminate();
+                    else if (stopBeforeStart)
+                        result.TaskControl.Stop();
+
+                    m_options.MainAction = result.MainOperation;
+                    await ApplySecretProviderAsync(CancellationToken.None).ConfigureAwait(false);
+                    try
+                    {
+                        (paths, filter) = SetupCommonOptions(result, paths, filter, logTarget);
+                    }
+                    catch
+                    {
+                        // The report modules that were loaded before the failure must still
+                        // see the operation, or the failure is never reported to them
+                        ReportModulesHandler = await ReportModuleController.SetupAsync(this, result, m_options, m_currentTaskControl.StopToken);
+                        throw;
+                    }
+
+                    ReportModulesHandler = await ReportModuleController.SetupAsync(this, result, m_options, m_currentTaskControl.StopToken);
+
+                    logTarget.AddTarget(m_messageSink, m_options.ConsoleLoglevel, m_options.ConsoleLogFilter);
+                    result.MessageSink = m_messageSink;
                     Logging.Log.WriteInformationMessage(LOGTAG, "StartingOperation", Strings.Controller.StartingOperationMessage(m_options.MainAction));
 
+                    // The filter that was passed in gets the case-sensitivity of the operation,
+                    // and so do the filters that the operation creates from here on
+                    filter = FilterExpression.WithCaseSensitivity(filter, m_options.FilterCaseSensitive);
+
+                    using (FilterExpression.StartCaseSensitivityScope(m_options.FilterCaseSensitive))
+                    using (SlowQueryMonitor.StartMonitoring(m_options.SlowQueryThreshold))
                     using (new ProcessController(m_options))
                     using (new Logging.Timer(LOGTAG, string.Format("Run{0}", result.MainOperation), string.Format("Running {0}", result.MainOperation)))
-                    using(new CoCoL.IsolatedChannelScope())
-                    using(m_options.ConcurrencyMaxThreads <= 0 ? null : new CoCoL.CappedThreadedThreadPool(m_options.ConcurrencyMaxThreads))
-                        method(result);
+                    using (new CoCoL.IsolatedChannelScope())
+                    using (m_options.ConcurrencyMaxThreads <= 0 ? null : new CoCoL.CappedThreadedThreadPool(m_options.ConcurrencyMaxThreads))
+                    // Sync keeps its own intent journal and does not record a remote operation log,
+                    // so the messages are never flushed and must not be collected in memory
+                    using (var backend = new Backend.BackendManager(m_backendUrl, m_options, result.BackendWriter, result.TaskControl, collectDatabaseMessages: !UsesSyncDatabase))
+                    {
+                        try
+                        {
+                            backend.UpdateThrottleValues(m_options.MaxUploadPrSecond, m_options.MaxDownloadPrSecond);
+                            m_currentBackendManager = backend;
+                            var config = new RunActionData<TRes, TCon>(result, context, m_backendUrl, paths, m_options, filter, backend, logTarget);
+                            await method(config).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            m_currentBackendManager = null;
 
-                    if (result.EndTime.Ticks == 0)
-                        result.EndTime = DateTime.UtcNow;
-                    result.SetDatabase(null);
+                            // TODO: Should also have a single shared database connection for all operations
+                            // The transactions should be managed inside the connection, and not passed around
 
-                    OnOperationComplete(result);
+                            // This would allow us to pass the database instance to the backend manager
+                            // And safeguard against remote operations not being logged in the database
+
+                            // This would also allow us to control the unclean shutdown flag,
+                            // by toggling this on start and completion of transfers in the manager,
+                            // instead of relying on the operations to correctly toggle the flag
+                            //
+                            // The sync operation owns its own database and records its own audit log.
+                            if (File.Exists(m_options.Dbpath) && !m_options.NoLocalDb && !UsesSyncDatabase)
+                            {
+                                try
+                                {
+                                    await using var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, result.MainOperation.ToString(), true, null, CancellationToken.None).ConfigureAwait(false);
+                                    await backend.StopRunnerAndFlushMessagesAsync(db).ConfigureAwait(false);
+                                }
+                                catch (Exception ex)
+                                {
+                                    Logging.Log.WriteWarningMessage(LOGTAG, "FailedFlushBackendMessages", ex, "Failed to flush backend messages to database: {0}", ex.Message);
+                                }
+                            }
+                            else
+                            {
+                                backend.StopRunnerAndDiscardMessages();
+                            }
+                        }
+                    }
+
+                    if (resultSetter.EndTime.Ticks == 0)
+                        resultSetter.EndTime = DateTime.UtcNow;
+
+                    // The operation returned, but if a stop was requested it returned early, so
+                    // the run did not cover everything it was asked to. Its numbers must not be
+                    // recorded as the latest state of the backup, which is what this flag decides
+                    // (see Runner.UpdateMetadata).
+                    resultSetter.Interrupted = m_currentTaskControl?.StopToken.IsCancellationRequested == true;
+
+                    // The post-operation result/log writes target the backup LocalDatabase schema
+                    // (Operation, LogData, DeletedVolume tables). The sync database has its own
+                    // schema, so sync operations write their results through the sync database
+                    // instead of running incompatible SQL against it.
+                    if (File.Exists(m_options.Dbpath) && !m_options.Dryrun && !UsesSyncDatabase)
+                    {
+                        try
+                        {
+                            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, null, true, null, CancellationToken.None).ConfigureAwait(false);
+                            await WriteResultsAsync(db, result).ConfigureAwait(false);
+                            await db.PurgeLogDataAsync(m_options.LogRetention, CancellationToken.None).ConfigureAwait(false);
+                            await db.PurgeDeletedVolumesAsync(DateTime.UtcNow, CancellationToken.None).ConfigureAwait(false);
+
+                            // Vacuum is done AFTER the results are written to the database
+                            // This means that the information about the vacuum is not stored in the database,
+                            // but will be reported in the log output and messages sent with any of the reporting modules
+                            if (m_options.AutoVacuum && result is IResultsWithVacuum vacuumResults && result is BasicResults basicResults)
+                            {
+                                try
+                                {
+                                    vacuumResults.VacuumResults = new VacuumResults(basicResults);
+                                    await new Operation.VacuumHandler(m_options, (VacuumResults)vacuumResults.VacuumResults)
+                                        .RunAsync().ConfigureAwait(false);
+                                }
+                                catch (Exception ex)
+                                {
+                                    Logging.Log.WriteVerboseMessage(LOGTAG, "FailedToVacuum", ex, "Failed to vacuum database");
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Logging.Log.WriteWarningMessage(LOGTAG, "FailedWriteOperation", ex, "Failed to write operation results to database: {0}", ex.Message);
+                        }
+                    }
+                    else if (UsesSyncDatabase)
+                    {
+                        try
+                        {
+                            await WriteSyncResultsAsync(result, true).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logging.Log.WriteWarningMessage(LOGTAG, "FailedWriteOperation", ex, "Failed to write operation results to database: {0}", ex.Message);
+                        }
+                    }
+
+                    await OperationCompleteAsync(result, null, filter).ConfigureAwait(false);
 
                     Logging.Log.WriteInformationMessage(LOGTAG, "CompletedOperation", Strings.Controller.CompletedOperationMessage(m_options.MainAction));
 
                     return result;
                 }
+                // Handle custom abort exception from run-script
+                catch (OperationAbortException oae)
+                {
+                    ReportModulesHandler?.OperationException = null; // Requested aborts are not failures.
+                    resultSetter.EndTime = DateTime.UtcNow;
+                    // Log this as a normal operation, as the script raising the exception,
+                    // has already populated either warning or log messages as required
+                    Logging.Log.WriteInformationMessage(LOGTAG, "AbortOperation", "Aborting operation by request, requested result: {0}", oae.AbortReason);
+
+                    resultSetter.Interrupted = true;
+                    try
+                    {
+                        // No operation was started in database, so write logs to new operation.
+                        // Sync uses its own database schema
+                        if (UsesSyncDatabase)
+                            await WriteSyncResultsAsync(result, false).ConfigureAwait(false);
+                        else if (File.Exists(m_options.Dbpath) && !m_options.Dryrun)
+                            await using (var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, result.MainOperation.ToString(), true, null, CancellationToken.None).ConfigureAwait(false))
+                                await WriteResultsAsync(db, result).ConfigureAwait(false);
+                    }
+                    catch (Exception we)
+                    {
+                        Logging.Log.WriteWarningMessage(LOGTAG, "FailedWriteOperation", we, we.Message);
+                    }
+
+                    // Do not propagate the cancel exception
+                    await OperationCompleteAsync(result, null, filter).ConfigureAwait(false);
+
+                    return result;
+                }
+                // Handle an abort requested through AbortAsync, which reaches this point as a
+                // cancellation. Reported the way the run-script abort above is: the user asked
+                // for it, so it is not a failure of the backup.
+                //
+                // The guard consults the token rather than the exception type. The progress token
+                // is only ever cancelled by TaskControl.Terminate, so a cancellation from anything
+                // else - an HttpClient request timeout, which surfaces as a TaskCanceledException,
+                // or the caller's own token - still falls through to the failure path below.
+                catch (OperationCanceledException) when (m_currentTaskControl?.ProgressToken.IsCancellationRequested == true)
+                {
+                    ReportModulesHandler?.OperationException = null; // Requested aborts are not failures.
+                    resultSetter.EndTime = DateTime.UtcNow;
+                    resultSetter.Interrupted = true;
+
+                    // Information rather than an error: the operation did what it was told to do.
+                    // Fatal is deliberately not set, and the phase is left alone, so the operation
+                    // is not presented as having errored.
+                    Logging.Log.WriteInformationMessage(LOGTAG, "TerminatedOperation", "Terminating operation {0} by request", m_options.MainAction);
+
+                    try
+                    {
+                        // Write logs to previous operation if database exists.
+                        // Sync uses its own database schema
+                        if (UsesSyncDatabase)
+                            await WriteSyncResultsAsync(result, false).ConfigureAwait(false);
+                        else if (File.Exists(m_options.Dbpath) && !m_options.Dryrun)
+                            await using (var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, null, true, null, CancellationToken.None).ConfigureAwait(false))
+                                await WriteResultsAsync(db, result).ConfigureAwait(false);
+                    }
+                    catch (Exception we)
+                    {
+                        Logging.Log.WriteWarningMessage(LOGTAG, "FailedWriteOperation", we, we.Message);
+                    }
+
+                    // Reported without the exception: ReportHelper forces the Fatal level whenever
+                    // it is given one, regardless of the result's own classification.
+                    await OperationCompleteAsync(result, null, filter).ConfigureAwait(false);
+
+                    // Still propagated. Callers rely on an abort surfacing as an exception rather
+                    // than as a returned result.
+                    throw;
+                }
                 catch (Exception ex)
                 {
-                    result.EndTime = DateTime.UtcNow;
+                    ReportModulesHandler?.OperationException = ex;
+                    Logging.Log.WriteErrorMessage(LOGTAG, "FailedOperation", ex, Strings.Controller.FailedOperationMessage(m_options.MainAction));
 
-                    if (ex is Library.Interface.OperationAbortException oae)
+                    try
                     {
-                        // Perform the module shutdown
-                        OnOperationComplete(ex);
+                        if (result is BasicResults basicResults)
+                            basicResults.OperationProgressUpdater.UpdatePhase(OperationPhase.Error);
 
-                        // Log this as a normal operation, as the script raising the exception,
-                        // has already populated either warning or log messages as required
-                        Logging.Log.WriteInformationMessage(LOGTAG, "AbortOperation", "Aborting operation by request, requested result: {0}", oae.AbortReason);
-
-                        return result;
+                        resultSetter.Fatal = true;
+                        // Write logs to previous operation if database exists.
+                        // Sync uses its own database schema
+                        if (UsesSyncDatabase)
+                            await WriteSyncResultsAsync(result, false).ConfigureAwait(false);
+                        else if (File.Exists(m_options.Dbpath) && !m_options.Dryrun)
+                            await using (var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, null, true, null, CancellationToken.None).ConfigureAwait(false))
+                                await WriteResultsAsync(db, result).ConfigureAwait(false);
                     }
-                    else
+                    catch (Exception we)
                     {
-                        try { (result as BasicResults).OperationProgressUpdater.UpdatePhase(OperationPhase.Error); }
-                        catch { }
-
-                        OnOperationComplete(ex);
-
-                        Logging.Log.WriteErrorMessage(LOGTAG, "FailedOperation", ex, Strings.Controller.FailedOperationMessage(m_options.MainAction, ex.Message));
-
-                        throw;
+                        Logging.Log.WriteWarningMessage(LOGTAG, "FailedWriteOperation", we, we.Message);
                     }
 
+                    // Report the result, and the failure
+                    await OperationCompleteAsync(result, ex, filter).ConfigureAwait(false);
+
+                    throw;
                 }
                 finally
                 {
-                    m_currentTask = null;
-                    m_currentTaskThread = null;
+                    lock (m_taskControlLock)
+                        m_currentTaskControl = null;
                 }
             }
         }
 
         /// <summary>
-        /// Attempts to get the locale, but delays linking to the calls as they are missing in some environments
+        /// Writes the results of a sync operation to the sync database, so they can be shown in the job log.
+        /// The sync database has its own schema, so the results cannot be written with <see cref="LocalDatabase"/>.
+        /// As for a backup, nothing is written for a dry run, or if the database was never created.
         /// </summary>
-        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-        private static void DoGetLocale(out System.Globalization.CultureInfo locale, out System.Globalization.CultureInfo uiLocale)
+        /// <param name="result">The results to write</param>
+        /// <param name="purgeOldResults">Whether to purge results older than the log retention period</param>
+        /// <returns>A task that completes when the results have been written</returns>
+        private async Task WriteSyncResultsAsync(IBasicResults result, bool purgeOldResults)
         {
-            locale = System.Globalization.CultureInfo.DefaultThreadCurrentCulture;
-            uiLocale = System.Globalization.CultureInfo.DefaultThreadCurrentUICulture;
+            if (!File.Exists(m_options.Dbpath) || m_options.Dryrun)
+                return;
+
+            // Browsing a sync job's snapshots is not an event for the job log; a restore is
+            if (result is not ISyncResults and not IRestoreResults)
+                return;
+
+            using var db = new LocalSyncDatabase(m_options.Dbpath);
+            await db.WriteResultsAsync(result, CancellationToken.None).ConfigureAwait(false);
+            if (purgeOldResults)
+                await db.PurgeResultsAsync(m_options.LogRetention, CancellationToken.None).ConfigureAwait(false);
         }
 
         /// <summary>
-        /// Attempts to set the locale, but delays linking to the calls as they are missing in some environments
+        /// Writes the results of an operation to the job log, and remembers the entry so
+        /// <see cref="UpdateResultLogAsync"/> can add what is logged after it was written.
         /// </summary>
-        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-        private static void DoSetLocale(System.Globalization.CultureInfo locale, System.Globalization.CultureInfo uiLocale)
+        /// <param name="db">The database to write the results to</param>
+        /// <param name="result">The results to write</param>
+        /// <returns>A task that completes when the results have been written</returns>
+        private async Task WriteResultsAsync(LocalDatabase db, IBasicResults result)
         {
-            System.Globalization.CultureInfo.DefaultThreadCurrentCulture = locale;
-            System.Globalization.CultureInfo.DefaultThreadCurrentUICulture = uiLocale;
+            m_resultLogId = await db.WriteResultsAndCommitAsync(result, CancellationToken.None).ConfigureAwait(false);
+            m_resultLogIssueCount = CountIssues(result);
         }
 
-        private void OnOperationComplete(object result)
+        /// <summary>
+        /// Rewrites the results in the job log if warnings or errors were logged after they were
+        /// written, such as a report that could not be sent. The operation is already done, so a
+        /// failure here leaves the job log as it was and does not change the outcome.
+        /// </summary>
+        /// <param name="result">The results of the operation</param>
+        /// <returns>A task that completes when the job log has been updated</returns>
+        private async Task UpdateResultLogAsync(IBasicResults result)
         {
-            if (m_options != null && m_options.LoadedModules != null)
+            var logId = m_resultLogId;
+            m_resultLogId = -1;
+            if (logId < 0 || result == null || CountIssues(result) == m_resultLogIssueCount || !File.Exists(m_options.Dbpath))
+                return;
+
+            try
             {
-                foreach (KeyValuePair<bool, Library.Interface.IGenericModule> mx in m_options.LoadedModules)
-                    if (mx.Key && mx.Value is IGenericCallbackModule module)
-                        try { module.OnFinish(result); }
+                await using var db = await LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, null, true, null, CancellationToken.None).ConfigureAwait(false);
+                await db.UpdateResultsAndCommitAsync(logId, result, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Verbose, as a warning would itself change the outcome of the operation
+                Logging.Log.WriteVerboseMessage(LOGTAG, "FailedUpdateOperation", ex, "Failed to update operation results in database: {0}", ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Counts the warnings and errors in the results.
+        /// </summary>
+        /// <param name="result">The results to count in</param>
+        /// <returns>The number of warnings and errors</returns>
+        private static int CountIssues(IBasicResults result)
+            => (result.Warnings?.Count() ?? 0) + (result.Errors?.Count() ?? 0);
+
+        /// <summary>
+        /// Temporarily pushes the filter into the raw options so modules can read it.
+        /// Returns a disposable that removes the key when disposed.
+        /// </summary>
+        /// <param name="options">The options to push the filter into</param>
+        /// <param name="filter">The filter to push</param>
+        /// <returns>A disposable that removes the key when disposed</returns>
+        internal static IDisposable PushFilterToOptions(Options options, IFilter filter)
+            => PushFilterToOptions(options, filter, out var _);
+        /// <summary>
+        /// Temporarily pushes the filter into the raw options so modules can read it.
+        /// Returns a disposable that removes the key when disposed.
+        /// </summary>
+        /// <param name="options">The options to push the filter into</param>
+        /// <param name="filter">The filter to push</param>
+        /// <returns>A disposable that removes the key when disposed</returns>
+        internal static IDisposable PushFilterToOptions(Options options, IFilter filter, out string filterString)
+        {
+            filterString = filter != null && !filter.Empty
+                ? string.Join(Path.PathSeparator.ToString(), FilterExpression.Serialize(filter))
+                : null;
+
+            options.RawOptions["filter"] = filterString;
+            return new FilterOptionScope(options);
+        }
+
+        /// <summary>
+        /// Helper to remove the filter option on dispose
+        /// </summary>
+        private sealed class FilterOptionScope : IDisposable
+        {
+            private readonly Options m_opts;
+            public FilterOptionScope(Options opts) => m_opts = opts;
+            public void Dispose() => m_opts?.RawOptions.Remove("filter");
+        }
+
+        private async Task OperationCompleteAsync(IBasicResults result, Exception exception, IFilter filter)
+        {
+            using var _ = PushFilterToOptions(m_options, filter);
+
+            // Fire the report modules' completion callbacks and stop their progress ticker
+            // before the module instances themselves are disposed below. The handle reads
+            // the exception captured in the RunActionAsync catch blocks via the field.
+            try
+            {
+                if (this.ReportModulesHandler != null)
+                {
+                    // Wait at most 30s for the report modules to stop
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                    await this.ReportModulesHandler.StopAsync(cts.Token);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logging.Log.WriteWarningMessage(LOGTAG, "ReportModuleHandleDisposeError", ex, "Report module handle dispose failed: {0}", ex.Message);
+            }
+
+            this.ReportModulesHandler = default;
+
+            if (m_options?.LoadedModules != null)
+            {
+                foreach (var mx in m_options.LoadedModules)
+                    if (mx is IGenericCallbackModule module)
+                        try { RunScriptCallbackWithStatus(result, mx, () => module.OnFinish(result, exception)); }
                         catch (Exception ex) { Logging.Log.WriteWarningMessage(LOGTAG, $"OnFinishError{mx.Key}", ex, "OnFinish callback {0} failed: {1}", mx.Key, ex.Message); }
 
-                foreach (KeyValuePair<bool, Library.Interface.IGenericModule> mx in m_options.LoadedModules)
-                    if (mx.Key && mx.Value is IDisposable disposable)
+                foreach (var mx in m_options.LoadedModules)
+                    if (mx is IDisposable disposable)
                         try { disposable.Dispose(); }
                         catch (Exception ex) { Logging.Log.WriteWarningMessage(LOGTAG, $"DisposeError{mx.Key}", ex, "Dispose for {0} failed: {1}", mx.Key, ex.Message); }
 
-                m_options.LoadedModules.Clear();
+                m_options.ClearLoadedModules();
             }
 
-            if (m_resetPriority != null)
+            if (m_localeChange != null)
             {
-                System.Threading.Thread.CurrentThread.Priority = m_resetPriority.Value;
-                m_resetPriority = null;
+                m_localeChange.Dispose();
+                m_localeChange = null;
             }
 
-            if (m_doResetLocale)
-            {
-                // Wrap the call to avoid loading issues for the setLocale method
-                DoSetLocale(m_resetLocale, m_resetLocaleUI);
+            await UpdateResultLogAsync(result).ConfigureAwait(false);
 
-                m_doResetLocale = false;
-                m_resetLocale = null;
-                m_resetLocaleUI = null;
-            }
-
-            if (m_logTarget != null)
-            {
-                m_logTarget.Dispose();
-                m_logTarget = null;
-            }
+            OnOperationCompleted?.Invoke(result, exception);
         }
 
-        private void SetupCommonOptions(ISetCommonOptions result, ref string[] paths, ref IFilter filter)
+        private (string[] paths, IFilter filter) SetupCommonOptions(ISetCommonOptions result, string[] paths, IFilter filter, ControllerMultiLogTarget logTarget)
         {
             m_options.MainAction = result.MainOperation;
 
@@ -553,78 +1191,84 @@ namespace Duplicati.Library.Main
                     break;
             }
 
-            //Load all generic modules
-            m_options.LoadedModules.Clear();
+            if (string.IsNullOrEmpty(m_options.Dbpath))
+                m_options.Dbpath = CLIDatabaseLocator.GetDatabasePathForCLI(m_backendUrl, m_options, true, false, UsesSyncDatabase);
 
-            foreach (Library.Interface.IGenericModule m in DynamicLoader.GenericLoader.Modules)
-                m_options.LoadedModules.Add(new KeyValuePair<bool, Library.Interface.IGenericModule>(!m_options.DisableModules.Contains(m.Key, StringComparer.OrdinalIgnoreCase) && (m.LoadAsDefault || m_options.EnableModules.Contains(m.Key, StringComparer.OrdinalIgnoreCase)), m));
+            RestoreOptionsFromExistingDatabase(result.MainOperation);
 
-            // Make the filter read-n-write able in the generic modules
-            var pristinefilter = string.Join(System.IO.Path.PathSeparator.ToString(), FilterExpression.Serialize(filter));
-            m_options.RawOptions["filter"] = pristinefilter;
-            
+            //Load generic modules
+            m_options.ClearLoadedModules();
+
+            foreach (var m in DynamicLoader.GenericLoader.Modules)
+            {
+                var active = !m_options.DisableModules.Contains(m.Key, StringComparer.OrdinalIgnoreCase) && (m.LoadAsDefault || m_options.EnableModules.Contains(m.Key, StringComparer.OrdinalIgnoreCase));
+                if (!active)
+                    continue;
+
+                m_options.AddLoadedModule(DynamicLoader.GenericLoader.GetModule(m.Key));
+            }
+
             // Store the URL connection options separately, as these should only be visible to modules implementing IConnectionModule
             var conopts = new Dictionary<string, string>(m_options.RawOptions);
-            var qp = new Library.Utility.Uri(m_backend).QueryParameters;
+            var qp = new Library.Utility.RelaxedUri(m_backendUrl).QueryParameters;
             foreach (var k in qp.Keys)
                 conopts[(string)k] = qp[(string)k];
 
-            //// Since Configure in RunScript can alter the RawOptions, make sure it is first in the list for Configure
-            var LoadedModules = new List<KeyValuePair<bool, Interface.IGenericModule>>();
-            foreach (var mx in m_options.LoadedModules)
-                if (mx.Value.ToString().IndexOf("runscript", StringComparison.OrdinalIgnoreCase) >= 0)
+            // Make the filter read-n-write able in the generic modules
+            using (PushFilterToOptions(m_options, filter, out var pristinefilter))
+            {
+                // A module that fails the operation in OnStart (a run-script-before script) is
+                // started before the report modules, so the remaining modules are still configured
+                // and started. Otherwise their OnFinish has nothing to report the failure with.
+                // A script asking to skip the run without a warning or error is not reported.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo startFailure = null;
+                foreach (var mx in m_options.LoadedModules)
                 {
-                    LoadedModules.Insert(0, mx);
-                }
-                else
-                {
-                    LoadedModules.Add(mx);
-                }
-
-            foreach (var mx in LoadedModules)
-                if (mx.Key)
-                {
-                    if (mx.Value is Library.Interface.IConnectionModule)
-                        mx.Value.Configure(conopts);
+                    if (mx is IConnectionModule)
+                        mx.Configure(conopts);
                     else
-                        mx.Value.Configure(m_options.RawOptions);
+                        mx.Configure(m_options.RawOptions);
 
-                    if (mx.Value is IGenericSourceModule sourcemodule)
+                    if (mx is IGenericCallbackModule module)
                     {
-                        if (sourcemodule.ContainFilesForBackup(paths))
+                        try
                         {
-                            var sourceoptions = sourcemodule.ParseSourcePaths(ref paths, ref pristinefilter, m_options.RawOptions);
-
-                            foreach (var sourceoption in sourceoptions)
-                                m_options.RawOptions[sourceoption.Key] = sourceoption.Value;
+                            RunScriptCallbackWithStatus(result, mx, () => module.OnStart(result.MainOperation.ToString(), ref m_backendUrl, ref paths));
+                        }
+                        catch (OperationAbortException oae) when (startFailure == null && oae.AbortReason == OperationAbortReason.Normal)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex) when (startFailure == null)
+                        {
+                            startFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logging.Log.WriteWarningMessage(LOGTAG, $"OnStartError{mx.Key}", ex, "OnStart callback {0} failed: {1}", mx.Key, ex.Message);
                         }
                     }
-
-                    if (mx.Value is IGenericCallbackModule module)
-                        module.OnStart(result.MainOperation.ToString(), ref m_backend, ref paths);
                 }
 
-            // If the filters were changed by a module, read them back in
-            if (pristinefilter != m_options.RawOptions["filter"])
-            {
-                filter = FilterExpression.Deserialize(m_options.RawOptions["filter"].Split(new string[] { System.IO.Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries));
+                startFailure?.Throw();
+
+                // If the filters were changed by a module, read them back in
+                if (pristinefilter != m_options.RawOptions["filter"])
+                    filter = FilterExpression.Deserialize(m_options.RawOptions["filter"].Split([Path.PathSeparator.ToString()], StringSplitOptions.RemoveEmptyEntries));
             }
-            m_options.RawOptions.Remove("filter"); // "--filter" is not a supported command line option
 
             if (!string.IsNullOrEmpty(m_options.Logfile))
             {
-                var path = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(m_options.Logfile));
-                if (!System.IO.Directory.Exists(path))
-                    System.IO.Directory.CreateDirectory(path);
+                var path = Path.GetDirectoryName(Path.GetFullPath(m_options.Logfile));
+                if (!Directory.Exists(path))
+                    Directory.CreateDirectory(path);
 
-                m_logTarget.AddTarget(
+                logTarget.AddTarget(
                     new Library.Logging.StreamLogDestination(m_options.Logfile),
                     m_options.LogFileLoglevel,
                     m_options.LogFileLogFilter
                 );
             }
-
-
 
             if (m_options.HasTempDir)
             {
@@ -635,38 +1279,102 @@ namespace Duplicati.Library.Main
             {
                 try
                 {
-                    var locale = m_options.ForcedLocale;
-                    DoGetLocale(out m_resetLocale, out m_resetLocaleUI);
-                    m_doResetLocale = true;
-                    // Wrap the call to avoid loading issues for the setLocale method
-                    DoSetLocale(locale, locale);
+                    m_localeChange = new LocaleChange(m_options.ForcedLocale);
                 }
-                catch (Exception ex) // or only: MissingMethodException
+                catch (Exception ex)
                 {
                     Library.Logging.Log.WriteWarningMessage(LOGTAG, "LocaleChangeError", ex, Strings.Controller.FailedForceLocaleError(ex.Message));
-                    m_doResetLocale = false;
-                    m_resetLocale = m_resetLocaleUI = null;
                 }
             }
 
-            if (!string.IsNullOrEmpty(m_options.ThreadPriority))
+            ValidateOptions(paths);
+
+            return (paths, filter);
+        }
+
+        internal static void RunScriptCallbackWithStatus(object result, IGenericModule module, Action callback)
+        {
+            if (!string.Equals(module?.Key, "runscript", StringComparison.OrdinalIgnoreCase) || result is not BasicResults basicResults)
             {
-                m_resetPriority = System.Threading.Thread.CurrentThread.Priority;
-                System.Threading.Thread.CurrentThread.Priority = Library.Utility.Utility.ParsePriority(m_options.ThreadPriority);
+                callback();
+                return;
             }
 
-            if (string.IsNullOrEmpty(m_options.Dbpath))
-                m_options.Dbpath = DatabaseLocator.GetDatabasePath(m_backend, m_options);
+            var progress = basicResults.OperationProgressUpdater;
+            progress.UpdateOverall(out var previousPhase, out _, out _, out _, out _, out _, out _);
 
-            ValidateOptions();
+            progress.UpdatePhase(OperationPhase.RunScript_Running);
+            try
+            {
+                callback();
+            }
+            finally
+            {
+                progress.UpdatePhase(previousPhase);
+            }
+        }
+
+
+        private void RestoreOptionsFromExistingDatabase(OperationMode operation)
+        {
+            // The sync database (LocalSyncDatabase) has its own schema, distinct from the
+            // backup LocalDatabase, and does not store options to restore. Opening it as a
+            // backup database would run the backup schema upgrade against an incompatible
+            // schema and throw. Sync reads its options directly from the command-line dict.
+            if (UsesSyncDatabase)
+                return;
+
+            if (m_options.NoLocalDb || string.IsNullOrWhiteSpace(m_options.Dbpath) || !File.Exists(m_options.Dbpath))
+                return;
+
+            LocalDatabase db;
+            try
+            {
+                db = LocalDatabase.CreateLocalDatabaseAsync(m_options.Dbpath, operation.ToString(), true, null, CancellationToken.None).Await();
+            }
+            // A repair sets an unreadable database aside and recreates it, so it must get to do that
+            catch (Exception ex) when (operation == OperationMode.Repair)
+            {
+                Logging.Log.WriteInformationMessage(LOGTAG, "SkipOptionsFromUnreadableDatabase", "Not reading the options stored in the local database {0}, as it cannot be opened: {1}", m_options.Dbpath, ex.Message);
+                return;
+            }
+
+            using (db)
+                Utility.UpdateOptionsFromDbAsync(db, m_options, CancellationToken.None).Await();
+        }
+
+        private async Task ApplySecretProviderAsync(CancellationToken cancellationToken)
+        {
+            var args = new[] { new Library.Utility.RelaxedUri(m_backendUrl) };
+            await SecretProviderHelper.ApplySecretProviderAsync([], args, m_options.RawOptions, TempFolder.SystemTempPath, SecretProvider, cancellationToken).ConfigureAwait(false);
+            // Write back the backend argument, if it was modified by the secret provider
+            m_backendUrl = args[0].ToString();
+        }
+
+        /// <summary>
+        /// Warns if an identifier option holds characters that are known to cause trouble. The value is
+        /// kept as given, as it may already be in use elsewhere; the user decides whether to change it.
+        /// </summary>
+        /// <param name="option">The name of the identifier option</param>
+        /// <param name="messageId">The id of the warning</param>
+        private void WarnOnProblematicIdentifier(string option, string messageId)
+        {
+            var problematic = Options.GetProblematicIdentifierCharacters(m_options.RawOptions.GetValueOrDefault(option));
+            if (problematic.Count > 0)
+                Logging.Log.WriteWarningMessage(LOGTAG, messageId, null, "The option --{0} contains the character(s) {1}, which may cause problems when the id is used in reports and by remote control. Consider using only letters, digits, dashes and dots, or add {2} to --suppress-warnings to keep the id.", option, string.Join(" ", problematic.Select(Options.DescribeIdentifierCharacter)), messageId);
         }
 
         /// <summary>
         /// This function will examine all options passed on the commandline, and test for unsupported or deprecated values.
         /// Any errors will be logged into the statistics module.
         /// </summary>
-        private void ValidateOptions()
+        /// <param name="paths">The source paths, used to determine the options supported by source providers; null for operations without sources.</param>
+        private void ValidateOptions(string[] paths)
         {
+            // The ids are passed around by the console and in reports, where some characters break the handling
+            WarnOnProblematicIdentifier("backup-id", "BackupIdSpecialCharacters");
+            WarnOnProblematicIdentifier("machine-id", "MachineIdSpecialCharacters");
+
             // Check if only one of the retention options is set
             var selectedRetentionOptions = new List<String>();
 
@@ -680,84 +1388,181 @@ namespace Duplicati.Library.Main
                 selectedRetentionOptions.Add("keep-versions");
             }
 
-            if (m_options.RetentionPolicy.Any())
+            //Check validity of retention-policy option value
+            List<Options.RetentionPolicyValue> retentionPolicy;
+            try
+            {
+                retentionPolicy = m_options.RetentionPolicy;
+                Options.ValidateRetentionPolicy(retentionPolicy);
+            }
+            catch (Exception e) // simply reading the option value might also result in an exception due to incorrect formatting
+            {
+                throw new Interface.UserInformationException(string.Format("An error occoured while processing the value of --{0}: {1}", "retention-policy", e.Message), "RetentionPolicyParseError", e);
+            }
+
+            if (retentionPolicy.Any())
             {
                 selectedRetentionOptions.Add("retention-policy");
             }
 
             if (selectedRetentionOptions.Count() > 1)
             {
-                throw new Interface.UserInformationException(string.Format("Setting multiple retention options ({0}) is not permitted",
-                    String.Join(", ", selectedRetentionOptions.Select(x => "--" + x))), "MultipleRetentionOptionsNotSupported");
+                throw new UserInformationException(string.Format("Setting multiple retention options ({0}) is not permitted",
+                    string.Join(", ", selectedRetentionOptions.Select(x => "--" + x))), "MultipleRetentionOptionsNotSupported");
             }
+
+            // The files not in the list are copied from the previous version, and a file can cross a moving limit without being changed
+            if (m_options.HasMovingModifiedTimeLimit && m_options.ChangedFilelist is { Length: > 0 })
+                throw new UserInformationException("A modification time limit given relative to now, such as --skip-files-modified-after=1W, cannot be combined with --changed-files. Give the limit as a date instead.", "MovingTimeLimitWithChangedFiles");
 
             // Check Prefix
             if (!string.IsNullOrWhiteSpace(m_options.Prefix) && m_options.Prefix.Contains("-"))
-                throw new Interface.UserInformationException("The prefix cannot contain hyphens (-)", "PrefixCannotContainHyphens");
+                throw new UserInformationException("The prefix cannot contain hyphens (-)", "PrefixCannotContainHyphens");
 
-            //Check validity of retention-policy option value
-            try
-            {
-                foreach (var configEntry in m_options.RetentionPolicy)
-                {
-                    if (!configEntry.IsKeepAllVersions() && !configEntry.IsUnlimtedTimeframe() &&
-                        configEntry.Interval >= configEntry.Timeframe)
-                    {
-                        throw new Interface.UserInformationException("An interval cannot be bigger than the timeframe it is in", "IntervalCannotBeBiggerThanTimeFrame");
-                    }
-                }
-            }
-            catch (Exception e) // simply reading the option value might also result in an exception due to incorrect formatting
-            {
-                throw new Interface.UserInformationException(string.Format("An error occoured while processing the value of --{0}", "retention-policy"), "RetentionPolicyParseError", e);
-            }
+            if (m_options.VolumeSize < m_options.Blocksize * 2)
+                throw new UserInformationException("The volume size must be at least twice the block size", "VolumeSizeTooSmall");
 
             //Keep a list of all supplied options
-            Dictionary<string, string> ropts = new Dictionary<string, string>(m_options.RawOptions);
+            var ropts = new Dictionary<string, string>(m_options.RawOptions);
 
             //Keep a list of all supported options
-            Dictionary<string, Library.Interface.ICommandLineArgument> supportedOptions = new Dictionary<string, Library.Interface.ICommandLineArgument>();
+            var supportedOptions = new Dictionary<string, ICommandLineArgument>();
 
             //There are a few internal options that are not accessible from outside, and thus not listed
-            foreach (string s in Options.InternalOptions)
+            foreach (var s in Options.InternalOptions)
                 supportedOptions[s] = null;
 
             //Figure out what module options are supported in the current setup
-            List<Library.Interface.ICommandLineArgument> moduleOptions = new List<Duplicati.Library.Interface.ICommandLineArgument>();
-            Dictionary<string, string> disabledModuleOptions = new Dictionary<string, string>();
+            var moduleOptions = new List<ICommandLineArgument>();
+            var disabledModuleOptions = new Dictionary<string, string>();
+            var loadedModuleKeys = m_options.LoadedModules.Select(k => k.Key).ToHashSet();
 
-            foreach (KeyValuePair<bool, Library.Interface.IGenericModule> m in m_options.LoadedModules)
-                if (m.Value.SupportedCommands != null)
-                    if (m.Key)
-                        moduleOptions.AddRange(m.Value.SupportedCommands);
-                    else
-                        foreach (Library.Interface.ICommandLineArgument c in m.Value.SupportedCommands)
-                        {
-                            disabledModuleOptions[c.Name] = m.Value.DisplayName + " (" + m.Value.Key + ")";
+            foreach (var m in DynamicLoader.GenericLoader.Modules)
+            {
+                if (m.SupportedCommands == null)
+                    continue;
 
-                            if (c.Aliases != null)
-                                foreach (string s in c.Aliases)
-                                    disabledModuleOptions[s] = disabledModuleOptions[c.Name];
-                        }
+                if (loadedModuleKeys.Contains(m.Key))
+                    moduleOptions.AddRange(m.SupportedCommands);
+                else
+                    foreach (var c in m.SupportedCommands)
+                    {
+                        disabledModuleOptions[c.Name] = m.DisplayName + " (" + m.Key + ")";
+
+                        if (c.Aliases != null)
+                            foreach (string s in c.Aliases)
+                                disabledModuleOptions[s] = disabledModuleOptions[c.Name];
+                    }
+            }
+
+            //Figure out what options are supported by the source providers of the current sources
+            var sourceProviderOptions = new List<ICommandLineArgument>();
+            var sourceProviderSchemes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var path in paths ?? [])
+            {
+                var remoteSource = SourceProviderFactory.ParseRemoteSource(path);
+                if (remoteSource == null)
+                    continue;
+
+                try
+                {
+                    var sourceUri = new Library.Utility.RelaxedUri(remoteSource.Url);
+
+                    // Throw url-encoded options into the mix
+                    //TODO: This can hide values if both commandline and url-parameters supply the same key
+                    foreach (var k in sourceUri.QueryParameters.AllKeys)
+                        ropts[k] = sourceUri.QueryParameters[k];
+
+                    // Each source provider scheme contributes its options once,
+                    // even if multiple sources use the same scheme
+                    if (!sourceProviderSchemes.Add(sourceUri.Scheme))
+                        continue;
+
+                    var sourcecommands = DynamicLoader.SourceProviderLoader.GetSupportedCommands(remoteSource.Url);
+                    if (sourcecommands != null)
+                        sourceProviderOptions.AddRange(sourcecommands);
+                }
+                catch
+                {
+                    // Invalid source urls are reported when the source provider is loaded
+                    continue;
+                }
+            }
+
+            // The prefix-based source providers (e.g. %HYPERV%) contribute their options
+            // when one of the sources is theirs
+            foreach (var module in Library.SourceProviders.SourceProviderModules.BuiltInPrefixSourceProviderModules)
+                if (module.SupportedCommands != null && (paths ?? []).Any(module.MatchesSource))
+                    sourceProviderOptions.AddRange(module.SupportedCommands);
+
+            //Figure out what options are supported by the restore destination provider, if the restore target is remote
+            var restoreDestinationOptions = new List<ICommandLineArgument>();
+            var restorepath = m_options.Restorepath;
+            if (!string.IsNullOrEmpty(restorepath) && restorepath.StartsWith("@"))
+            {
+                try
+                {
+                    var restoreUri = new Library.Utility.RelaxedUri(restorepath.Substring(1));
+
+                    // Throw url-encoded options into the mix
+                    foreach (var k in restoreUri.QueryParameters.AllKeys)
+                        ropts[k] = restoreUri.QueryParameters[k];
+
+                    var restorecommands = DynamicLoader.RestoreDestinationProviderLoader.GetSupportedCommands(restorepath.Substring(1));
+                    if (restorecommands != null)
+                        restoreDestinationOptions.AddRange(restorecommands);
+                }
+                catch
+                {
+                    // Invalid restore destination urls are reported when the restore destination provider is loaded
+                }
+            }
 
             // Throw url-encoded options into the mix
             //TODO: This can hide values if both commandline and url-parameters supply the same key
-            var ext = new Library.Utility.Uri(m_backend).QueryParameters;
-            foreach(var k in ext.AllKeys)
+            var ext = new Library.Utility.RelaxedUri(m_backendUrl).QueryParameters;
+            foreach (var k in ext.AllKeys)
                 ropts[k] = ext[k];
 
+            var backendCommands = DynamicLoader.BackendLoader.GetSupportedCommands(m_backendUrl);
+            var encryptionCommands = m_options.NoEncryption ? [] : DynamicLoader.EncryptionLoader.GetSupportedCommands(m_options.EncryptionModule);
+            var compressionCommands = DynamicLoader.CompressionLoader.GetSupportedCommands(m_options.CompressionModule);
+            var parityCommands = string.IsNullOrEmpty(m_options.ParityModule) ? [] : DynamicLoader.ParityLoader.GetSupportedCommands(m_options.ParityModule);
+
+            // The same module can legitimately contribute its options more than once, e.g. when
+            // the target backend is also used as a source, or a provider is used as both the
+            // source and the restore destination. Silently drop such identical re-declarations,
+            // while keeping re-declarations with a differing definition, so the duplicate check
+            // below still reports those.
+            var declaredOptions = new Dictionary<string, ICommandLineArgument>(StringComparer.OrdinalIgnoreCase);
+            foreach (var l in new IEnumerable<ICommandLineArgument>[] { m_options.SupportedCommands, backendCommands, encryptionCommands, moduleOptions, compressionCommands, parityCommands })
+                if (l != null)
+                    foreach (var a in l)
+                    {
+                        declaredOptions.TryAdd(a.Name, a);
+                        if (a.Aliases != null)
+                            foreach (var s in a.Aliases)
+                                declaredOptions.TryAdd(s, a);
+                    }
+
+            sourceProviderOptions = FilterIdenticalRedeclarations(sourceProviderOptions, declaredOptions);
+            restoreDestinationOptions = FilterIdenticalRedeclarations(restoreDestinationOptions, declaredOptions);
+
             //Now run through all supported options, and look for deprecated options
-            foreach (IList<Library.Interface.ICommandLineArgument> l in new IList<Library.Interface.ICommandLineArgument>[] {
+            foreach (var l in new IEnumerable<ICommandLineArgument>[] {
                 m_options.SupportedCommands,
-                DynamicLoader.BackendLoader.GetSupportedCommands(m_backend),
-                m_options.NoEncryption ? null : DynamicLoader.EncryptionLoader.GetSupportedCommands(m_options.EncryptionModule),
+                backendCommands,
+                encryptionCommands,
                 moduleOptions,
-                DynamicLoader.CompressionLoader.GetSupportedCommands(m_options.CompressionModule) })
+                sourceProviderOptions,
+                restoreDestinationOptions,
+                compressionCommands,
+                parityCommands })
             {
                 if (l != null)
-                    foreach (Library.Interface.ICommandLineArgument a in l)
+                    foreach (ICommandLineArgument a in l)
                     {
-                        if (supportedOptions.ContainsKey(a.Name) && !Options.KnownDuplicates.Contains(a.Name, StringComparer.OrdinalIgnoreCase))
+                        if (supportedOptions.ContainsKey(a.Name) && !Options.KnownDuplicates.Contains(a.Name))
                             Logging.Log.WriteWarningMessage(LOGTAG, "DuplicateOption", null, Strings.Controller.DuplicateOptionNameWarning(a.Name));
 
                         supportedOptions[a.Name] = a;
@@ -765,7 +1570,7 @@ namespace Duplicati.Library.Main
                         if (a.Aliases != null)
                             foreach (string s in a.Aliases)
                             {
-                                if (supportedOptions.ContainsKey(s) && !Options.KnownDuplicates.Contains(s, StringComparer.OrdinalIgnoreCase))
+                                if (supportedOptions.ContainsKey(s) && !Options.KnownDuplicates.Contains(s))
                                     Logging.Log.WriteWarningMessage(LOGTAG, "DuplicateOption", null, Strings.Controller.DuplicateOptionNameWarning(s));
 
                                 supportedOptions[s] = a;
@@ -789,75 +1594,136 @@ namespace Duplicati.Library.Main
                                 }
 
                         }
+
+                        if (a.Type == CommandLineArgument.ArgumentType.Boolean && a.DefaultValue == "true" && !a.Deprecated)
+                            Logging.Log.WriteWarningMessage(LOGTAG, "DefaultBooleanOption", null, Strings.Controller.WrongDefaultBooleanOptionWarning(a.Name), null);
                     }
             }
 
+            // Added last, so a name that Duplicati also declares is not reported as a duplicate
+            foreach (var s in OptionsHandledByCaller ?? new HashSet<string>())
+                supportedOptions.TryAdd(s, null);
+
             //Now look for options that were supplied but not supported
-            foreach (string s in ropts.Keys)
+            var rejectedOptions = new List<string>();
+            foreach (var s in ropts.Keys)
                 if (!supportedOptions.ContainsKey(s))
-                    if (disabledModuleOptions.ContainsKey(s))
+                    if (RejectUnsupportedOptions != null && RejectUnsupportedOptions.Contains(s))
+                        rejectedOptions.Add(disabledModuleOptions.TryGetValue(s, out var module)
+                            ? Strings.Controller.UnsupportedOptionDisabledModuleError(s, module)
+                            : Strings.Controller.UnsupportedOptionError(s));
+                    else if (disabledModuleOptions.ContainsKey(s))
                         Logging.Log.WriteWarningMessage(LOGTAG, "UnsupportedDisabledModule", null, Strings.Controller.UnsupportedOptionDisabledModuleWarning(s, disabledModuleOptions[s]), null);
                     else
                         Logging.Log.WriteWarningMessage(LOGTAG, "UnsupportedOption", null, Strings.Controller.UnsupportedOptionWarning(s), null);
 
+            if (rejectedOptions.Count > 0)
+                throw new UserInformationException(string.Join(Environment.NewLine, rejectedOptions), "UnsupportedOptionGiven");
+
             //Look at the value supplied for each argument and see if is valid according to its type
-            foreach (string s in ropts.Keys)
+            foreach (var s in ropts.Keys)
             {
-                Library.Interface.ICommandLineArgument arg;
-                if (supportedOptions.TryGetValue(s, out arg) && arg != null)
+                if (supportedOptions.TryGetValue(s, out var arg) && arg != null)
                 {
-                    string validationMessage = ValidateOptionValue(arg, s, ropts[s]);
-                    if (validationMessage != null)
+                    var validationMessage = CommandLineArgumentValidator.ValidateOptionValue(arg, s, ropts[s]);
+                    if (!string.IsNullOrWhiteSpace(validationMessage))
                         Logging.Log.WriteWarningMessage(LOGTAG, "OptionValidationError", null, validationMessage);
                 }
             }
 
-            // For now, warn not to use 7z
-            if (string.Equals(m_options.CompressionModule, "7z", StringComparison.OrdinalIgnoreCase))
-                Logging.Log.WriteWarningMessage(LOGTAG, "7zModuleHasIssues", null, "The 7z compression module has known issues and should only be used for experimental purposes");
+            var scheme = Library.Utility.Utility.GuessScheme(m_backendUrl);
+            if (backendCommands == null && !string.Equals(m_backendUrl, "dummy://", StringComparison.OrdinalIgnoreCase))
+            {
+                // If the backend is HTTP or HTTPS, give a custom error message
+                if (string.Equals(scheme, "http", StringComparison.OrdinalIgnoreCase) || string.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase))
+                    throw new UserInformationException(Strings.Controller.BackendNotSupportedHttpError, "BackendNotSupportedHttp");
 
-            //Inform the user about the deprecated Tardigrade-Backend. They should switch to Storj DCS instead.
-            if (string.Equals(new Library.Utility.Uri(m_backend).Scheme, "tardigrade", StringComparison.OrdinalIgnoreCase))
-                Logging.Log.WriteWarningMessage(LOGTAG, "TardigradeRename", null, "The Tardigrade-backend got renamed to Storj DCS - please migrate your backups to the new configuration by changing the destination storage type to Storj DCS.");
+                throw new UserInformationException(Strings.Controller.BackendNotSupportedError(scheme, string.Join(", ", DynamicLoader.BackendLoader.Keys)), "BackendNotSupported");
+            }
+
+            //Inform the user about unmaintained backends
+            if (BackendModules.DeprecatedBackendModules.Contains(scheme))
+                Logging.Log.WriteWarningMessage(LOGTAG, "BackendDeprecated", null, $"The backend {scheme} is deprecated and should be migrated away from.");
+
+            //Warn about experimental diskimage filesystem parsing
+            if (m_options.RawOptions.ContainsKey("diskimage-filesystem-parsed"))
+                Logging.Log.WriteWarningMessage(LOGTAG, "ExperimentalDiskImageFilesystemParsed", null, "The option 'diskimage-filesystem-parsed' is experimental and should be used with caution.");
 
             //TODO: Based on the action, see if all options are relevant
         }
 
-		/// <summary>
-		/// Helper method that expands the users chosen source input paths,
-		/// and removes duplicate paths
-		/// </summary>
-		/// <returns>The expanded and filtered sources.</returns>
-		private string[] ExpandInputSources(string[] inputsources, IFilter filter)
+        /// <summary>
+        /// Removes commands that are identical re-declarations of an already declared option,
+        /// and registers the remaining commands as declared, so that later lists are filtered
+        /// against them as well.
+        /// </summary>
+        /// <param name="commands">The commands to filter</param>
+        /// <param name="declaredOptions">The options declared so far, keyed by name and alias</param>
+        /// <returns>The commands that are not identical re-declarations</returns>
+        private static List<ICommandLineArgument> FilterIdenticalRedeclarations(List<ICommandLineArgument> commands, Dictionary<string, ICommandLineArgument> declaredOptions)
+        {
+            var result = new List<ICommandLineArgument>(commands.Count);
+            foreach (var c in commands)
+            {
+                if (declaredOptions.TryGetValue(c.Name, out var existing)
+                    && existing.Type == c.Type
+                    && existing.DefaultValue == c.DefaultValue)
+                    continue;
+
+                result.Add(c);
+                declaredOptions.TryAdd(c.Name, c);
+                if (c.Aliases != null)
+                    foreach (var s in c.Aliases)
+                        declaredOptions.TryAdd(s, c);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Helper method that expands the users chosen source input paths,
+        /// and removes duplicate paths
+        /// </summary>
+        /// <param name="inputsources">The input sources.</param>
+        /// <param name="filter">The filter.</param>
+        /// <param name="options">The options.</param>
+        /// <returns>The expanded and filtered sources.</returns>
+        internal static (string[] Sources, IFilter Filter) ExpandInputSources(string[] inputsources, IFilter filter, Options options)
         {
             if (inputsources == null || inputsources.Length == 0)
-                throw new Duplicati.Library.Interface.UserInformationException(Strings.Controller.NoSourceFoldersError, "NoSourceFolders");
+                throw new UserInformationException(Strings.Controller.NoSourceFoldersError, "NoSourceFolders");
 
             var sources = new List<string>(inputsources.Length);
 
-            System.IO.DriveInfo[] drives = null;
+            // Filters may name the content of a prefix-based source provider the same way as the sources do
+            filter = SourceProviderFactory.TranslatePrefixedFilters(filter);
+
+            // What the filter names at the root of a drive is also at the root of a share
+            filter = SourceProviderFactory.AddDriveRootEntriesForRemoteSources(filter, inputsources);
+
+            DriveInfo[] drives = null;
 
             //Make sure they all have the same format and exist
             foreach (var inputsource in inputsources)
             {
                 List<string> expandedSources = new List<string>();
 
-                if (Platform.IsClientWindows && (inputsource.StartsWith("*:", StringComparison.Ordinal) || inputsource.StartsWith("?:", StringComparison.Ordinal)))
+                if (OperatingSystem.IsWindows() && (inputsource.StartsWith("*:", StringComparison.Ordinal) || inputsource.StartsWith("?:", StringComparison.Ordinal)))
                 {
                     // *: drive paths are only supported on Windows clients
                     // Lazily load the drive info
-                    drives = drives ?? System.IO.DriveInfo.GetDrives();
+                    drives = drives ?? DriveInfo.GetDrives();
 
                     // Replace the drive letter with each available drive
                     string sourcePath = inputsource.Substring(1);
-                    foreach (System.IO.DriveInfo drive in drives)
+                    foreach (DriveInfo drive in drives)
                     {
                         string expandedSource = drive.Name[0] + sourcePath;
                         Logging.Log.WriteVerboseMessage(LOGTAG, "AddingSourcePathFromWildcard", @"Adding source path ""{0}"" due to wildcard source path ""{1}""", expandedSource, inputsource);
                         expandedSources.Add(expandedSource);
                     }
                 }
-                else if (Platform.IsClientWindows && inputsource.StartsWith(@"\\?\Volume{", StringComparison.OrdinalIgnoreCase))
+                else if (OperatingSystem.IsWindows() && inputsource.StartsWith(@"\\?\Volume{", StringComparison.OrdinalIgnoreCase))
                 {
                     // In order to specify a drive by it's volume name, adopt the volume guid path syntax:
                     //   \\?\Volume{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
@@ -866,25 +1732,32 @@ namespace Duplicati.Library.Main
                     Guid volumeGuid;
                     if (Guid.TryParse(inputsource.Substring(@"\\?\Volume{".Length, @"XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX".Length), out volumeGuid))
                     {
-                        string driveLetter = Library.Utility.Utility.GetDriveLetterFromVolumeGuid(volumeGuid);
-                        if (!string.IsNullOrEmpty(driveLetter))
+                        // The drive letter, or the folder the volume is mounted on when it has none
+                        string mountPath = Library.Utility.Utility.GetMountPathFromVolumeGuid(volumeGuid);
+                        if (!string.IsNullOrEmpty(mountPath))
                         {
-                            string expandedSource = driveLetter + inputsource.Substring(@"\\?\Volume{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}".Length);
+                            string expandedSource = Library.Utility.Utility.CombineVolumeMountPath(mountPath, inputsource.Substring(@"\\?\Volume{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}".Length));
                             Logging.Log.WriteVerboseMessage(LOGTAG, "AddingSourceFromGuid", @"Adding source path ""{0}"" in place of volume guid source path ""{1}""", expandedSource, inputsource);
                             expandedSources.Add(expandedSource);
                         }
                         else
                         {
-                            // If we aren't allow to have missing sources, throw an exception indicating we couldn't find a drive where this volume is mounted
-                            if (!m_options.AllowMissingSource)
-                                throw new Duplicati.Library.Interface.UserInformationException(Strings.Controller.SourceVolumeNameNotFoundError(inputsource, volumeGuid), "MissingSourceFolder");
+                            // Couldn't find a drive where this volume is mounted: abort if requested,
+                            // otherwise warn (unless missing sources are silently allowed)
+                            if (options.AbortIfSourceMissing)
+                                throw new UserInformationException(Strings.Controller.SourceVolumeNameNotFoundError(inputsource, volumeGuid), "MissingSourceFolder");
+                            else if (!options.AllowMissingSource)
+                                Logging.Log.WriteWarningMessage(LOGTAG, "SourceVolumeNotFound", null, Strings.Controller.SourceVolumeNameNotFoundError(inputsource, volumeGuid));
                         }
                     }
                     else
                     {
-                        // If we aren't allow to have missing sources, throw an exception indicating we couldn't find this volume
-                        if (!m_options.AllowMissingSource)
-                            throw new Duplicati.Library.Interface.UserInformationException(Strings.Controller.SourceVolumeNameInvalidError(inputsource), "SourceVolumeNameInvalid");
+                        // Couldn't parse/find this volume: abort if requested, otherwise warn
+                        // (unless missing sources are silently allowed)
+                        if (options.AbortIfSourceMissing)
+                            throw new UserInformationException(Strings.Controller.SourceVolumeNameInvalidError(inputsource), "SourceVolumeNameInvalid");
+                        else if (!options.AllowMissingSource)
+                            Logging.Log.WriteWarningMessage(LOGTAG, "SourceVolumeInvalid", null, Strings.Controller.SourceVolumeNameInvalidError(inputsource));
                     }
                 }
                 else
@@ -892,30 +1765,81 @@ namespace Duplicati.Library.Main
                     expandedSources.Add(inputsource);
                 }
 
-                bool foundAnyPaths = false;
-                bool unauthorized = false;
-                foreach (string expandedSource in expandedSources)
+                var foundAnyPaths = false;
+                var unauthorized = false;
+                foreach (var expandedSource in expandedSources)
                 {
                     string source;
+                    // Check if this is a mounted path, avoid logging the source if something fails here
+                    if (expandedSource.StartsWith("@"))
+                    {
+                        // NOTE: If the remote source fails to load,
+                        // this will be an enumeration warning, but will result
+                        // in the backup being recorded without files from the source
+                        // Eventually, this could lead to retention deletion,
+                        // causing the last backup with the data from the source to be deleted
+
+                        // TODO: We do not honor the PreventEmptySource option here,
+                        // as we do not know if the source is empty or not
+                        foundAnyPaths = true;
+                        sources.Add(expandedSource);
+                        continue;
+                    }
+
+                    // Prefix-based source providers (e.g. %HYPERV%, %MSSQL%) are virtual paths
+                    // handled by a source provider, so they should not be checked against the filesystem
+                    if (Library.SourceProviders.SourceProviderModules.BuiltInPrefixSourceProviderModules.Any(m => m.MatchesSource(expandedSource)))
+                    {
+                        foundAnyPaths = true;
+                        sources.Add(expandedSource);
+                        continue;
+                    }
+
                     try
                     {
-                        // TODO: This expands "C:" to CWD, but not C:\
-                        source = System.IO.Path.GetFullPath(expandedSource);
+                        // A bare drive is drive-relative, so GetFullPath would answer with
+                        // the current directory on that drive instead of the root of it
+                        source = Path.GetFullPath(Util.ExpandBareDriveRoot(expandedSource));
                     }
                     catch (Exception ex)
                     {
                         // Note that we use the original source (with the *) in the error
-                        throw new Duplicati.Library.Interface.UserInformationException(Strings.Controller.InvalidPathError(expandedSource, ex.Message), "InputSourceInvalid", ex);
+                        throw new UserInformationException(Strings.Controller.InvalidPathError(expandedSource, ex.Message), "InputSourceInvalid", ex);
                     }
 
-                    var fi = new System.IO.FileInfo(source);
-                    var di = new System.IO.DirectoryInfo(source);
+                    var fi = new FileInfo(source);
+                    var di = new DirectoryInfo(source);
                     if (fi.Exists || di.Exists)
                     {
                         foundAnyPaths = true;
 
                         if (!fi.Exists)
+                        {
+                            // Listing the folder also shows that it can be read. One that cannot, as on a
+                            // failed drive, would be backed up without any of its files, and that version
+                            // would push out the previous ones. A missing source is only skipped when allowed,
+                            // and an unreadable one is treated the same way.
+                            try
+                            {
+                                if (di.Exists && (options.PreventEmptySource || !options.AllowMissingSource))
+                                {
+                                    // If the directory exists, but is empty, and we are not allowed to have empty sources, throw an error
+                                    var isEmpty = !di.EnumerateFileSystemInfos().Any();
+                                    if (options.PreventEmptySource && isEmpty)
+                                        throw new UserInformationException(Strings.Controller.SourceFolderEmptyError(inputsource), "SourceFolderEmpty");
+                                }
+                            }
+                            catch (UnauthorizedAccessException ex)
+                            {
+                                throw new UserInformationException(Strings.Controller.SourceUnauthorizedError(inputsource), "SourceUnauthorized", ex);
+                            }
+                            catch (IOException ex)
+                            {
+                                throw new UserInformationException(Strings.Controller.SourceUnreadableError(inputsource, ex.Message), "SourceUnreadable", ex);
+                            }
+
                             source = Util.AppendDirSeparator(source);
+                        }
 
                         sources.Add(source);
                     }
@@ -936,30 +1860,68 @@ namespace Duplicati.Library.Main
                     }
                 }
 
-                // If no paths were found, and we aren't allowed to have missing sources, throw an error
-                if (!foundAnyPaths && !m_options.AllowMissingSource)
+                // If no paths were found, handle according to options
+                if (!foundAnyPaths)
                 {
-                    if (unauthorized)
+                    if (options.AbortIfSourceMissing)
                     {
-                        throw new System.IO.IOException(Strings.Controller.SourceUnauthorizedError(inputsource));
-                    }
+                        if (unauthorized)
+                            throw new UserInformationException(Strings.Controller.SourceUnauthorizedError(inputsource), "SourceUnauthorized");
 
-                    throw new System.IO.IOException(Strings.Controller.SourceIsMissingError(inputsource));
+                        throw new UserInformationException(Strings.Controller.SourceIsMissingError(inputsource), "SourceIsMissing");
+                    }
+                    else if (!options.AllowMissingSource)
+                    {
+                        if (unauthorized)
+                            throw new UserInformationException(Strings.Controller.SourceUnauthorizedError(inputsource), "SourceUnauthorized");
+
+                        Logging.Log.WriteWarningMessage(LOGTAG, "SourceIsMissing", null, Strings.Controller.SourceIsMissingWarning(inputsource));
+                    }
                 }
             }
 
             //Sanity check for duplicate files/folders
             ISet<string> pathDuplicates;
-            sources = Library.Utility.Utility.GetUniqueItems(sources, Library.Utility.Utility.ClientFilenameStringComparer, out pathDuplicates).OrderBy(a => a).ToList();
+            sources = Library.Utility.Utility.GetUniqueItems(sources, Library.Utility.Utility.ClientFilenameStringComparer, out pathDuplicates).ToList();
 
             foreach (var pathDuplicate in pathDuplicates)
                 Logging.Log.WriteVerboseMessage(LOGTAG, "RemoveDuplicateSource", "Removing duplicate source: {0}", pathDuplicate);
 
             //Sanity check for multiple inclusions of the same folder
             for (int i = 0; i < sources.Count; i++)
+            {
+                // A link on the way that the walk stores as a link, if one was met
+                string storedLink = null;
+
                 for (int j = 0; j < sources.Count; j++)
-                    if (i != j && sources[i].StartsWith(sources[j], Library.Utility.Utility.ClientFilenameStringComparison) && sources[i].EndsWith(Util.DirectorySeparatorString, Library.Utility.Utility.ClientFilenameStringComparison))
+                    if (i != j
+                        && sources[i].StartsWith(sources[j], Library.Utility.Utility.ClientFilenameStringComparison)
+                        && sources[j].EndsWith(Util.DirectorySeparatorString, Library.Utility.Utility.ClientFilenameStringComparison))
                     {
+                        var reach = WalkTowards(sources[i], sources[j], filter, options, out var link);
+
+                        // An include filter cannot bring it back when the walk of the
+                        // containing source stops on the way to it, because the filter is
+                        // never reached. Keeping it as a source is what works, because a
+                        // source is walked from its own root, and the containing source still
+                        // stops where it is told to. Carry on looking: another source may
+                        // still be able to reach it, and keeping one that is reachable would
+                        // walk the same tree twice.
+                        if (reach == NestedSourceReach.CutOff)
+                        {
+                            Logging.Log.WriteVerboseMessage(LOGTAG, "KeepingSubfolderSource", "Keeping source \"{0}\" although it is inside \"{1}\", because the walk of the latter does not reach it", sources[i], sources[j]);
+                            continue;
+                        }
+
+                        // A link that is stored as a link cannot be kept as a source as well:
+                        // the backup would then hold the link and the folder behind it under
+                        // the same path. Carry on looking, as another source may reach it.
+                        if (reach == NestedSourceReach.StoredAsLink)
+                        {
+                            storedLink ??= link;
+                            continue;
+                        }
+
                         if (filter != null)
                         {
                             bool excludes;
@@ -969,191 +1931,302 @@ namespace Duplicati.Library.Main
                             // If there are no excludes, there is no need to keep the folder as a filter
                             if (excludes)
                             {
-                                Logging.Log.WriteVerboseMessage(LOGTAG, "RemovingSubfolderSource", "Removing source \"{0}\" because it is a subfolder of \"{1}\", and using it as an include filter", sources[i], sources[j]);
-                                filter = Library.Utility.JoinedFilterExpression.Join(new FilterExpression(sources[i]), filter);
+                                Logging.Log.WriteVerboseMessage(LOGTAG, "RemovingSubfolderSource", "Removing source \"{0}\" because it is a folder or file inside \"{1}\", and using it as an include filter", sources[i], sources[j]);
+                                filter = JoinedFilterExpression.Join(new FilterExpression(sources[i]), filter);
                             }
                             else
-                                Logging.Log.WriteVerboseMessage(LOGTAG, "RemovingSubfolderSource", "Removing source \"{0}\" because it is a subfolder or subfile of \"{1}\"", sources[i], sources[j]);
+                                Logging.Log.WriteVerboseMessage(LOGTAG, "RemovingSubfolderSource", "Removing source \"{0}\" because it is a folder or file inside \"{1}\"", sources[i], sources[j]);
                         }
                         else
-                            Logging.Log.WriteVerboseMessage(LOGTAG, "RemovingSubfolderSource", "Removing source \"{0}\" because it is a subfolder or subfile of \"{1}\"", sources[i], sources[j]);
+                            Logging.Log.WriteVerboseMessage(LOGTAG, "RemovingSubfolderSource", "Removing source \"{0}\" because it is a folder or file inside \"{1}\"", sources[i], sources[j]);
 
                         sources.RemoveAt(i);
                         i--;
+                        storedLink = null;
                         break;
                     }
 
-            return sources.ToArray();
+                // No source reaches it, and one of them stores a link on the way as a link.
+                // Keeping it would put the link and the folder behind it under the same path,
+                // so it is left out, but not quietly.
+                if (storedLink != null)
+                {
+                    Logging.Log.WriteWarningMessage(LOGTAG, "NestedSourceBehindStoredSymlink", null, "The source \"{0}\" is not backed up: it is reached through the symbolic link \"{1}\", which is inside another source and is stored as a link. Set --symlink-policy=follow to back up what the link points to.", sources[i], storedLink);
+                    sources.RemoveAt(i);
+                    i--;
+                }
+            }
+
+            // If there is nothing to do, don't run the backup
+            if (sources.Count == 0)
+                throw new UserInformationException(Strings.Controller.NoSourcesError, "NoSources");
+
+            return (sources.ToArray(), filter);
         }
 
         /// <summary>
-        /// Checks if the value passed to an option is actually valid.
+        /// How the walk of a source treats another source inside it
         /// </summary>
-        /// <param name="arg">The argument being validated</param>
-        /// <param name="optionname">The name of the option to validate</param>
-        /// <param name="value">The value to check</param>
-        /// <returns>Null if no errors are found, an error message otherwise</returns>
-        private static string ValidateOptionValue(Library.Interface.ICommandLineArgument arg, string optionname, string value)
+        internal enum NestedSourceReach
         {
-            if (arg.Type == Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Enumeration)
-            {
-                bool found = false;
-                foreach (string v in arg.ValidValues ?? new string[0])
-                    if (string.Equals(v, value, StringComparison.CurrentCultureIgnoreCase))
-                    {
-                        found = true;
-                        break;
-                    }
-
-                if (!found)
-                    return Strings.Controller.UnsupportedEnumerationValue(optionname, value, arg.ValidValues ?? new string[0]);
-
-            }
-            else if (arg.Type == Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Flags)
-            {
-                bool validatedAllFlags = false;
-                var flags = (value ?? string.Empty).ToLowerInvariant().Split(new[] {","}, StringSplitOptions.None).Select(flag => flag.Trim()).Distinct();
-                var validFlags = arg.ValidValues ?? new string[0];
-
-                foreach (var flag in flags)
-                {
-                    if (!validFlags.Any(validFlag => string.Equals(validFlag, flag, StringComparison.CurrentCultureIgnoreCase)))
-                    {
-                        validatedAllFlags = false;
-                        break;
-                    }
-
-                    validatedAllFlags = true;
-                }
-
-                if (!validatedAllFlags)
-                {
-                    return Strings.Controller.UnsupportedFlagsValue(optionname, value, validFlags);
-                }
-            }
-            else if (arg.Type == Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Boolean)
-            {
-                if (!string.IsNullOrEmpty(value) && Library.Utility.Utility.ParseBool(value, true) != Library.Utility.Utility.ParseBool(value, false))
-                    return Strings.Controller.UnsupportedBooleanValue(optionname, value);
-            }
-            else if (arg.Type == Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Integer)
-            {
-                if (!long.TryParse(value, out _))
-                    return Strings.Controller.UnsupportedIntegerValue(optionname, value);
-            }
-            else if (arg.Type == Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Path)
-            {
-                foreach (string p in value.Split(System.IO.Path.DirectorySeparatorChar))
-                    if (p.IndexOfAny(System.IO.Path.GetInvalidPathChars()) >= 0)
-                        return Strings.Controller.UnsupportedPathValue(optionname, p);
-            }
-            else if (arg.Type == Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Size)
-            {
-                try
-                {
-                    Library.Utility.Sizeparser.ParseSize(value);
-                }
-                catch
-                {
-                    return Strings.Controller.UnsupportedSizeValue(optionname, value);
-                }
-
-                if (!string.IsNullOrWhiteSpace(value) && char.IsDigit(value.Last()))
-                    return Strings.Controller.NonQualifiedSizeValue(optionname, value);
-            }
-            else if (arg.Type == Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Timespan)
-            {
-                try
-                {
-                    Library.Utility.Timeparser.ParseTimeSpan(value);
-                }
-                catch
-                {
-                    return Strings.Controller.UnsupportedTimeValue(optionname, value);
-                }
-            }
-
-            return null;
+            /// <summary>The walk reaches the inner source</summary>
+            Reached,
+            /// <summary>The walk stops before it reaches the inner source, or leaves the inner source out</summary>
+            CutOff,
+            /// <summary>The walk stores a link on the way, or the inner source itself, as a link and does not follow it</summary>
+            StoredAsLink
         }
 
-        public void Pause()
+        /// <summary>
+        /// Follows the walk of <paramref name="container"/> towards <paramref name="source"/>,
+        /// and reports whether it gets there. The walk does not descend into a folder that the
+        /// filter excludes, that holds an ignore marker, whose attributes are excluded, that is
+        /// marked as excluded from backups by an extended attribute, or that is a symbolic link
+        /// it does not follow. Nothing below such a folder is reached, no matter what the filter
+        /// says about the things below it.
+        /// </summary>
+        /// <returns>How the walk treats the source.</returns>
+        /// <param name="source">The source that sits inside the other one.</param>
+        /// <param name="container">The source that contains it, ending with a separator.</param>
+        /// <param name="filter">The filter to ask.</param>
+        /// <param name="options">The options that decide what the walk leaves out.</param>
+        /// <param name="link">The link that is stored as a link, if that is where the walk stops.</param>
+        internal static NestedSourceReach WalkTowards(string source, string container, IFilter filter, Options options, out string link)
         {
-            var ct = m_currentTask;
+            link = null;
+
+            // A mounted source is not a path on this machine, so there are no folders
+            // between the two to ask about
+            if (source.StartsWith("@", StringComparison.Ordinal) || container.StartsWith("@", StringComparison.Ordinal))
+                return NestedSourceReach.Reached;
+
+            // Every folder between the two, asked for in the form the enumeration uses,
+            // which is with a trailing separator. The container is not one of them: it is
+            // a root, and the walk never leaves out a root.
+            var relative = source.Substring(container.Length);
+            for (var at = relative.IndexOf(Util.DirectorySeparatorString, StringComparison.Ordinal);
+                 at >= 0;
+                 at = relative.IndexOf(Util.DirectorySeparatorString, at + 1, StringComparison.Ordinal))
+            {
+                var folder = container + relative.Substring(0, at + 1);
+                if (folder.Length >= source.Length)
+                    break;
+
+                var reach = WalkPast(folder, filter, options);
+                if (reach != NestedSourceReach.Reached)
+                {
+                    if (reach == NestedSourceReach.StoredAsLink)
+                        link = folder;
+                    return reach;
+                }
+            }
+
+            // The source itself as well. The filter is not asked about it, because the include
+            // filter that replaces it overrules an exclude, but everything else is, as the
+            // enumeration either checks it before the filter, or checks it even when the filter
+            // includes the path, so the include filter never gets a say.
+            var own = WalkPast(source, null, options);
+            if (own == NestedSourceReach.StoredAsLink)
+                link = source;
+            return own;
+        }
+
+        /// <summary>
+        /// Reports how the walk treats a path that is not a root. These are the checks the
+        /// enumeration makes, in the order it makes them, and like it, a path that cannot be
+        /// read is not left out.
+        /// </summary>
+        /// <returns>How the walk treats the path.</returns>
+        /// <param name="path">The path to check, ending with a separator if it is a folder.</param>
+        /// <param name="filter">The filter to ask, or <c>null</c> to not ask it.</param>
+        /// <param name="options">The options that decide what the walk leaves out.</param>
+        private static NestedSourceReach WalkPast(string path, IFilter filter, Options options)
+        {
+            var isFolder = path.EndsWith(Util.DirectorySeparatorString, StringComparison.Ordinal);
+
+            var ignorenames = options.IgnoreFilenames;
+            if (ignorenames != null && isFolder)
+            {
+                try
+                {
+                    if (ignorenames.Any(n => SystemIO.IO_OS.FileExists(Path.Combine(path, n))))
+                        return NestedSourceReach.CutOff;
+                }
+                catch
+                {
+                }
+            }
+
+            FileAttributes? attributes = null;
+            try
+            {
+                attributes = SystemIO.IO_OS.GetFileAttributes(path);
+            }
+            catch
+            {
+            }
+
+            var attributeFilter = options.FileAttributeFilter;
+            if ((attributeFilter & (attributes ?? (isFolder ? FileAttributes.Directory : FileAttributes.Normal))) != 0)
+                return NestedSourceReach.CutOff;
+
+            // A path the filter does not mention is not excluded, it only falls to the
+            // default, so what matters is whether an entry matched and said to exclude it
+            if (filter != null && !filter.Empty && filter.Matches(path, out var include, out _) && !include)
+                return NestedSourceReach.CutOff;
+
+            var isLink = false;
+            try
+            {
+                isLink = attributes != null && Snapshots.SnapshotUtility.IsSymlink(SystemIO.IO_OS, path, attributes.Value);
+            }
+            catch
+            {
+            }
+
+            if (!options.DisableBackupExclusionXattr)
+            {
+                try
+                {
+                    var metadata = SystemIO.IO_OS.GetMetadata(path, isLink, options.SymlinkPolicy == Options.SymlinkStrategy.Follow);
+                    if (metadata != null && metadata.Keys.Any(Operation.Backup.FileEnumerationProcess.ExcludedBackupAttributes.Contains))
+                        return NestedSourceReach.CutOff;
+                }
+                catch
+                {
+                }
+            }
+
+            if (isLink)
+            {
+                if (options.SymlinkPolicy == Options.SymlinkStrategy.Ignore)
+                    return NestedSourceReach.CutOff;
+                if (options.SymlinkPolicy == Options.SymlinkStrategy.Store)
+                    return NestedSourceReach.StoredAsLink;
+            }
+
+            return NestedSourceReach.Reached;
+        }
+
+        /// <inheritdoc />
+        public Task PauseAsync(bool alsoTransfers)
+        {
+            var ct = m_currentTaskControl;
             if (ct != null)
-                ct.Pause();
+                ct.Pause(alsoTransfers);
+            return Task.CompletedTask;
         }
 
-        public void Resume()
+        /// <inheritdoc />
+        public Task ResumeAsync()
         {
-            var ct = m_currentTask;
+            var ct = m_currentTaskControl;
             if (ct != null)
                 ct.Resume();
+            return Task.CompletedTask;
         }
 
-        public void Stop(bool allowCurrentFileToFinish)
+        /// <inheritdoc />
+        public Task StopAsync()
         {
-            var ct = m_currentTask;
+            ITaskControl ct;
+            lock (m_taskControlLock)
+            {
+                ct = m_currentTaskControl;
+                // Before the first operation has started, keep the request for it
+                if (ct == null && !m_operationStarted)
+                    m_stopBeforeStart = true;
+            }
             if (ct == null)
-                return;
+                return Task.CompletedTask;
 
             Logging.Log.WriteVerboseMessage(LOGTAG, "CancellationRequested", "Cancellation Requested");
-            m_cancellationTokenSource.Cancel();
-            ct.Stop(allowCurrentFileToFinish);
+            ct.Stop();
+            return Task.CompletedTask;
         }
 
-        public void Abort()
+        /// <inheritdoc />
+        public Task AbortAsync()
         {
-            var ct = m_currentTask;
-            if (ct != null)
-                ct.Abort();
-
-            var t = m_currentTaskThread;
-            if (t != null)
-                t.Abort();
+            ITaskControl ct;
+            lock (m_taskControlLock)
+            {
+                ct = m_currentTaskControl;
+                // Before the first operation has started, keep the request for it
+                if (ct == null && !m_operationStarted)
+                    m_abortBeforeStart = true;
+            }
+            ct?.Terminate();
+            return Task.CompletedTask;
         }
 
-        public long MaxUploadSpeed
+        /// <inheritdoc />
+        public Task SetThrottleSpeedsAsync(long maxUploadPrSecond, long maxDownloadPrSecond)
         {
-            get { return m_options.MaxUploadPrSecond; }
-            set { m_options.MaxUploadPrSecond = value; }
-        }
-
-        public long MaxDownloadSpeed
-        {
-            get { return m_options.MaxDownloadPrSecond; }
-            set { m_options.MaxDownloadPrSecond = value; }
+            // Set these values in the options, in case the backend is not up yet
+            m_options.MaxUploadPrSecond = maxUploadPrSecond;
+            m_options.MaxDownloadPrSecond = maxDownloadPrSecond;
+            m_currentBackendManager?.UpdateThrottleValues(maxUploadPrSecond, maxDownloadPrSecond);
+            return Task.CompletedTask;
         }
 
         /// <summary>
-        /// Time of last compact operation
+        /// The time of the last compact operation
         /// </summary>
-        public DateTime LastCompact { get; set; }
+        private DateTime m_lastCompact;
 
         /// <summary>
-        /// Time of last vacuum operation
+        /// The time of the last vacuum operation
         /// </summary>
-        public DateTime LastVacuum { get; set; }
+        private DateTime m_lastVacuum;
+
+        /// <summary>
+        /// The time of the last restore test
+        /// </summary>
+        private DateTime m_lastRestoreTest;
+
+        /// <inheritdoc />
+        public Task SetLastCompactAsync(DateTime lastCompact)
+        {
+            m_lastCompact = lastCompact;
+            return Task.CompletedTask;
+        }
+
+        /// <inheritdoc />
+        public Task SetLastVacuumAsync(DateTime lastVacuum)
+        {
+            m_lastVacuum = lastVacuum;
+            return Task.CompletedTask;
+        }
+
+        /// <inheritdoc />
+        public Task SetLastRestoreTestAsync(DateTime lastRestoreTest)
+        {
+            m_lastRestoreTest = lastRestoreTest;
+            return Task.CompletedTask;
+        }
 
         private void CheckAutoCompactInterval()
         {
-            if (!m_options.NoAutoCompact && (LastCompact > DateTime.MinValue) && (LastCompact.Add(m_options.AutoCompactInterval) > DateTime.Now))
+            if (!m_options.NoAutoCompact && (m_lastCompact > DateTime.MinValue) && (m_lastCompact.Add(m_options.AutoCompactInterval) > DateTime.Now))
             {
-                Logging.Log.WriteInformationMessage(LOGTAG, "CompactResults", "Skipping auto compaction until {0}", LastCompact.Add(m_options.AutoCompactInterval));
+                Logging.Log.WriteInformationMessage(LOGTAG, "CompactResults", "Skipping auto compaction until {0}", m_lastCompact.Add(m_options.AutoCompactInterval));
                 m_options.RawOptions["no-auto-compact"] = "true";
             }
         }
 
         private void CheckAutoVacuumInterval()
         {
-            if (m_options.AutoVacuum && (LastVacuum > DateTime.MinValue) && (LastVacuum.Add(m_options.AutoVacuumInterval) > DateTime.Now))
+            if (m_options.AutoVacuum && (m_lastVacuum > DateTime.MinValue) && (m_lastVacuum.Add(m_options.AutoVacuumInterval) > DateTime.Now))
             {
-                Logging.Log.WriteInformationMessage(LOGTAG, "VacuumResults", "Skipping auto vacuum until {0}", LastVacuum.Add(m_options.AutoVacuumInterval));
+                Logging.Log.WriteInformationMessage(LOGTAG, "VacuumResults", "Skipping auto vacuum until {0}", m_lastVacuum.Add(m_options.AutoVacuumInterval));
                 m_options.RawOptions["auto-vacuum"] = "false";
             }
         }
 
         #region IDisposable Members
 
+        /// <inheritdoc />
         public void Dispose()
         {
         }

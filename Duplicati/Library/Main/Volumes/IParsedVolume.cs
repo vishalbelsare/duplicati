@@ -1,7 +1,24 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+using System;
 
 namespace Duplicati.Library.Main.Volumes
 {
@@ -13,6 +30,17 @@ namespace Duplicati.Library.Main.Volumes
         DateTime Time { get; }
         string CompressionModule { get; }
         string EncryptionModule { get; }
-        Library.Interface.IFileEntry File { get; }
+        Interface.IFileEntry File { get; }
+
+        /// <summary>
+        /// True if this is a parity (error-correction) companion file protecting a data volume.
+        /// The remaining properties still describe the owning data volume.
+        /// </summary>
+        bool IsParity { get; }
+
+        /// <summary>
+        /// The parity module extension (e.g. "par2") if <see cref="IsParity"/> is true, otherwise null.
+        /// </summary>
+        string ParityModule { get; }
     }
 }

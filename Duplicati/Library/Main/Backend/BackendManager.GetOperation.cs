@@ -1,0 +1,385 @@
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Utility;
+using Duplicati.StreamUtil;
+using SharpAESCrypt;
+
+namespace Duplicati.Library.Main.Backend;
+
+#nullable enable
+
+partial class BackendManager
+{
+    /// <summary>
+    /// Represents a pending GET operation
+    /// </summary>
+    private class GetOperation : PendingOperation<(TempFile File, string Hash, long Size)>
+    {
+        /// <summary>
+        /// The log tag for this class
+        /// </summary>
+        private static readonly string LOGTAG = Logging.Log.LogTagFromType<GetOperation>();
+
+        /// <summary>
+        /// The remote filename that is to be downloaded
+        /// </summary>
+        public override string RemoteFilename { get; }
+        /// <summary>
+        /// The size of the remote file, or -1 if unknown
+        /// </summary>
+        public override long Size { get; }
+        /// <summary>
+        /// Flag indicating whether the file should be decrypted
+        /// </summary>
+        public bool Decrypt { get; set; }
+        /// <summary>
+        /// The hash of the remote file, or null if unknown
+        /// </summary>
+        public required string? Hash { get; set; }
+
+        /// <summary>
+        /// Whether a failed download may be repaired in place using parity data. This is
+        /// enabled for normal operations, but disabled for the test/verification flow so
+        /// that damaged files are reported rather than silently repaired.
+        /// </summary>
+        public bool AllowParityRepair { get; set; } = true;
+
+        /// <summary>
+        /// The operation type
+        /// </summary>
+        public override BackendActionType Operation => BackendActionType.Get;
+
+        /// <summary>
+        /// Creates a new GetOperation
+        /// </summary>
+        /// <param name="remotefilename">The remote filename to download</param>
+        /// <param name="size">The size of the remote file, or -1 if unknown</param>
+        /// <param name="context">The execution context</param>
+        /// <param name="cancelToken">The cancellation token</param>
+        public GetOperation(string remotefilename, long size, ExecuteContext context, CancellationToken cancelToken)
+            : base(context, true, cancelToken)
+        {
+            RemoteFilename = remotefilename;
+            Size = size;
+        }
+
+        /// <summary>
+        /// Executes the operation
+        /// </summary>
+        /// <param name="backend">The backend to download from</param>
+        /// <param name="cancelToken">The cancellation token</param>
+        /// <returns>The file, hash and size of the downloaded file</returns>
+        public override async Task<(TempFile File, string Hash, long Size)> ExecuteAsync(IBackend backend, CancellationToken cancelToken)
+        {
+            TempFile? tmpfile = null;
+
+            try
+            {
+                Context.Statwriter.SendEvent(BackendActionType.Get, BackendEventType.Started, RemoteFilename, Size);
+
+                // Start and time the donwload
+                var begin = DateTime.Now;
+
+                (tmpfile, var dataSizeDownloaded, var fileHash) = await DoGetFileAsync(backend, cancelToken).ConfigureAwait(false);
+
+                var duration = DateTime.Now - begin;
+                Logging.Log.WriteProfilingMessage(LOGTAG, "DownloadSpeed", "Downloaded {0} to {1} ({2}) in {3}, {4}/s",
+                    RemoteFilename, tmpfile.Name, Library.Utility.Utility.FormatSizeString(dataSizeDownloaded),
+                    duration, Library.Utility.Utility.FormatSizeString((long)(dataSizeDownloaded / duration.TotalSeconds)));
+
+                Context.Database.LogRemoteOperation("get", RemoteFilename, System.Text.Json.JsonSerializer.Serialize(new { Size = dataSizeDownloaded, Hash = fileHash }));
+                Context.Statwriter.SendEvent(BackendActionType.Get, BackendEventType.Completed, RemoteFilename, dataSizeDownloaded);
+
+                if (!Context.Options.SkipFileHashChecks)
+                {
+                    var sizeMismatch = Size >= 0 && dataSizeDownloaded != Size;
+                    var hashMismatch = !string.IsNullOrEmpty(Hash) && fileHash != Hash;
+
+                    if (sizeMismatch || hashMismatch)
+                    {
+                        // The downloaded file failed verification; attempt a best-effort
+                        // repair using a parity companion file, if one is available. In the
+                        // test/verification flow (AllowParityRepair == false) we skip the
+                        // repair so that damaged files are reported instead of masked.
+                        var repaired = AllowParityRepair
+                            ? await TryRepairWithParityAsync(backend, tmpfile, cancelToken).ConfigureAwait(false)
+                            : null;
+                        if (repaired != null)
+                        {
+                            tmpfile.Dispose();
+                            tmpfile = repaired;
+                            dataSizeDownloaded = new System.IO.FileInfo(tmpfile).Length;
+                            fileHash = CalculateFileHash(tmpfile, Context.Options);
+                            sizeMismatch = Size >= 0 && dataSizeDownloaded != Size;
+                            hashMismatch = !string.IsNullOrEmpty(Hash) && fileHash != Hash;
+                        }
+
+                        if (sizeMismatch)
+                            throw new Exception(Strings.Controller.DownloadedFileSizeError(RemoteFilename, dataSizeDownloaded, Size));
+
+                        if (hashMismatch)
+                            throw new HashMismatchException(Strings.Controller.HashMismatchError(RemoteFilename, Hash, fileHash));
+                    }
+                }
+
+                // Perform decryption after hash validation, if needed
+                if (Decrypt)
+                    tmpfile = DecryptFile(tmpfile, RemoteFilename, Context.Options, true);
+
+                return (tmpfile, fileHash, dataSizeDownloaded);
+            }
+            catch
+            {
+                tmpfile?.Dispose();
+                throw;
+            }
+            finally
+            {
+                Context.ProgressHandler.EndTransfer(BackendActionType.Get, RemoteFilename);
+            }
+        }
+
+        /// <summary>
+        /// Attempts to repair a downloaded file that failed verification, using a
+        /// parity companion file downloaded from the same backend. This is best-effort:
+        /// if parity is disabled, the parity file is missing, or the engine is
+        /// unavailable, it returns false and the caller reports the original error.
+        /// </summary>
+        /// <param name="backend">The backend to download the parity file from</param>
+        /// <param name="tmpfile">The downloaded (still-encrypted) file to repair</param>
+        /// <param name="cancelToken">The cancellation token</param>
+        /// <returns>A repaired copy of the file, or null if it was not repaired</returns>
+        private async Task<TempFile?> TryRepairWithParityAsync(IBackend backend, TempFile tmpfile, CancellationToken cancelToken)
+        {
+            var parityModule = Context.Options.ParityModule;
+            if (string.IsNullOrEmpty(parityModule))
+                return null;
+
+            // Do not attempt to repair a parity file itself, or non-volume files. Only
+            // data volumes (dblock/dlist) have parity companions; for anything else there
+            // is no parity file to find.
+            var parsed = Volumes.VolumeBase.ParseFilename(RemoteFilename);
+            if (parsed == null || parsed.IsParity)
+                return null;
+            if (parsed.FileType != RemoteVolumeType.Blocks && parsed.FileType != RemoteVolumeType.Files)
+                return null;
+
+            try
+            {
+                // The shared parity instance lives for the whole operation, so the
+                // availability probe and any "not found" warning happen once, not per volume.
+                var parity = Context.Parity.Get();
+                if (parity == null || !parity.IsAvailable)
+                    return null;
+
+                var parityEffectiveName = GetEffectiveRemoteName() + "." + parity.FilenameExtension;
+                using var parityTemp = new TempFile();
+                try
+                {
+                    await backend.GetAsync(parityEffectiveName, parityTemp, cancelToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "ParityFileNotAvailable", ex, "No parity file available to repair {0}: {1}", RemoteFilename, ex.Message);
+                    return null;
+                }
+
+                // Repair a copy: the downloaded file can be a hard link to the stored file,
+                // and writing to it would change the stored file as well
+                TempFile? repaired = new TempFile();
+                try
+                {
+                    System.IO.File.Copy(tmpfile, repaired, true);
+                    if (await parity.RepairAsync(repaired, parityTemp, cancelToken).ConfigureAwait(false))
+                    {
+                        // Repairing a volume means the remote data was damaged; emit a warning
+                        // so it is visible that the backup data is no longer in prime condition.
+                        Logging.Log.WriteWarningMessage(LOGTAG, "ParityRepairSuccess", null, "Repaired {0} using parity data; the remote copy is damaged and should be checked", RemoteFilename);
+                        var result = repaired;
+                        repaired = null;
+                        return result;
+                    }
+                }
+                finally
+                {
+                    repaired?.Dispose();
+                }
+
+                Logging.Log.WriteWarningMessage(LOGTAG, "ParityRepairFailed", null, "Parity repair did not succeed for {0}", RemoteFilename);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Logging.Log.WriteWarningMessage(LOGTAG, "ParityRepairError", ex, "Error during parity repair of {0}: {1}", RemoteFilename, ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Downloads a file from the backend
+        /// </summary>
+        /// <param name="backend">The backend to download from</param>
+        /// <param name="cancelToken">The cancellation token</param>
+        /// <returns>The downloaded file, the size of the file, and the hash of the file</returns>
+        private async Task<(TempFile tempFile, long downloadSize, string remotehash)> DoGetFileAsync(IBackend backend, CancellationToken cancelToken)
+        {
+            TempFile? dlTarget = null;
+            try
+            {
+                long retDownloadSize;
+                string retHashcode;
+                dlTarget = new TempFile();
+                Context.ProgressHandler.BeginTransfer(BackendActionType.Get, Size, RemoteFilename);
+                // The effective remote name is the name passed to the backend. For
+                // folder-enabled backends it equals RemoteFilename (the full relative
+                // path); for non-folder backends the backend is pointed at the file's
+                // sub-folder (via BackendUrlOverride) and this is just the filename.
+                var effectiveName = GetEffectiveRemoteName();
+                if (backend is IStreamingBackend streamingBackend && streamingBackend.SupportsStreaming && !Context.Options.DisableStreamingTransfers)
+                {
+                    // extended to use stacked streams
+                    using (var fs = System.IO.File.OpenWrite(dlTarget))
+                    using (var hasher = HashFactory.CreateHasher(Context.Options.FileHashAlgorithm))
+                    using (var hs = new HashCalculatingStream(fs, hasher))
+                    using (var ss = new ShaderStream(hs, true))
+                    {
+                        using (var ts = new ThrottleEnabledStream(ss, Context.UploadThrottleManager, Context.DownloadThrottleManager))
+                        using (var pgs = new ProgressReportingStream(ts, pg => Context.ProgressHandler.HandleProgress(pg, RemoteFilename)))
+                        {
+                            await streamingBackend.GetAsync(effectiveName, pgs, cancelToken).ConfigureAwait(false);
+                        }
+                        await ss.FlushAsync();
+                        retDownloadSize = ss.TotalBytesWritten;
+                        retHashcode = Convert.ToBase64String(hs.GetFinalHash());
+                    }
+                }
+                else
+                {
+                    await backend.GetAsync(effectiveName, dlTarget, cancelToken).ConfigureAwait(false);
+                    retDownloadSize = new System.IO.FileInfo(dlTarget).Length;
+                    retHashcode = CalculateFileHash(dlTarget, Context.Options);
+                }
+
+                var retTarget = dlTarget;
+                dlTarget = null;
+                return (retTarget, retDownloadSize, retHashcode);
+            }
+            finally
+            {
+                // Remove temp files on failure
+                dlTarget?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Detects the encryption module to use, based on the filename.
+        /// This makes it possible to restore from a folder with mixed encryption modules.
+        /// </summary>
+        /// <param name="encryption">The default encryption module</param>
+        /// <returns>The encryption module to use</returns>
+        private static IEncryption? DetectEncryptionModule(string filename, Options options, IEncryption? encryption)
+        {
+            try
+            {
+                // Auto-guess the encryption module
+                var ext = (System.IO.Path.GetExtension(filename) ?? "").TrimStart('.');
+                if (!ext.Equals(encryption?.FilenameExtension, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Check if the file is not encrypted
+                    if (DynamicLoader.CompressionLoader.Keys.Contains(ext, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (encryption != null)
+                            Logging.Log.WriteVerboseMessage(LOGTAG, "AutomaticDecryptionDetection", "Filename extension \"{0}\" does not match encryption module \"{1}\", guessing that it is not encrypted", ext, options.EncryptionModule);
+                        return null;
+                    }
+                    // Check if the file is encrypted with something else
+                    else if (DynamicLoader.EncryptionLoader.Keys.Contains(ext, StringComparer.OrdinalIgnoreCase))
+                    {
+                        Logging.Log.WriteVerboseMessage(LOGTAG, "AutomaticDecryptionDetection", "Filename extension \"{0}\" does not match encryption module \"{1}\", attempting to use matching encryption module", ext, options.EncryptionModule);
+
+                        try
+                        {
+                            return DynamicLoader.EncryptionLoader.GetModule(ext, options.Passphrase, options.RawOptions)
+                                ?? encryption;
+                        }
+                        catch (Exception ex)
+                        {
+                            Logging.Log.WriteWarningMessage(LOGTAG, "AutomaticDecryptionDetection", ex, "Failed to load encryption module \"{0}\", using specified encryption module \"{1}\"", ext, options.EncryptionModule);
+                        }
+                    }
+                    // Fallback, lets see what happens...
+                    else
+                    {
+                        Logging.Log.WriteVerboseMessage(LOGTAG, "AutomaticDecryptionDetection", "Filename extension \"{0}\" does not match encryption module \"{1}\", attempting to use specified encryption module as no others match", ext, options.EncryptionModule);
+                    }
+                }
+
+                return encryption;
+            }
+            // If we fail here, make sure that we throw a crypto exception
+            catch (System.Security.Cryptography.CryptographicException) { throw; }
+            catch (Exception ex) { throw new System.Security.Cryptography.CryptographicException(ex.Message, ex); }
+        }
+
+        /// <summary>
+        /// Performs decryption of a file. This could be more efficient if we decrypt while downloading,
+        /// but that would prevent us from verifying the hash of the encrypted file, before decrypting it.
+        /// Decrypting afterwards also ensures we can control the thrown exceptions.
+        /// </summary>
+        /// <param name="tempFile">The encrypted file</param>
+        /// <param name="decrypter">Then encryption module to use, or <c>null</c> for no encryption</param>
+        /// <returns>The decrypted file</returns>
+        private static TempFile DecryptFile(TempFile tempFile, IEncryption? decrypter, bool dispose)
+        {
+            // Support no encryption
+            if (decrypter == null)
+                return tempFile;
+
+            TempFile? decryptTarget = null;
+
+            // Always dispose the source file
+            using (dispose ? tempFile : null)
+            using (new Logging.Timer(LOGTAG, "DecryptFile", "Decrypting " + tempFile))
+            {
+                try
+                {
+                    decryptTarget = new TempFile();
+                    try { decrypter.Decrypt(tempFile, decryptTarget); }
+                    // If we fail here, make sure that we throw a crypto exception
+                    catch (System.Security.Cryptography.CryptographicException) { throw; }
+                    catch (Exception ex) { throw new System.Security.Cryptography.CryptographicException(ex.Message, ex); }
+
+                    var result = decryptTarget;
+                    decryptTarget = null;
+                    return result;
+                }
+                finally
+                {
+                    // Remove temp files on failure
+                    decryptTarget?.Dispose();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Decrypts a file using the specified options
+        /// </summary>
+        /// <param name="tmpfile">The file to decrypt</param>
+        /// <param name="filename">The name of the file. Used for detecting encryption algorithm if not specified in options or if it differs from the options</param>
+        /// <param name="options">The Duplicati options</param>
+        /// <param name="dispose">If true, the source file will be disposed after decryption</param>
+        /// <returns>The decrypted file</returns>
+        public static TempFile DecryptFile(TempFile tmpfile, string filename, Options options, bool dispose)
+        {
+            using var encryption = options.NoEncryption
+                                    ? null
+                                    : (DynamicLoader.EncryptionLoader.GetModule(options.EncryptionModule, options.Passphrase, options.RawOptions)
+                                        ?? throw new Exception(Strings.BackendMananger.EncryptionModuleNotFound(options.EncryptionModule))
+                                );
+            return DecryptFile(tmpfile, DetectEncryptionModule(filename, options, encryption), dispose);
+        }
+    }
+}

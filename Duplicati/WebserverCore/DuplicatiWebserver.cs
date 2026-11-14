@@ -1,0 +1,533 @@
+﻿// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using System.Collections.Concurrent;
+using System.Net;
+using Duplicati.Library.ChangeTracking;
+using System.Net.Security;
+using System.Security.Authentication;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Utility;
+using Duplicati.Server;
+using Duplicati.Server.Database;
+using Duplicati.WebserverCore.Abstractions;
+using Duplicati.WebserverCore.Dto.V2;
+using Duplicati.WebserverCore.Exceptions;
+using Duplicati.WebserverCore.Extensions;
+using Duplicati.WebserverCore.Mcp;
+using Duplicati.WebserverCore.Middlewares;
+using Duplicati.WebserverCore.Services;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Http.Json;
+using Microsoft.AspNetCore.Server.Kestrel.Https;
+using Microsoft.Extensions.Configuration.Json;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.OpenApi;
+
+namespace Duplicati.WebserverCore;
+
+/// <summary>
+/// Instance of the Duplicati webserver
+/// </summary>
+public class DuplicatiWebserver
+{
+    /// <summary>
+    /// The log tag for this class
+    /// </summary>
+    private static readonly string LOGTAG = Library.Logging.Log.LogTagFromType<DuplicatiWebserver>();
+    /// <summary>
+    /// The name of the CORS policy
+    /// </summary>
+    public const string CorsPolicyName = "CustomCorsPolicy";
+    /// <summary>
+    /// The name of the authentication scheme that accepts the credentials of the API
+    /// </summary>
+    public const string CombinedSchemeName = "CombinedScheme";
+
+    /// <summary>
+    /// The configuration for the server
+    /// </summary>
+    public required IConfiguration Configuration { get; init; }
+
+    /// <summary>
+    /// The web application
+    /// </summary>
+    public required WebApplication App { get; init; }
+
+    /// <summary>
+    /// The service provider
+    /// </summary>
+    public IServiceProvider Provider => App.Services;
+
+    /// <summary>
+    /// The port the server is listening on
+    /// </summary>
+    public required int Port { get; init; }
+
+    /// <summary>
+    /// The interfaces being listened to
+    /// </summary>
+    public required string Interface { get; init; }
+
+    /// <summary>
+    /// The port the server is listening on
+    /// </summary>
+    public required bool CorsEnabled { get; init; }
+
+    /// <summary>
+    /// The task that will be set when the server is terminated
+    /// </summary>
+    public Task TerminationTask { get; private set; } = Task.CompletedTask;
+
+    /// <summary>
+    /// If Swagger should be enabled
+    /// </summary>
+#if DEBUG
+    private static readonly bool EnableSwagger = true;
+#else
+    private static readonly bool EnableSwagger = false;
+#endif
+
+    /// <summary>
+    /// Gets server-only options that are consumed by the server and not passed to the command-line client.
+    /// </summary>
+    public static ICommandLineArgument[] ServerOnlyOptions =>
+    [
+        new CommandLineArgument(
+            "store-task-config",
+            CommandLineArgument.ArgumentType.Enumeration,
+            Server.Strings.Program.StoretaskconfigShort,
+            Server.Strings.Program.StoretaskconfigLong,
+            StoreTaskConfigMode.Auto.ToString(),
+            null,
+            Enum.GetNames(typeof(StoreTaskConfigMode))),
+        new CommandLineArgument(
+            Server.Runner.FILE_WATCHER_OPTION,
+            CommandLineArgument.ArgumentType.Boolean,
+            Server.Strings.Program.UsefilewatcherShort,
+            Server.Strings.Program.UsefilewatcherLong,
+            "false")
+    ];
+
+    /// <summary>
+    /// The settings used for stating the server
+    /// </summary>
+    /// <param name="WebRoot">The root folder with static files</param>
+    /// <param name="Port">The listining port</param>
+    /// <param name="Interface">The listening interface</param>
+    /// <param name="AllowedHostnames">The allowed hostnames</param>
+    /// <param name="DisableStaticFiles">If static files should be disabled</param>
+    /// <param name="TokenLifetimeInMinutes">The lifetime of refresh tokens in minutes</param>
+    /// <param name="SPAPaths">The paths to serve as SPAs</param>
+    /// <param name="CorsOrigins">The origins to allow for CORS</param>
+    /// <param name="PreAuthTokens">The pre-authenticated tokens</param>
+    public record InitSettings(
+        string WebRoot,
+        int Port,
+        IPAddress Interface,
+        IEnumerable<string> AllowedHostnames,
+        bool DisableStaticFiles,
+        int TokenLifetimeInMinutes,
+        IEnumerable<string> SPAPaths,
+        IEnumerable<string> CorsOrigins,
+        IReadOnlySet<string> PreAuthTokens,
+        ChangeTrackingSettings ChangeTracking
+    );
+
+    /// <summary>
+    /// Creates a new webserver instance
+    /// </summary>
+    /// <param name="settings">The settings for the server</param>
+    /// <param name="connection">The connection to the database</param>
+    /// <param name="logWriteHandler">The log write handler</param>
+    /// <param name="applicationSettings">The application settings</param>
+    /// <returns>The new webserver instance</returns>
+    public static DuplicatiWebserver CreateWebServer(InitSettings settings, Connection connection, ILogWriteHandler logWriteHandler, IApplicationSettings applicationSettings)
+    {
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions()
+        {
+            ContentRootPath = settings.WebRoot,
+            WebRootPath = settings.WebRoot
+        });
+
+        // Remove all appsettings sources as they are not used, but they do install FS watchers by default
+        while (true)
+        {
+            var appCfgSource = builder.Configuration.Sources.FirstOrDefault(x => x is JsonConfigurationSource { ReloadOnChange: true });
+            if (appCfgSource == null)
+                break;
+            builder.Configuration.Sources.Remove(appCfgSource);
+        }
+
+        var useHttps = connection.ApplicationSettings.UseHTTPS && connection.ApplicationSettings.ServerSSLCertificate != null;
+        builder.WebHost.ConfigureKestrel(options =>
+        {
+            // Handle IPv6 addresses
+            if (settings.Interface == IPAddress.Any)
+            {
+                options.ListenAnyIP(settings.Port, listenOptions =>
+                {
+                    if (useHttps)
+                        ConfigureHttps(listenOptions, connection);
+                });
+            }
+            else if (settings.Interface == IPAddress.Loopback)
+            {
+                options.ListenLocalhost(settings.Port, listenOptions =>
+                {
+                    if (useHttps)
+                        ConfigureHttps(listenOptions, connection);
+                });
+            }
+            else
+            {
+                options.Listen(settings.Interface, settings.Port, listenOptions =>
+                {
+                    if (useHttps)
+                        ConfigureHttps(listenOptions, connection);
+                });
+            }
+        });
+
+        builder.Services.Configure<JsonOptions>(opt =>
+        {
+            opt.SerializerOptions.PropertyNamingPolicy = null;
+            opt.SerializerOptions.Converters.Add(new DayOfWeekStringEnumConverter());
+            opt.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
+        });
+
+        // Loads the JWTConfig, generating one with a signing key if not present.
+        // The config can be replaced at runtime (e.g. on password change), so consumers must read it through the provider.
+        var jwtConfigProvider = new JWTConfigProvider(connection, settings.TokenLifetimeInMinutes);
+
+        if (EnableSwagger)
+        {
+            // Swagger is picking up JSON settings from controllers, even though we do not use controllers
+            builder.Services.AddControllers()
+                .AddJsonOptions(opt =>
+                {
+                    opt.JsonSerializerOptions.PropertyNamingPolicy = null;
+                    opt.JsonSerializerOptions.Converters.Add(new DayOfWeekStringEnumConverter());
+                    opt.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+                });
+
+            builder.Services
+                .AddEndpointsApiExplorer()
+                .AddSwaggerGen(c =>
+                {
+                    c.SwaggerDoc("v1", new OpenApiInfo { Title = "Duplicati API Documentation", Version = "v1" });
+                    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme()
+                    {
+                        Description = "JWT Authorization header using the Bearer scheme. Example: \"Authorization: Bearer {token}\"",
+                        Name = "Authorization",
+                        In = ParameterLocation.Header,
+                        Type = SecuritySchemeType.Http,
+                        Scheme = "bearer"
+                    });
+                });
+        }
+
+        builder.Services
+            .AddHttpContextAccessor()
+            .AddMemoryCache()
+            .AddSingleton<IHostnameValidator>(new HostnameValidator(settings.AllowedHostnames))
+            .AddSingleton<IJWTConfigProvider>(jwtConfigProvider)
+            .AddTransient(sp => sp.GetRequiredService<IJWTConfigProvider>().Current)
+            .AddSingleton(new PreAuthTokenConfig(settings.PreAuthTokens))
+            .AddAuthorization()
+            .AddAuthentication(options => { options.DefaultScheme = CombinedSchemeName; })
+            .AddScheme<AuthenticationSchemeOptions, PreAuthTokenHandler>(PreAuthTokenHandler.SchemeName, null)
+            .AddScheme<AuthenticationSchemeOptions, McpTokenHandler>(McpTokenHandler.SchemeName, null)
+            .AddPolicyScheme(CombinedSchemeName, $"JWT or {PreAuthTokenHandler.SchemeName}", options =>
+            {
+                options.ForwardDefaultSelector = context =>
+                {
+                    var authHeader = context.Request.Headers["Authorization"].ToString();
+                    if (authHeader?.StartsWith(PreAuthTokenHandler.SchemePrefix) == true)
+                        return "PreAuth";
+
+                    // Support for websocket authentication (should be fixed with messages)
+                    var queryToken = context.Request.Query["token"].ToString();
+                    if (string.IsNullOrWhiteSpace(authHeader) && !string.IsNullOrEmpty(queryToken) && settings.PreAuthTokens.Contains(queryToken))
+                        return "PreAuth";
+
+                    return "Jwt";
+                };
+            })
+            .AddJwtBearer("Jwt", options =>
+            {
+                var initialJwtConfig = jwtConfigProvider.Current;
+                options.Authority = initialJwtConfig.Authority;
+                options.Audience = initialJwtConfig.Audience;
+                options.SaveToken = true;
+                options.TokenValidationParameters = JWTTokenProvider.GetTokenValidationParameters(initialJwtConfig);
+                // Resolve the key on each validation, so a reset signing key takes effect immediately
+                options.TokenValidationParameters.IssuerSigningKey = null;
+                options.TokenValidationParameters.IssuerSigningKeyResolver = (_, _, _, _) => [jwtConfigProvider.Current.SymmetricSecurityKey()];
+                options.Configuration = new Microsoft.IdentityModel.Protocols.OpenIdConnect.OpenIdConnectConfiguration();
+
+                options.Events = new JwtBearerEvents
+                {
+                    OnMessageReceived = (context) =>
+                    {
+                        var accessToken = context.Request.Query["token"];
+
+                        // If the request is for our hub...
+                        var path = context.HttpContext.Request.Path;
+                        if (!string.IsNullOrEmpty(accessToken) &&
+                            path.StartsWithSegments("/notifications"))
+                        {
+                            // Read the token out of the query string
+                            context.Token = accessToken;
+                        }
+                        return Task.CompletedTask;
+                    },
+                    OnTokenValidated = context =>
+                    {
+                        var store = context.HttpContext.RequestServices.GetRequiredService<ITokenFamilyStore>();
+                        return JWTTokenProvider.ValidateAccessTokenAsync(context, store);
+                    }
+                };
+            });
+
+        builder.Services.AddHealthChecks()
+            .AddCheck("Basic", () => HealthCheckResult.Healthy("Service is running"));
+
+        builder.Services.AddDuplicatiMcp();
+        builder.Services.AddDuplicati(connection, logWriteHandler, applicationSettings, settings.ChangeTracking);
+
+        // Prevent logs from spamming the console, but allow enabling for debugging
+        if (Environment.GetEnvironmentVariable("DUPLICATI_WEBSERVER_LOGGING") != "1")
+        {
+            builder.Logging
+                .AddFilter("Microsoft", LogLevel.Warning)
+                .AddFilter("Microsoft.AspNetCore.DataProtection.KeyManagement.XmlKeyManager", LogLevel.Error)
+                .AddFilter("System", LogLevel.Warning)
+                .AddFilter("Duplicati", LogLevel.Warning)
+                .AddFilter("ModelContextProtocol", LogLevel.Warning)
+                .AddFilter("Microsoft.AspNetCore.Diagnostics", LogLevel.None);
+
+            // The event log of Windows has a filter rule of its own, which takes precedence
+            // over the rules above, so the exceptions must be silenced for it separately
+            if (OperatingSystem.IsWindows())
+                builder.Logging.AddFilter<Microsoft.Extensions.Logging.EventLog.EventLogLoggerProvider>("Microsoft.AspNetCore.Diagnostics", LogLevel.None);
+        }
+
+        builder.Services.AddHttpClient();
+        // The client forwarding remote control commands must only talk to the local server,
+        // so it must not follow redirects, as that would send the request elsewhere
+        builder.Services.AddHttpClient(RemoteControllerHandler.ForwardingHttpClientName)
+            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+
+        var useCors = settings.CorsOrigins != null && settings.CorsOrigins.Any();
+        if (useCors)
+        {
+            builder.Services.AddCors(options =>
+            {
+                options.AddPolicy(
+                    name: CorsPolicyName,
+                    policy =>
+                    {
+                        policy.WithOrigins(settings.CorsOrigins!.ToArray())
+                            .AllowAnyHeader()
+                            .AllowAnyMethod();
+                    });
+            });
+        }
+
+        var app = builder.Build();
+        var httpClientFactory = app.Services.GetRequiredService<IHttpClientFactory>();
+        HttpClientHelper.Configure(httpClientFactory);
+
+        if (useCors)
+            app.UseCors(CorsPolicyName);
+
+        app.UseDuplicatiMcpAccessControl();
+        app.UseAuthentication();
+        app.UseAuthorization();
+
+        app.UseSynologyDsmAuthIfEnabled();
+        app.UseQnapAuthIfEnabled();
+
+        if (EnableSwagger)
+        {
+            app.UseSwagger();
+            app.UseSwaggerUI(c =>
+            {
+                c.SwaggerEndpoint("/swagger/v1/swagger.json", "Duplicati");
+            });
+        }
+
+        if (!settings.DisableStaticFiles)
+            app.UseDefaultStaticFiles(settings.WebRoot, settings.SPAPaths);
+
+        app.Use(async (context, next) =>
+        {
+            // Set up the log scope to capture any log messages for the livelog / server log
+            using (var scope = Library.Logging.Log.StartScope(logWriteHandler))
+                await next();
+        });
+
+        app.UseExceptionHandler(app =>
+        {
+            app.Run(async context =>
+            {
+                var thrownException = context.Features.Get<IExceptionHandlerPathFeature>()?.Error;
+                var userReportedHttpException = thrownException as UserReportedHttpException;
+                var userInformationException = thrownException as UserInformationException;
+                var isV2Request = (context.Request.Path.Value ?? "").StartsWith("/api/v2/");
+
+                if (isV2Request && userReportedHttpException != null)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.OK;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(JsonSerializer.Serialize(ResponseEnvelope.Failure(userReportedHttpException.Message, $"HTTP-{userReportedHttpException.StatusCode}")));
+                }
+                else if (isV2Request && userInformationException != null)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.OK;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(JsonSerializer.Serialize(ResponseEnvelope.Failure(userInformationException.Message, userInformationException.HelpID)));
+                }
+                else if (userReportedHttpException != null)
+                {
+                    context.Response.StatusCode = userReportedHttpException.StatusCode;
+                    context.Response.ContentType = userReportedHttpException.ContentType;
+                    if (context.Response.ContentType == "text/plain")
+                        await context.Response.WriteAsync(userReportedHttpException.Message);
+                    else
+                        await context.Response.WriteAsync(JsonSerializer.Serialize(new { Error = userReportedHttpException.Message, Code = userReportedHttpException.StatusCode }));
+                }
+                else if (userInformationException != null)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(JsonSerializer.Serialize(new { Error = userInformationException.Message, Code = (int)HttpStatusCode.BadRequest, HelpId = userInformationException.HelpID }));
+                }
+                else
+                {
+                    // These are unexpected exceptions, so log them
+                    app.ApplicationServices.GetRequiredService<ILogger<DuplicatiWebserver>>()
+                        .LogError(thrownException, "Unhandled exception");
+
+                    Library.Logging.Log.WriteErrorMessage(LOGTAG, "UnhandledException", thrownException, "Unhandled exception in webserver request to {0}", context.Request.Path);
+
+                    context.Response.StatusCode = 500;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(JsonSerializer.Serialize(new { Error = "An error occurred", Code = 500 }));
+                }
+            });
+        });
+
+        if (connection.ApplicationSettings.RemoteControlEnabled)
+            app.Services.GetRequiredService<IRemoteController>().Enable(false);
+
+        // Preload static system info, for better first-load experience
+        _ = Task.Run(() => app.Services.GetRequiredService<ISystemInfoProvider>().GetSystemInfo(null));
+
+        // Get a string description of the listen interface used
+        var listenInterface = settings.Interface == IPAddress.Any
+            ? "*"
+            : settings.Interface == IPAddress.Loopback
+                ? "localhost"
+                : settings.Interface.ToString();
+
+        var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+
+        // Register SIGTERM handler
+        lifetime.ApplicationStopping.Register(() => applicationSettings.SignalApplicationExit());
+
+        // The factory is disposed with the service provider when the server stops,
+        // so clients created after that must not come from it
+        lifetime.ApplicationStopped.Register(() => HttpClientHelper.Unconfigure(httpClientFactory));
+
+        return new DuplicatiWebserver()
+        {
+            Configuration = builder.Configuration,
+            App = app,
+            Port = settings.Port,
+            Interface = listenInterface,
+            CorsEnabled = useCors
+        };
+
+    }
+
+    /// <summary>
+    /// Configures HTTPS for the server with dynamic certificate loading.
+    /// This allows certificates to be renewed without restarting the server.
+    /// </summary>
+    /// <param name="listenOptions">The listen options</param>
+    /// <param name="connection">The connection</param>
+    private static void ConfigureHttps(Microsoft.AspNetCore.Server.Kestrel.Core.ListenOptions listenOptions, Connection connection)
+    {
+        var _contextCache = new ConcurrentDictionary<string, SslStreamCertificateContext>();
+
+        listenOptions.UseHttps(new TlsHandshakeCallbackOptions
+        {
+            OnConnection = context =>
+            {
+                var collection = connection.ApplicationSettings.ServerSSLCertificate;
+                var leafCert = collection?.FirstOrDefault(x => x.HasPrivateKey);
+                if (leafCert == null || collection == null)
+                {
+                    Library.Logging.Log.WriteWarningMessage(LOGTAG, "NoCertificateAvailable", null, "No SSL certificate available for HTTPS connection.");
+                    throw new AuthenticationException("No certificates found");
+                }
+
+                // We only expect a single active certificate
+                if (_contextCache.Count > 2)
+                    _contextCache.Clear();
+
+                // Reuse cert context across connections
+                var certContext = _contextCache.GetOrAdd(leafCert.Thumbprint, _ => SslStreamCertificateContext.Create(leafCert, collection));
+                return new ValueTask<SslServerAuthenticationOptions>(new SslServerAuthenticationOptions
+                {
+                    ServerCertificateContext = certContext
+                });
+            }
+        });
+    }
+
+    /// <summary>
+    /// Starts the webserver
+    /// </summary>
+    /// <returns>The task that will be set when the server is terminated</returns>
+    public Task StartAsync()
+    {
+        App.MapHealthChecks("/health");
+        App.MapDuplicatiMcp();
+        App.AddEndpoints(CorsEnabled)
+            .UseNotifications("/notifications");
+
+        return TerminationTask = App.RunAsync();
+    }
+
+    /// <summary>
+    /// Stops the webserver
+    /// </summary>
+    /// <returns>An awaitable task</returns>
+    public Task StopAsync()
+        => App.StopAsync();
+}

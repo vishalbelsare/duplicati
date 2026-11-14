@@ -1,23 +1,24 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
 
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using Duplicati.Library.Interface;
 
 namespace Duplicati.Library.Backend
@@ -25,7 +26,7 @@ namespace Duplicati.Library.Backend
     public class S3Config : IWebModule
     {
         private const ConfigType DEFAULT_CONFIG_TYPE = ConfigType.Providers;
-        private static readonly string DEFAULT_CONFIG_TYPE_STR = Enum.GetName(typeof(ConfigType), DEFAULT_CONFIG_TYPE);
+        private static readonly string DEFAULT_CONFIG_TYPE_STR = DEFAULT_CONFIG_TYPE.ToString();
         private const string KEY_CONFIGTYPE = "s3-config";
 
         public enum ConfigType
@@ -33,7 +34,9 @@ namespace Duplicati.Library.Backend
             Providers,
             Regions,
             RegionHosts,
-            StorageClasses
+            StorageClasses,
+            DigitalOceanRegions,
+            HetznerRegions,
         }
 
         public S3Config()
@@ -42,46 +45,34 @@ namespace Duplicati.Library.Backend
 
         #region IWebModule implementation
 
-        public IDictionary<string, string> Execute(IDictionary<string, string> options)
+        public Task<IDictionary<string, string?>> Execute(IDictionary<string, string?> options, CancellationToken cancellationToken)
         {
-            string k;
-            options.TryGetValue(KEY_CONFIGTYPE, out k);
-            if (string.IsNullOrWhiteSpace(k))
-                k = DEFAULT_CONFIG_TYPE_STR;
-            
-            ConfigType ct;
-            if (!Enum.TryParse<ConfigType>(k, true, out ct))
-                ct = DEFAULT_CONFIG_TYPE;
-             
-            switch (ct)
-            {
-                case ConfigType.RegionHosts:
-                    return S3.DEFAULT_S3_LOCATION_BASED_HOSTS;
-                case ConfigType.Regions:
-                    return S3.KNOWN_S3_LOCATIONS;
-                case ConfigType.StorageClasses:
-                    return S3.KNOWN_S3_STORAGE_CLASSES;
-                default:
-                    return S3.KNOWN_S3_PROVIDERS;
-            }
+            var ct = Utility.Utility.ParseEnumOption(options.AsReadOnly(), KEY_CONFIGTYPE, DEFAULT_CONFIG_TYPE);
+            GetLookups().TryGetValue(ct.ToString(), out var dict);
+            return Task.FromResult(dict ?? new Dictionary<string, string?>());
         }
 
-        public string Key { get { return "s3-getconfig"; } }
+        public string Key => "s3-getconfig";
 
-        public string DisplayName { get { return "S3 configuration module"; } }
+        public string DisplayName => Strings.S3Config.DisplayName;
 
-        public string Description { get { return "Exposes S3 configuration as a web module"; } }
+        public string Description => Strings.S3Config.Description;
 
-        public IList<ICommandLineArgument> SupportedCommands
-        {
-            get
+        public IList<ICommandLineArgument> SupportedCommands =>
+        [
+            new CommandLineArgument(KEY_CONFIGTYPE, CommandLineArgument.ArgumentType.Enumeration, Strings.S3Config.ConfigTypeShort, Strings.S3Config.ConfigTypeLong, DEFAULT_CONFIG_TYPE_STR, Enum.GetNames(typeof(ConfigType)))
+        ];
+
+        public IDictionary<string, IDictionary<string, string?>> GetLookups()
+            => new Dictionary<string, IDictionary<string, string?>>()
             {
-                return new List<ICommandLineArgument>(new ICommandLineArgument[] {
-                    new CommandLineArgument(KEY_CONFIGTYPE, CommandLineArgument.ArgumentType.Enumeration, "The config to get", "Provides different config values", DEFAULT_CONFIG_TYPE_STR, Enum.GetNames(typeof(ConfigType)))
-
-                });
-            }
-        }
+                { ConfigType.Providers.ToString(), S3.KNOWN_S3_PROVIDERS.ToDictionary((x) => x.Key, (y) => y.Value) },
+                { ConfigType.Regions.ToString(), S3.KNOWN_S3_LOCATIONS.ToDictionary((x) => x.Key, (y) => y.Value) },
+                { ConfigType.RegionHosts.ToString(), S3.DEFAULT_S3_LOCATION_BASED_HOSTS.ToDictionary((x) => x.Key, (y) => y.Value) },
+                { ConfigType.StorageClasses.ToString(), S3.KNOWN_S3_STORAGE_CLASSES.ToDictionary((x) => x.Key, (y) => y.Value) },
+                { ConfigType.DigitalOceanRegions.ToString(), S3.DIGITALOCEAN_REGIONS.ToDictionary((x) => x.Key, (y) => y.Value) },
+                { ConfigType.HetznerRegions.ToString(), S3.HETZNER_REGIONS.ToDictionary((x) => x.Key, (y) => y.Value) },
+            };
 
         #endregion
     }

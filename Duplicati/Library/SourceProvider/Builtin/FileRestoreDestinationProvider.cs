@@ -1,0 +1,346 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using Duplicati.Library.Common.IO;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Snapshots;
+
+namespace Duplicati.Library.SourceProvider;
+
+public class FileRestoreDestinationProvider(string mountedPath, bool allowRestoreOutsideTargetDirectory, bool overwrite) : IRestoreDestinationProvider
+{
+    private static readonly string LOGTAG = Logging.Log.LogTagFromType<FileRestoreDestinationProvider>();
+    private static readonly string DIRSEP = Path.DirectorySeparatorChar.ToString();
+
+    /// <inheritdoc />
+    public string TargetDestination => mountedPath;
+
+    /// <inheritdoc />
+    public Task ClearReadOnlyAttribute(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        var currentAttr = SystemIO.IO_OS.GetFileAttributes(path);
+        SystemIO.IO_OS.SetFileAttributes(path, currentAttr & ~FileAttributes.ReadOnly);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task<bool> CreateFolderIfNotExists(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        if (SystemIO.IO_OS.DirectoryExists(path))
+            return Task.FromResult(false);
+
+        SystemIO.IO_OS.DirectoryCreate(path);
+        return Task.FromResult(true);
+    }
+
+    /// <inheritdoc />
+    public Task DeleteFile(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        SystemIO.IO_OS.FileDelete(path);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task DeleteFolder(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        SystemIO.IO_OS.DirectoryDelete(path, true);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+    }
+
+    /// <inheritdoc />
+    public Task<bool> FileExists(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        return Task.FromResult(SystemIO.IO_OS.FileExists(path));
+    }
+
+    /// <inheritdoc />
+    public Task<long> GetFileLength(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        return Task.FromResult(SystemIO.IO_OS.FileLength(path));
+    }
+
+    /// <inheritdoc />
+    public Task<bool> HasReadOnlyAttribute(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        var currentAttr = SystemIO.IO_OS.GetFileAttributes(path);
+        return Task.FromResult(currentAttr.HasFlag(FileAttributes.ReadOnly));
+    }
+
+    /// <inheritdoc />
+    public Task Initialize(CancellationToken cancel)
+        => Task.CompletedTask;
+
+    /// <inheritdoc />
+    public Task Finalize(Action<double>? progressCallback, bool isComplete, CancellationToken cancel)
+        => Task.CompletedTask;
+
+    /// <inheritdoc />
+    public Task Test(CancellationToken cancellationToken)
+        => SystemIO.IO_OS.DirectoryExists(mountedPath) ? Task.CompletedTask : throw new Exception($"The path {mountedPath} does not exist");
+
+    /// <inheritdoc />
+    public Task<Stream> OpenRead(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        return Task.FromResult<Stream>(SystemIO.IO_OS.FileOpenRead(path));
+    }
+
+    /// <inheritdoc />
+    public Task<Stream> OpenReadWrite(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        return Task.FromResult<Stream>(SystemIO.IO_OS.FileOpenReadWrite(path));
+    }
+
+    /// <inheritdoc />
+    public Task<Stream> OpenWrite(string path, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        return Task.FromResult<Stream>(SystemIO.IO_OS.FileOpenWrite(path));
+    }
+
+    /// <summary>
+    /// Verify that the given path is within the target destination.
+    /// </summary>
+    /// <param name="path">The path to verify.</param>
+    private void VerifyPath(string path)
+    {
+        if (allowRestoreOutsideTargetDirectory || string.IsNullOrWhiteSpace(TargetDestination))
+            return;
+
+        if (!Util.IsPathInsideTarget(path, TargetDestination))
+            throw new UserInformationException($"Path traversal detected: {path} resolves outside {TargetDestination}", "RestorePathTraversal");
+    }
+
+    /// <inheritdoc />
+    public Task<bool> WriteMetadata(string path, Dictionary<string, string?> metadata, bool restoreSymlinkMetadata, bool restorePermissions, bool hasRestoredEntriesBelow, CancellationToken cancel)
+    {
+        VerifyPath(path);
+        var wrote_something = false;
+
+        var isDirTarget = path.EndsWith(DIRSEP, StringComparison.Ordinal);
+        var targetpath = isDirTarget ? path.Substring(0, path.Length - 1) : path;
+
+        // Make the symlink first, otherwise we cannot apply metadata to it
+        if (metadata.TryGetValue("CoreSymlinkTarget", out var k) && !string.IsNullOrWhiteSpace(k))
+        {
+            if (!allowRestoreOutsideTargetDirectory && !string.IsNullOrWhiteSpace(TargetDestination))
+            {
+                // A folder link's path ends in a separator, which would make the link its own parent
+                var fullPath = Path.GetFullPath(targetpath);
+                var parent = Path.GetDirectoryName(fullPath);
+                if (!string.IsNullOrEmpty(parent))
+                {
+                    var target = Path.GetFullPath(Path.Combine(parent, k));
+
+                    if (!Util.IsPathInsideTarget(target, TargetDestination))
+                    {
+                        Logging.Log.WriteWarningMessage(LOGTAG, "SymlinkTargetOutside", null, "Skipping creation of symlink {0} -> {1} because it points outside the restore target", path, k);
+                        return Task.FromResult(false);
+                    }
+                }
+            }
+
+            // Check if the target exists, and overwrite it if that loses nothing. A link
+            // that is there already is replaced. Anything else is data: a file is replaced
+            // only with --overwrite and otherwise kept, and a folder only when it is empty,
+            // as a restore does not remove files that are not in the backup.
+            var isFile = SystemIO.IO_OS.FileExists(targetpath);
+            var isFolder = !isFile && SystemIO.IO_OS.DirectoryExists(targetpath);
+            var isLink = (isFile || isFolder) && SystemIO.IO_OS.IsSymlink(targetpath);
+
+            // A junction is made as a junction, not as a symbolic link. Elsewhere there are
+            // no junctions, so it is made as a symbolic link, as before.
+            var makeJunction = OperatingSystem.IsWindows() && isDirTarget
+                && metadata.TryGetValue("CoreSymlinkType", out var kind) && kind == "junction";
+            var isRightKind = !OperatingSystem.IsWindows() || !isLink
+                || new SystemIOWindows().IsJunction(targetpath) == makeJunction;
+
+            // A link that is there already and points where it should is left as it is.
+            // Making it again would leave its path missing for a moment, and anything that is
+            // restored below it at that moment, such as the files of a source that is itself
+            // a link, would fail.
+            if (isLink && isRightKind && string.Equals(SystemIO.IO_OS.GetSymlinkTarget(targetpath), k, StringComparison.Ordinal))
+            {
+                Logging.Log.WriteVerboseMessage(LOGTAG, "SymlinkAlreadyInPlace", "The symbolic link {0} -> {1} is already in place", path, k);
+            }
+            else
+            {
+                if (isFile || isFolder)
+                {
+                    if (!isLink && isFolder && SystemIO.IO_OS.EnumerateFileSystemEntries(targetpath).Any())
+                    {
+                        // When this restore put entries below the link, the folder holds what was
+                        // restored, as when the link's target is not on this machine. That is the
+                        // outcome of the restore rather than something in its way.
+                        if (hasRestoredEntriesBelow)
+                            Logging.Log.WriteInformationMessage(LOGTAG, "SymlinkRestoredAsFolder", "Not making the symbolic link {0} -> {1}, because the entries below it were restored into a folder in its place", path, k);
+                        else
+                            Logging.Log.WriteWarningMessage(LOGTAG, "SymlinkPlaceTakenByFolder", null, "Not restoring the symbolic link {0} -> {1}, because a folder with files in it is in its place", path, k);
+                        return Task.FromResult(false);
+                    }
+
+                    if (!isLink && isFile && !overwrite)
+                    {
+                        Logging.Log.WriteWarningMessage(LOGTAG, "SymlinkPlaceTakenByFile", null, "Not restoring the symbolic link {0} -> {1}, because a file is in its place. Set --overwrite to replace the file", path, k);
+                        return Task.FromResult(false);
+                    }
+
+                    if (isFile)
+                        SystemIO.IO_OS.FileDelete(targetpath);
+                    else
+                        SystemIO.IO_OS.DirectoryDelete(targetpath, true);
+                }
+                if (makeJunction && OperatingSystem.IsWindows())
+                    new SystemIOWindows().CreateJunction(targetpath, k);
+                else
+                    SystemIO.IO_OS.CreateSymlink(targetpath, k, isDirTarget);
+                wrote_something = true;
+            }
+        }
+        // If the target is a folder, make sure we create it first
+        else if (isDirTarget && !SystemIO.IO_OS.DirectoryExists(targetpath))
+            SystemIO.IO_OS.DirectoryCreate(targetpath);
+
+        // Do not apply metadata to symlinks unless --restore-symlink-metadata is set. What is applied is set on
+        // the link itself; outside Windows the permissions and the file attributes of a link are skipped,
+        // as chmod would change the file or folder the link points to
+        if (!restoreSymlinkMetadata && SystemIO.IO_OS.IsSymlink(targetpath))
+        {
+            // The owner is set with lchown, which does not follow the link, so it is restored with the permissions alone
+            if (restorePermissions && !OperatingSystem.IsWindows())
+            {
+                var owner = metadata
+                    .Where(x => x.Value != null && (x.Key == "unix:uid-gid-perm" || x.Key == "unix:owner-name" || x.Key == "unix:group-name"))
+                    .ToDictionary(x => x.Key, x => x.Value!);
+                if (owner.Count > 0)
+                    SystemIO.IO_OS.SetMetadata(path, owner, restorePermissions);
+            }
+
+            Logging.Log.WriteVerboseMessage(LOGTAG, "no-symlink-metadata-restored", "Not applying metadata to symlink: {0}", targetpath);
+            return Task.FromResult(wrote_something);
+        }
+
+        // The read-only attribute prevents setting timestamps on files on Windows
+        var clearedReadOnly = false;
+        if (!isDirTarget && OperatingSystem.IsWindows())
+        {
+            try
+            {
+                var currentAttr = SystemIO.IO_OS.GetFileAttributes(targetpath);
+                if (currentAttr.HasFlag(FileAttributes.ReadOnly))
+                {
+                    SystemIO.IO_OS.SetFileAttributes(targetpath, currentAttr & ~FileAttributes.ReadOnly);
+                    clearedReadOnly = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logging.Log.WriteVerboseMessage(LOGTAG, "ClearReadOnlyBeforeMetadataFailed", ex, "Failed to clear read-only attribute before applying metadata to: {0}", targetpath);
+            }
+        }
+
+        // Applies the stored permissions/ACLs. On some platforms (notably Windows) the current
+        // DACL on the restored entry may deny the write access needed to set timestamps, e.g. when
+        // the parent directory has a protected ACL without inheritable entries, so the freshly
+        // created child inherits no rights. Restoring the stored permissions grants the correct
+        // access again. This is invoked lazily as a fallback if a timestamp write is denied.
+        var permissionsApplied = false;
+        void ApplyStoredPermissions()
+        {
+            if (permissionsApplied)
+                return;
+            SystemIO.IO_OS.SetMetadata(path, metadata, restorePermissions);
+            permissionsApplied = true;
+        }
+
+        // Sets a timestamp, retrying once after applying the stored permissions if access is denied.
+        void SetTimestampWithRetry(Action apply)
+        {
+            try
+            {
+                apply();
+            }
+            catch (UnauthorizedAccessException) when (!permissionsApplied)
+            {
+                Logging.Log.WriteVerboseMessage(LOGTAG, "TimestampAccessDenied", "Access denied setting timestamp on {0}, applying stored permissions and retrying", targetpath);
+                ApplyStoredPermissions();
+                apply();
+            }
+        }
+
+        if (metadata.TryGetValue("CoreLastWritetime", out k) && long.TryParse(k, out var t))
+        {
+            var time = new DateTime(t, DateTimeKind.Utc);
+            if (isDirTarget)
+                SetTimestampWithRetry(() => SystemIO.IO_OS.DirectorySetLastWriteTimeUtc(targetpath, time));
+            else
+                SetTimestampWithRetry(() => SystemIO.IO_OS.FileSetLastWriteTimeUtc(targetpath, time));
+        }
+
+        if (metadata.TryGetValue("CoreCreatetime", out k) && long.TryParse(k, out t))
+        {
+            var time = new DateTime(t, DateTimeKind.Utc);
+            if (isDirTarget)
+                SetTimestampWithRetry(() => SystemIO.IO_OS.DirectorySetCreationTimeUtc(targetpath, time));
+            else
+                SetTimestampWithRetry(() => SystemIO.IO_OS.FileSetCreationTimeUtc(targetpath, time));
+        }
+
+        // Outside Windows the read-only attribute is set with chmod, which follows a symbolic link,
+        // so the attributes of a link would be set on the file it points to.
+        if (metadata.TryGetValue("CoreAttributes", out k) && Enum.TryParse<FileAttributes>(k, true, out var fa)
+            && (OperatingSystem.IsWindows() || !SystemIO.IO_OS.IsSymlink(targetpath)))
+        {
+            // Apply the stored attributes, which also restores the read-only attribute if it was set.
+            SystemIO.IO_OS.SetFileAttributes(targetpath, fa);
+        }
+        else if (clearedReadOnly)
+        {
+            // No attributes were stored, but we cleared read-only above, so restore it.
+            SystemIO.IO_OS.SetFileAttributes(targetpath, SystemIO.IO_OS.GetFileAttributes(targetpath) | FileAttributes.ReadOnly);
+        }
+
+        // Apply permissions last (if not already applied by the timestamp fallback above) so the
+        // final ACL state matches the backup.
+        ApplyStoredPermissions();
+        return Task.FromResult(wrote_something);
+    }
+
+    /// <inheritdoc />
+    public IList<string> GetPriorityFiles()
+    {
+        // File-based restore doesn't have special priority files
+        return Array.Empty<string>();
+    }
+}

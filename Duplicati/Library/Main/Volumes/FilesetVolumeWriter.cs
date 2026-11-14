@@ -1,8 +1,33 @@
-﻿using System;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Newtonsoft.Json;
 using Duplicati.Library.Interface;
+using Duplicati.Library.Main.Database.Local;
+using Duplicati.Library.Main.Operation.Common;
+using System.Threading.Tasks;
+using System.Threading;
 
 namespace Duplicati.Library.Main.Volumes
 {
@@ -17,6 +42,13 @@ namespace Duplicati.Library.Main.Volumes
 
         public override RemoteVolumeType FileType { get { return RemoteVolumeType.Files; } }
 
+        /// <summary>
+        /// Checks if a remote name is already in use. A failed upload is retried under a new
+        /// name, and a dlist name is only a time, so the new name has to be checked against the
+        /// names that are taken.
+        /// </summary>
+        public Func<string, CancellationToken, Task<bool>> IsRemoteNameTaken { get; set; }
+
         public FilesetVolumeWriter(Options options, DateTime timestamp)
             : base(options, timestamp)
         {
@@ -29,6 +61,8 @@ namespace Duplicati.Library.Main.Volumes
 
         private void WriteMetaProperties(string metahash, long metasize, string metablockhash, IEnumerable<string> metablocklisthashes)
         {
+            if (string.IsNullOrWhiteSpace(metahash))
+                throw new ArgumentNullException(nameof(metahash));
             m_writer.WritePropertyName("metahash");
             m_writer.WriteValue(metahash);
             m_writer.WritePropertyName("metasize");
@@ -57,17 +91,13 @@ namespace Duplicati.Library.Main.Volumes
             }
         }
 
-        public void AddFile(string name, string filehash, long size, DateTime lastmodified, string metahash, long metasize, string metablockhash, string blockhash, long blocksize, IEnumerable<string> blocklisthashes, IEnumerable<string> metablocklisthashes)
-        {
-            AddFileEntry(FilelistEntryType.File, name, filehash, size, lastmodified, metahash, metasize, metablockhash, blockhash, blocksize, blocklisthashes, metablocklisthashes);
-        }
+        public Task AddFileAsync(string name, string filehash, long size, DateTime lastmodified, string metahash, long metasize, string metablockhash, string blockhash, long blocksize, IAsyncEnumerable<string> blocklisthashes, IEnumerable<string> metablocklisthashes)
+            => AddFileEntryAsync(FilelistEntryType.File, name, filehash, size, lastmodified, metahash, metasize, metablockhash, blockhash, blocksize, blocklisthashes, metablocklisthashes);
 
-        public void AddAlternateStream(string name, string filehash, long size, DateTime lastmodified, string metahash, string metablockhash, long metasize, string blockhash, long blocksize, IEnumerable<string> blocklisthashes, IEnumerable<string> metablocklisthashes)
-        {
-            AddFileEntry(FilelistEntryType.AlternateStream, name, filehash, size, lastmodified, metahash, metasize, metablockhash, blockhash, blocksize, blocklisthashes, metablocklisthashes);
-        }
+        public Task AddAlternateStreamAsync(string name, string filehash, long size, DateTime lastmodified, string metahash, string metablockhash, long metasize, string blockhash, long blocksize, IAsyncEnumerable<string> blocklisthashes, IEnumerable<string> metablocklisthashes)
+            => AddFileEntryAsync(FilelistEntryType.AlternateStream, name, filehash, size, lastmodified, metahash, metasize, metablockhash, blockhash, blocksize, blocklisthashes, metablocklisthashes);
 
-        private void AddFileEntry(FilelistEntryType type, string name, string filehash, long size, DateTime lastmodified, string metahash, long metasize, string metablockhash, string blockhash, long blocksize, IEnumerable<string> blocklisthashes, IEnumerable<string> metablocklisthashes)
+        private async Task AddFileEntryAsync(FilelistEntryType type, string name, string filehash, long size, DateTime lastmodified, string metahash, long metasize, string metablockhash, string blockhash, long blocksize, IAsyncEnumerable<string> blocklisthashes, IEnumerable<string> metablocklisthashes)
         {
             m_filecount++;
             m_writer.WriteStartObject();
@@ -81,20 +111,19 @@ namespace Duplicati.Library.Main.Volumes
             m_writer.WriteValue(size);
             m_writer.WritePropertyName("time");
             m_writer.WriteValue(Library.Utility.Utility.SerializeDateTime(lastmodified));
-            if (metahash != null)
-                WriteMetaProperties(metahash, metasize, metablockhash, metablocklisthashes);
+            WriteMetaProperties(metahash, metasize, metablockhash, metablocklisthashes);
 
             if (blocklisthashes != null)
             {
-                //Slightly awkward, but we avoid writing if there are no entries 
-                using (var en = blocklisthashes.GetEnumerator())
+                //Slightly awkward, but we avoid writing if there are no entries
+                await using (var en = blocklisthashes.GetAsyncEnumerator())
                 {
-                    if (en.MoveNext() && !string.IsNullOrEmpty(en.Current))
+                    if (await en.MoveNextAsync().ConfigureAwait(false) && !string.IsNullOrEmpty(en.Current))
                     {
                         m_writer.WritePropertyName("blocklists");
                         m_writer.WriteStartArray();
                         m_writer.WriteValue(en.Current);
-                        while (en.MoveNext())
+                        while (await en.MoveNextAsync().ConfigureAwait(false))
                             m_writer.WriteValue(en.Current);
                         m_writer.WriteEndArray();
                     }
@@ -124,9 +153,8 @@ namespace Duplicati.Library.Main.Volumes
             m_writer.WriteValue(type.ToString());
             m_writer.WritePropertyName("path");
             m_writer.WriteValue(name);
-            if (metahash != null)
-                WriteMetaProperties(metahash, metasize, metablockhash, metablocklisthashes);
-            
+            WriteMetaProperties(metahash, metasize, metablockhash, metablocklisthashes);
+
             m_writer.WriteEndObject();
         }
 
@@ -195,12 +223,142 @@ namespace Duplicati.Library.Main.Volumes
             AddMetaEntry(FilelistEntryType.Symlink, name, metahash, metasize, metablockhash, metablocklisthashes);
         }
 
-        public void CreateFilesetFile(bool isFullBackup)
+        /// <summary>
+        /// Writes the fileset file into the volume.
+        /// </summary>
+        /// <param name="isFullBackup">Whether the fileset is a full backup.</param>
+        /// <param name="filesetTime">
+        /// The time of the fileset, when it differs from the time in this volume's filename.
+        /// Only needed when replacing a dlist file, which has to be given a new name and
+        /// therefore a new time. Leave it out when the fileset has the time of the filename.
+        /// </param>
+        public void CreateFilesetFile(bool isFullBackup, DateTime? filesetTime = null)
         {
+            // The time is recorded even when it is the time in the filename: a failed upload
+            // is retried under a later name, and a recreate would otherwise take that time.
             using (var sr = new StreamWriter(this.m_compression.CreateFile(FILESET_FILENAME, CompressionHint.Compressible, DateTime.UtcNow), ENCODING))
             {
-                sr.Write(FilesetData.GetFilesetInstance(isFullBackup));
+                sr.Write(FilesetData.GetFilesetInstance(isFullBackup, filesetTime ?? ParseFilename(RemoteFilename).Time));
             }
+        }
+
+        /// <summary>
+        /// Adds the labels.json file to the volume, containing the labels of all backup versions.
+        /// </summary>
+        /// <param name="labels">The labels to write, where the key is the backup timestamp and the value is the label.</param>
+        public void AddLabelsFile(IEnumerable<KeyValuePair<DateTime, string>> labels)
+        {
+            var data = labels.ToDictionary(
+                x => Library.Utility.Utility.SerializeDateTime(x.Key.ToUniversalTime()),
+                x => x.Value);
+
+            using (var sr = new StreamWriter(this.m_compression.CreateFile(LABELS_FILENAME, CompressionHint.Compressible, DateTime.UtcNow), ENCODING))
+            {
+                sr.Write(JsonConvert.SerializeObject(data));
+            }
+        }
+
+        /// <summary>
+        /// Checks remote names against the volumes registered in the database
+        /// </summary>
+        /// <param name="database">The database to check for clashes</param>
+        /// <returns>A function that tells if a remote name is taken</returns>
+        internal static Func<string, CancellationToken, Task<bool>> NameTakenIn(DatabaseCommon database)
+            => async (name, cancellationToken) => await database.GetRemoteVolumeIDAsync(name, cancellationToken).ConfigureAwait(false) >= 0;
+
+        /// <summary>
+        /// Checks remote names against the volumes registered in the database
+        /// </summary>
+        /// <param name="database">The database to check for clashes</param>
+        /// <returns>A function that tells if a remote name is taken</returns>
+        internal static Func<string, CancellationToken, Task<bool>> NameTakenIn(LocalDatabase database)
+            => async (name, cancellationToken) => await database.GetRemoteVolumeIDAsync(name, cancellationToken).ConfigureAwait(false) >= 0;
+
+        /// <summary>
+        /// Probes for an unused filename, using the current time as a starting point
+        /// </summary>
+        /// <param name="database">The database to check for clashes</param>
+        /// <param name="options">The options to use for the filename</param>
+        /// <param name="start">The starting time to probe from</param>
+        /// <param name="cancellationToken">The cancellation token to use for the operation</param>
+        /// <param name="increment">The time to increment by each probe</param>
+        /// <param name="maxTries">The maximum number of tries to probe</param>
+        /// <returns>The first unused filename</returns>
+        internal static Task<DateTime> ProbeUnusedFilenameNameAsync(DatabaseCommon database, Options options, DateTime start, CancellationToken cancellationToken, TimeSpan increment = default, int maxTries = 60)
+            => ProbeUnusedFilenameNameAsync((name, CancellationToken) => database.GetRemoteVolumeIDAsync(name, cancellationToken), options, start, cancellationToken, increment, maxTries);
+
+        /// <summary>
+        /// Probes for an unused filename, using the current time as a starting point.
+        /// </summary>
+        /// <param name="database">The database to check for clashes.</param>
+        /// <param name="options">The options to use for the filename.</param>
+        /// <param name="start">The starting time to probe from.</param>
+        /// <param name="increment">The time to increment by each probe.</param>
+        /// <param name="maxTries">The maximum number of tries to probe.</param>
+        /// <returns>A task that when awaited returns the first unused filename.</returns>
+        internal static async Task<DateTime> ProbeUnusedFilenameNameAsync(LocalDatabase database, Options options, DateTime start, CancellationToken cancellationToken, TimeSpan increment = default, int maxTries = 60)
+            => await ProbeUnusedFilenameNameAsync(database.GetRemoteVolumeIDAsync, options, start, cancellationToken, increment, maxTries)
+                .ConfigureAwait(false);
+
+        /// <summary>
+        /// Probes for an unused filename, using the current time as a starting point
+        /// </summary>
+        /// <param name="ProbeForId">The function to use to probe for the ID</param>
+        /// <param name="options">The options to use for the filename</param>
+        /// <param name="start">The starting time to probe from</param>
+        /// <param name="increment">The time to increment by each probe</param>
+        /// <param name="maxTries">The maximum number of tries to probe</param>
+        /// <returns>The first unused filename</returns>
+        private static async Task<DateTime> ProbeUnusedFilenameNameAsync(Func<string, CancellationToken, Task<long>> ProbeForId, Options options, DateTime start, CancellationToken cancellationToken, TimeSpan increment = default, int maxTries = 60)
+        {
+            if (increment == default)
+                increment = TimeSpan.FromSeconds(1);
+
+            var time = start;
+
+            for (var s = 0; s < maxTries; s++)
+            {
+                var id = await ProbeForId(GenerateFilename(RemoteVolumeType.Files, options, null, time), cancellationToken).ConfigureAwait(false);
+                if (id < 0)
+                    return time;
+
+                time += increment;
+            }
+
+            throw new UserInformationException($"Failed to find an unused filename, tried {increment} * {maxTries} from {start}", "FailedToFindUnusedFilename");
+
+        }
+
+        /// <summary>
+        /// Finds a time for a fileset that replaces an existing one, so its filelist gets a name of its own
+        /// while the fileset stays between its neighbours. The seconds after the original time are tried
+        /// first, then the seconds before it.
+        /// </summary>
+        /// <remarks>
+        /// Every rewrite moves a fileset by at least a second, and the replaced name stays registered, so
+        /// trying only the later seconds runs into the next fileset after a few rewrites.
+        /// </remarks>
+        /// <param name="isUsed">Tells whether a filelist name is taken</param>
+        /// <param name="options">The options to use for the filename</param>
+        /// <param name="original">The time of the fileset that is replaced</param>
+        /// <param name="previous">The time of the fileset before it, or <c>null</c> if it is the oldest</param>
+        /// <param name="next">The time of the fileset after it, or <c>null</c> if it is the newest</param>
+        /// <param name="cancellationToken">The cancellation token to use for the operation</param>
+        /// <param name="maxTries">The maximum number of seconds to try in each direction</param>
+        /// <returns>The time to use, or <c>null</c> if no second between the neighbours is free</returns>
+        internal static async Task<DateTime?> FindUnusedReplacementTimeAsync(Func<string, CancellationToken, Task<bool>> isUsed, Options options, DateTime original, DateTime? previous, DateTime? next, CancellationToken cancellationToken, int maxTries = 60)
+        {
+            var increment = TimeSpan.FromSeconds(1);
+
+            for (var (time, s) = (original + increment, 0); s < maxTries && (next == null || time < next); time += increment, s++)
+                if (!await isUsed(GenerateFilename(RemoteVolumeType.Files, options, null, time), cancellationToken).ConfigureAwait(false))
+                    return time;
+
+            for (var (time, s) = (original - increment, 0); s < maxTries && (previous == null || time > previous); time -= increment, s++)
+                if (!await isUsed(GenerateFilename(RemoteVolumeType.Files, options, null, time), cancellationToken).ConfigureAwait(false))
+                    return time;
+
+            return null;
         }
     }
 }

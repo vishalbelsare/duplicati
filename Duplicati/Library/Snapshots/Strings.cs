@@ -1,3 +1,23 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
 using Duplicati.Library.Localization.Short;
 namespace Duplicati.Library.Snapshots.Strings {
     internal static class LinuxSnapshot {
@@ -11,9 +31,13 @@ Command: {1} {2}", message, executable, arguments); }
         public static string ScriptExitCodeError(int actualcode, int expectedcode, string message) { return LC.L(@"The script returned exit code {0}, but {1} was expected: {2}", actualcode, expectedcode, message); }
         public static string ScriptOutputError(string parameter, string message) { return LC.L(@"Script returned successfully, but the output was missing the {0} parameter: {1}", parameter, message); }
     }
+    internal static class SnapshotManager {
+        public static string SnapshotDeviceEmptyError(string volume, string providername) { return LC.L(@"The snapshot provider ""{1}"" did not return a snapshot device path for volume {0}. The snapshot was created, but it cannot be accessed as a filesystem path. This can happen if a third-party snapshot provider (such as the QEMU Guest Agent VSS Provider) handles the volume but does not expose a browsable shadow copy. Try selecting a different snapshot provider (for example the ""Native"" or ""Wmi"" provider), or uninstall/disable the conflicting snapshot provider.", volume, providername); }
+    }
     internal static class USNHelper {
         public static string PathResolveError { get { return LC.L(@"Unable to determine full file path for USN entry"); } }
         public static string JournalEntriesDeleted { get { return LC.L(@"USN journal entries were purged since last scan"); } }
+        public static string JournalEntriesPurged(string volume, string maximumsize) { return LC.L(@"USN journal entries were purged since last scan. The USN journal of {0} holds at most {1}, which does not reach back to the previous backup. To use the USN journal, make it larger, for example with ""fsutil usn createjournal m=1073741824 a=134217728 {0}"".", volume, maximumsize); }
         public static string EmptyResponseError { get { return LC.L(@"Unexpected empty response while enumerating"); } }
         public static string LinuxNotSupportedError { get { return LC.L(@"USN is not supported on Linux"); } }
         public static string SafeGuardError { get { return LC.L(@"The number of files returned by USN was zero. This is likely an error. To remedy this, USN has been disabled."); } }
@@ -23,8 +47,5 @@ Command: {1} {2}", message, executable, arguments); }
         public static string JournalIdChanged { get { return LC.L(@"USN journal ID changed"); } }
         public static string NextUsnZero { get { return LC.L(@"Next USN is zero"); } }
         public static string ConfigHashChanged { get { return LC.L(@"Backup configuration changed"); } }
-    }
-    internal static class WinNativeMethod {
-        public static string MissingBackupPrivilegeError { get { return LC.L(@"Calling process does not have the backup privilege"); } }
     }
 }

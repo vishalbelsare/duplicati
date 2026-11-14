@@ -1,0 +1,2242 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+#nullable enable
+
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using Duplicati.Library.ChangeTracking;
+using Duplicati.Library.Interface;
+using Duplicati.Server.Serialization;
+using Duplicati.Library.RestAPI;
+using Duplicati.Library.Utility;
+using System.Threading.Tasks;
+using Duplicati.Server.Database;
+using Duplicati.Server.Serialization.Interface;
+using Duplicati.WebserverCore.Abstractions;
+using System.Threading;
+using System.Text.Json;
+using System.Globalization;
+using CoCoL;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+
+[assembly: InternalsVisibleTo("Duplicati.UnitTest")]
+
+namespace Duplicati.Server
+{
+    public static class Runner
+    {
+        /// <summary>
+        /// The tag used for logging
+        /// </summary>
+        private static readonly string LOGTAG = Library.Logging.Log.LogTagFromType(typeof(Runner));
+
+        public const string TaskSetupFilename = "task-setup.json";
+
+        public interface IRunnerData : Serialization.Interface.IQueuedTask
+        {
+            Serialization.Interface.IBackup? Backup { get; }
+            IDictionary<string, string?>? ExtraOptions { get; }
+            string[]? FilterStrings { get; }
+            string[]? ExtraArguments { get; }
+            int PageSize { get; }
+            int PageOffset { get; }
+            bool ReturnExtendedData { get; }
+            bool CaseSensitiveSearch { get; }
+            bool SearchMetadata { get; }
+            void SetController(Library.Main.IController? controller);
+        }
+
+        private class RunnerData : IRunnerData
+        {
+            private static long RunnerTaskID = 1;
+
+            public Func<Task>? OnStarting { get; set; }
+            public Func<Exception?, Task>? OnFinished { get; set; }
+
+            /// <summary>
+            /// Callback to be executed when the task is finished.
+            /// Only supported for the delete operation for now.
+            /// </summary>
+            internal Action<IRunnerData>? AfterTaskFinished { get; set; }
+
+            public DuplicatiOperation Operation { get; internal set; }
+            public Serialization.Interface.IBackup? Backup { get; internal set; }
+            public IDictionary<string, string?>? ExtraOptions { get; internal set; }
+            public string[]? FilterStrings { get; internal set; }
+
+            public string? BackupID { get { return Backup?.ID; } }
+            public long TaskID { get { return m_taskID; } }
+
+            public string[]? ExtraArguments { get; internal set; }
+            public int PageSize { get; internal set; } = 0;
+            public int PageOffset { get; internal set; } = 0;
+            public bool ReturnExtendedData { get; internal set; } = false;
+            public bool CaseSensitiveSearch { get; internal set; } = false;
+            public bool SearchMetadata { get; internal set; } = false;
+
+            public DateTime? TaskStarted { get; set; }
+            public DateTime? TaskFinished { get; set; }
+
+            internal Library.Main.IController? Controller { get; private set; }
+
+            /// <summary>
+            /// Guards the controller together with the requests kept for it
+            /// </summary>
+            private readonly object m_controllerLock = new object();
+
+            /// <summary>
+            /// A stop asked for after the task started, but before it had a controller
+            /// </summary>
+            private bool m_stopBeforeController;
+
+            /// <summary>
+            /// An abort asked for after the task started, but before it had a controller
+            /// </summary>
+            private bool m_abortBeforeController;
+
+            public void SetController(Library.Main.IController? controller)
+            {
+                bool stop, abort;
+                lock (m_controllerLock)
+                {
+                    Controller = controller;
+                    stop = m_stopBeforeController;
+                    abort = m_abortBeforeController;
+                    m_stopBeforeController = m_abortBeforeController = false;
+                }
+
+                // Pass on a request that came while the task was being set up
+                if (controller == null)
+                    return;
+                if (abort)
+                    controller.AbortAsync().Await();
+                else if (stop)
+                    controller.StopAsync().Await();
+            }
+
+            public async Task StopAsync()
+            {
+                Library.Main.IController? controller;
+                lock (m_controllerLock)
+                {
+                    controller = Controller;
+                    // A queued task is left alone; a started one keeps the request for its controller
+                    if (controller == null && TaskStarted != null)
+                        m_stopBeforeController = true;
+                }
+                if (controller != null)
+                    await controller.StopAsync().ConfigureAwait(false);
+            }
+
+            public async Task AbortAsync()
+            {
+                Library.Main.IController? controller;
+                lock (m_controllerLock)
+                {
+                    controller = Controller;
+                    // A queued task is left alone; a started one keeps the request for its controller
+                    if (controller == null && TaskStarted != null)
+                        m_abortBeforeController = true;
+                }
+                if (controller != null)
+                    await controller.AbortAsync().ConfigureAwait(false);
+            }
+
+            public async Task PauseAsync(bool alsoTransfers)
+            {
+                if (Controller != null)
+                    await Controller.PauseAsync(alsoTransfers).ConfigureAwait(false);
+            }
+
+            public async Task ResumeAsync()
+            {
+                if (Controller != null)
+                    await Controller.ResumeAsync().ConfigureAwait(false);
+            }
+
+            public long OriginalUploadSpeed { get; set; }
+            public long OriginalDownloadSpeed { get; set; }
+
+            public async Task UpdateThrottleSpeedsAsync(string? uploadSpeed, string? downloadSpeed)
+            {
+                var controller = this.Controller;
+                if (controller == null)
+                    return;
+
+                var job_upload_throttle = this.OriginalUploadSpeed <= 0 ? long.MaxValue : this.OriginalUploadSpeed;
+                var job_download_throttle = this.OriginalDownloadSpeed <= 0 ? long.MaxValue : this.OriginalDownloadSpeed;
+
+                var server_upload_throttle = long.MaxValue;
+                var server_download_throttle = long.MaxValue;
+
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(uploadSpeed))
+                        server_upload_throttle = Sizeparser.ParseSize(uploadSpeed, "kb");
+                }
+                catch (Exception ex)
+                {
+                    Library.Logging.Log.WriteErrorMessage(LOGTAG, "ParseUploadLimitError", ex, "Failed to parse upload limit: {0}", uploadSpeed);
+                }
+
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(downloadSpeed))
+                        server_download_throttle = Sizeparser.ParseSize(downloadSpeed, "kb");
+                }
+                catch (Exception ex)
+                {
+                    Library.Logging.Log.WriteErrorMessage(LOGTAG, "ParseDownloadLimitError", ex, "Failed to parse download limit: {0}", downloadSpeed);
+                }
+
+                var upload_throttle = Math.Min(job_upload_throttle, server_upload_throttle);
+                var download_throttle = Math.Min(job_download_throttle, server_download_throttle);
+
+                if (upload_throttle <= 0 || upload_throttle == long.MaxValue)
+                    upload_throttle = 0;
+
+                if (download_throttle <= 0 || download_throttle == long.MaxValue)
+                    download_throttle = 0;
+
+                await controller.SetThrottleSpeedsAsync(upload_throttle, download_throttle).ConfigureAwait(false);
+            }
+
+            private readonly long m_taskID;
+
+            public RunnerData()
+            {
+                m_taskID = System.Threading.Interlocked.Increment(ref RunnerTaskID);
+            }
+        }
+
+        private class CustomRunnerTask : RunnerData
+        {
+            public readonly Action<Library.Main.IMessageSink> Run;
+
+            public CustomRunnerTask(Action<Library.Main.IMessageSink> runner)
+                : base()
+            {
+                if (runner == null)
+                    throw new ArgumentNullException(nameof(runner));
+                Run = runner;
+                Operation = DuplicatiOperation.CustomRunner;
+                Backup = new Database.Backup();
+            }
+        }
+
+        public static IRunnerData CreateCustomTask(Action<Library.Main.IMessageSink> runner)
+        {
+            return new CustomRunnerTask(runner);
+        }
+
+        /// <summary>
+        /// Parses the raw option value into a <see cref="StoreTaskConfigMode"/>.
+        /// For backwards compatibility, boolean true is treated as <see cref="StoreTaskConfigMode.Self"/>,
+        /// boolean false as <see cref="StoreTaskConfigMode.None"/>, and null/whitespace as <see cref="StoreTaskConfigMode.Auto"/>.
+        /// </summary>
+        /// <param name="rawValue">The raw option value.</param>
+        /// <returns>The parsed mode.</returns>
+        public static StoreTaskConfigMode ParseStoreTaskConfigMode(string? rawValue)
+        {
+            if (string.IsNullOrWhiteSpace(rawValue))
+                return StoreTaskConfigMode.Auto;
+
+            // Handle boolean values for backwards compatibility, use a lambda capture to see if we hit the default case
+            var usedDefault = false;
+            var parsedBool = Utility.ParseBool(rawValue, () => { usedDefault = true; return false; });
+            if (!usedDefault)
+                return parsedBool ? StoreTaskConfigMode.Self : StoreTaskConfigMode.None;
+
+            return Utility.ParseEnum(rawValue, StoreTaskConfigMode.Auto);
+        }
+
+        /// <summary>
+        /// Determines whether the backup is configured to use encryption.
+        /// </summary>
+        /// <param name="options">The backup options dictionary.</param>
+        /// <returns>True if encryption is enabled; otherwise, false.</returns>
+        private static bool IsBackupEncryptionEnabled(Dictionary<string, string?> options)
+        {
+            // In principle, this check should be enough
+            if (Utility.ParseBoolOption(options, "no-encryption"))
+                return false;
+
+            // An empty encryption-module is not checked: the backup then uses the default module (aes),
+            // as a backup created through the API or an older client can have only the passphrase
+
+            // But we need a passphrase
+            if (string.IsNullOrWhiteSpace(options.GetValueOrDefault("passphrase")))
+                return false;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Prepares a backup for export, optionally removing sensitive information.
+        /// </summary>
+        /// <param name="databaseConnection">The database connection.</param>
+        /// <param name="backup">The backup to export.</param>
+        /// <param name="removeSecrets">Whether to remove secrets in the export.</param>
+        /// <returns>The import/export structure.</returns>
+        private static Serializable.ImportExportStructure PrepareBackupForExport(Connection databaseConnection, IBackup backup, bool removeSecrets)
+        {
+            var prepped = ((Backup)backup).Clone();
+            if (removeSecrets)
+                prepped.RemoveSensitiveInformation();
+
+            return databaseConnection.PrepareBackupForExport(prepped);
+        }
+
+        /// <summary>
+        /// The operations a sync job supports. A sync job copies the files to the destination,
+        /// one dated snapshot folder per run or a single mirror, and its local database is not
+        /// a backup database, so the other operations would run backup queries against it and
+        /// fail. Listing and restore are answered from the destination by the sync restore
+        /// operations instead of the backup ones.
+        /// </summary>
+        private static readonly HashSet<DuplicatiOperation> SyncJobOperations =
+        [
+            DuplicatiOperation.BackupOrSync,
+            DuplicatiOperation.Delete,
+            DuplicatiOperation.ListFilesets,
+            DuplicatiOperation.ListFolderContents,
+            DuplicatiOperation.Restore,
+        ];
+
+        /// <summary>
+        /// Gets the source folders of a job, with environment variables expanded.
+        /// </summary>
+        /// <param name="backup">The job</param>
+        /// <returns>The source folders</returns>
+        private static string[] GetExpandedSources(IBackup backup)
+            => backup.Sources
+                .Select(n => SpecialFolders.ExpandEnvironmentVariables(n))
+                .WhereNotNullOrWhiteSpace()
+                .ToArray();
+
+        /// <summary>
+        /// Refuses an operation that the job cannot perform, before it is queued or run.
+        /// </summary>
+        /// <param name="operation">The operation to perform.</param>
+        /// <param name="backup">The job to perform it on.</param>
+        /// <exception cref="UserInformationException">The job is a sync job and the operation needs a backup.</exception>
+        private static void EnsureOperationIsSupported(DuplicatiOperation operation, IBackup backup)
+        {
+            if (backup.OperationType == OperationType.Sync && !SyncJobOperations.Contains(operation))
+                throw new UserInformationException($"The operation {operation} is not available for a sync job, as a sync job copies the files to the destination instead of keeping a backup", "SyncJobNotSupported");
+        }
+
+        public static IRunnerData CreateTask(DuplicatiOperation operation, IBackup backup, IDictionary<string, string?>? extraOptions = null, string[]? filterStrings = null, string[]? extraArguments = null, int pageSize = 0, int pageOffset = 0, bool returnExtended = false, bool caseSensitiveSearch = false, bool includeMetadata = false)
+        {
+            EnsureOperationIsSupported(operation, backup);
+            return new RunnerData()
+            {
+                Operation = operation,
+                Backup = backup,
+                ExtraOptions = extraOptions ?? new Dictionary<string, string?>(),
+                FilterStrings = filterStrings,
+                ExtraArguments = extraArguments,
+                PageSize = pageSize,
+                PageOffset = pageOffset,
+                ReturnExtendedData = returnExtended,
+                CaseSensitiveSearch = caseSensitiveSearch,
+                SearchMetadata = includeMetadata
+            };
+        }
+
+        public static IRunnerData CreateDeleteTask(IBackup backup, IDictionary<string, string?> extraOptions, Action<IRunnerData>? afterTaskFinished = null)
+        {
+            return new RunnerData()
+            {
+                Operation = DuplicatiOperation.Delete,
+                Backup = backup,
+                ExtraOptions = extraOptions,
+                AfterTaskFinished = afterTaskFinished
+            };
+        }
+
+        public static IRunnerData CreateListTask(IBackup backup, string[]? filters, bool onlyPrefix, bool allVersions, bool folderContents, DateTime time)
+        {
+            var dict = new Dictionary<string, string?>();
+            if (onlyPrefix)
+                dict["list-prefix-only"] = "true";
+            // Always set, so an all-versions option of the backup or the server does not turn
+            // the list of one version into a list of every version
+            dict["all-versions"] = allVersions ? "true" : "false";
+            if (time.Ticks > 0)
+                dict["time"] = Utility.SerializeDateTime(time.ToUniversalTime());
+            if (folderContents)
+                dict["list-folder-contents"] = "true";
+
+            return CreateTask(
+                DuplicatiOperation.List,
+                backup,
+                dict,
+                filters);
+        }
+
+        public static IRunnerData CreateListFilesetsTask(IBackup backup, Dictionary<string, string?>? extraOptions = null)
+        {
+            return CreateTask(
+                DuplicatiOperation.ListFilesets,
+                backup,
+                extraOptions ?? new Dictionary<string, string?>());
+        }
+
+        /// <summary>
+        /// Creates a task that updates the label of a backup version.
+        /// </summary>
+        /// <param name="backup">The backup to update the version label for</param>
+        /// <param name="version">The version to update</param>
+        /// <param name="label">The label to set, or null to clear the label</param>
+        /// <returns>The runner task</returns>
+        public static IRunnerData CreateSetVersionLabelTask(IBackup backup, long version, string? label)
+        {
+            var dict = new Dictionary<string, string?>
+            {
+                ["version"] = version.ToString(CultureInfo.InvariantCulture),
+                ["version-name"] = label ?? ""
+            };
+
+            return CreateTask(
+                DuplicatiOperation.SetVersionLabel,
+                backup,
+                dict);
+        }
+
+        public static IRunnerData CreateListFolderContents(IBackup backup, string[]? folders, DateTime time, int pageSize, int pageOffset, bool returnExtended)
+        {
+            var dict = new Dictionary<string, string?>();
+            if (time.Ticks > 0)
+                dict["time"] = Utility.SerializeDateTime(time.ToUniversalTime());
+
+            return CreateTask(
+                DuplicatiOperation.ListFolderContents,
+                backup,
+                dict,
+                extraArguments: folders,
+                pageSize: pageSize,
+                pageOffset: pageOffset,
+                returnExtended: returnExtended);
+        }
+
+        public static IRunnerData ListFileVersionsTask(IBackup backup, string[]? filepaths, int pageSize, int pageOffset)
+        {
+            var dict = new Dictionary<string, string?>();
+            return CreateTask(
+                DuplicatiOperation.ListFileVersions,
+                backup,
+                dict,
+                extraArguments: filepaths,
+                pageSize: pageSize,
+                pageOffset: pageOffset);
+        }
+
+        public static IRunnerData CreateSearchEntriesTask(IBackup backup, string[]? filters, bool caseSensitive, string[]? folders, DateTime time, long[]? version, int pageSize, int pageOffset, bool returnExtendedData, bool searchMetadata)
+        {
+            var dict = new Dictionary<string, string?>();
+            if (time.Ticks > 0)
+                dict["time"] = Utility.SerializeDateTime(time.ToUniversalTime());
+            if (version != null)
+                dict["version"] = string.Join(",", version.Select(v => v.ToString(CultureInfo.InvariantCulture)));
+
+            return CreateTask(
+                DuplicatiOperation.SearchEntries,
+                backup,
+                dict,
+                filters,
+                extraArguments: folders,
+                pageSize: pageSize,
+                pageOffset: pageOffset,
+                returnExtended: returnExtendedData,
+                caseSensitiveSearch: caseSensitive,
+                includeMetadata: searchMetadata);
+        }
+
+        /// <summary>
+        /// Creates a task that deletes the specified backup versions from the remote storage.
+        /// </summary>
+        /// <param name="backup">The backup to delete versions from</param>
+        /// <param name="versions">The versions to delete</param>
+        /// <param name="extraOptions">Optional extra options</param>
+        /// <returns>The runner task</returns>
+        public static IRunnerData CreateDeleteVersionsTask(IBackup backup, long[] versions, IDictionary<string, string?>? extraOptions = null)
+        {
+            var dict = extraOptions ?? new Dictionary<string, string?>();
+            if (versions != null && versions.Length > 0)
+                dict["version"] = string.Join(",", versions.Select(v => v.ToString(CultureInfo.InvariantCulture)));
+
+            return CreateTask(
+                DuplicatiOperation.DeleteVersions,
+                backup,
+                dict);
+        }
+
+        /// <summary>
+        /// Creates a task that lists broken files in the backup.
+        /// </summary>
+        /// <param name="backup">The backup to list broken files for</param>
+        /// <param name="filterStrings">Optional filter strings to apply</param>
+        /// <param name="extraOptions">Optional extra options</param>
+        /// <returns>The runner task</returns>
+        public static IRunnerData CreateListBrokenFilesTask(IBackup backup, string[]? filterStrings, IDictionary<string, string?>? extraOptions = null)
+        {
+            var dict = extraOptions ?? new Dictionary<string, string?>();
+
+            return CreateTask(
+                DuplicatiOperation.ListBrokenFiles,
+                backup,
+                dict,
+                filterStrings);
+        }
+
+        /// <summary>
+        /// Creates a task that purges broken files from the backup.
+        /// </summary>
+        /// <param name="backup">The backup to purge broken files from</param>
+        /// <param name="filterStrings">Optional filter strings to apply</param>
+        /// <param name="extraOptions">Optional extra options</param>
+        /// <returns>The runner task</returns>
+        public static IRunnerData CreatePurgeBrokenFilesTask(IBackup backup, string[]? filterStrings, IDictionary<string, string?>? extraOptions = null)
+        {
+            var dict = extraOptions ?? new Dictionary<string, string?>();
+
+            return CreateTask(
+                DuplicatiOperation.PurgeBrokenFiles,
+                backup,
+                dict,
+                filterStrings);
+        }
+
+        /// <summary>
+        /// Creates a task that purges files matching the filters from the backup.
+        /// </summary>
+        /// <param name="backup">The backup to purge files from</param>
+        /// <param name="filterStrings">The filter strings selecting the files to purge</param>
+        /// <param name="versions">The versions to purge from, or null to purge from all versions</param>
+        /// <param name="extraOptions">Optional extra options</param>
+        /// <returns>The runner task</returns>
+        public static IRunnerData CreatePurgeFilesTask(IBackup backup, string[]? filterStrings, long[]? versions, IDictionary<string, string?>? extraOptions = null)
+        {
+            var dict = extraOptions ?? new Dictionary<string, string?>();
+            if (versions != null && versions.Length > 0)
+                dict["version"] = string.Join(",", versions.Select(v => v.ToString(CultureInfo.InvariantCulture)));
+
+            return CreateTask(
+                DuplicatiOperation.PurgeFiles,
+                backup,
+                dict,
+                filterStrings);
+        }
+
+
+        public static IRunnerData CreateRestoreTask(IBackup backup, string[]? filters,
+                                                    DateTime time, string? restoreTarget, bool? overwrite, bool? restore_permissions,
+                                                    bool? skip_metadata, string? passphrase,
+                                                    IReadOnlyDictionary<string, string?>? options)
+        {
+            var dict = new Dictionary<string, string?>();
+
+            // Caller-supplied options are applied first, so the explicit arguments below take precedence
+            if (options != null)
+                foreach (var kv in options)
+                {
+                    var name = kv.Key?.Trim().TrimStart('-');
+                    if (!string.IsNullOrWhiteSpace(name))
+                        dict[name] = kv.Value;
+                }
+
+            dict["time"] = Utility.SerializeDateTime(time.ToUniversalTime());
+            dict["allow-passphrase-change"] = bool.TrueString;
+
+            // An unset value is not written, so the backup settings and the server's
+            // default options apply; an explicit value overrides them
+            if (overwrite.HasValue)
+                dict["overwrite"] = overwrite.Value ? bool.TrueString : bool.FalseString;
+            if (restore_permissions.HasValue)
+                dict["restore-permissions"] = restore_permissions.Value ? bool.TrueString : bool.FalseString;
+            if (skip_metadata.HasValue)
+                dict["skip-metadata"] = skip_metadata.Value ? bool.TrueString : bool.FalseString;
+            if (!string.IsNullOrWhiteSpace(restoreTarget))
+                dict["restore-path"] = SpecialFolders.ExpandEnvironmentVariables(restoreTarget);
+            if (!(passphrase is null))
+                dict["passphrase"] = passphrase;
+
+            return CreateTask(
+                DuplicatiOperation.Restore,
+                backup,
+                dict,
+                filters);
+        }
+
+        public static IRunnerData CreateRestoreControlFilesTask(IBackup backup, string restorePath, string[] files)
+        {
+            var dict = new Dictionary<string, string?>
+            {
+                ["restore-path"] = restorePath
+            };
+
+            return CreateTask(
+                DuplicatiOperation.RestoreControlFiles,
+                backup,
+                dict,
+                files);
+        }
+        private class MessageSink : Library.Main.IMessageSink
+        {
+            private class ProgressState : IProgressEventData
+            {
+                private readonly string? m_backupID;
+                private readonly long m_taskID;
+
+                internal Library.Main.BackendActionType m_backendAction;
+                internal string? m_backendPath;
+                internal long m_backendFileSize;
+                internal long m_backendFileProgress;
+                internal long m_backendSpeed;
+                internal bool m_backendIsBlocking;
+
+                internal ActiveTransfer[] m_activeTransfers = [];
+                internal ActiveFile[] m_activeFiles = [];
+                internal long? m_sourceBytesRead;
+                internal long m_backendBytesUploaded;
+                internal long m_backendBytesDownloaded;
+
+                internal string? m_currentFilename;
+                internal long m_currentFilesize;
+                internal long m_currentFileoffset;
+                internal bool m_currentFilecomplete;
+
+                internal Library.Main.OperationPhase m_phase;
+                internal float m_overallProgress;
+                internal long m_processedFileCount;
+                internal long m_processedFileSize;
+                internal long m_totalFileCount;
+                internal long m_totalFileSize;
+                internal bool m_stillCounting;
+
+                internal int m_remoteSyncDestinationIndex;
+                internal int m_remoteSyncDestinationCount;
+                internal TimeSpan? m_estimatedTimeToCompletion;
+
+                public ProgressState(long taskId, string? backupId)
+                {
+                    m_backupID = backupId;
+                    m_taskID = taskId;
+                }
+
+                internal ProgressState Clone()
+                {
+                    var res = (ProgressState)this.MemberwiseClone();
+                    res.m_activeTransfers = [.. m_activeTransfers];
+                    res.m_activeFiles = [.. m_activeFiles];
+                    return res;
+                }
+
+                #region IProgressEventData implementation
+                public string? BackupID { get { return m_backupID; } }
+                public long TaskID { get { return m_taskID; } }
+                public string BackendAction { get { return m_backendAction.ToString(); } }
+                public string? BackendPath { get { return m_backendPath; } }
+                public long BackendFileSize { get { return m_backendFileSize; } }
+                public long BackendFileProgress { get { return m_backendFileProgress; } }
+                public long BackendSpeed { get { return m_backendSpeed; } }
+                public bool BackendIsBlocking { get { return m_backendIsBlocking; } }
+                public string? CurrentFilename { get { return m_currentFilename; } }
+                public long CurrentFilesize { get { return m_currentFilesize; } }
+                public long CurrentFileoffset { get { return m_currentFileoffset; } }
+                public bool CurrentFilecomplete { get { return m_currentFilecomplete; } }
+                public string Phase { get { return m_phase.ToString(); } }
+                public float OverallProgress { get { return m_overallProgress; } }
+                public long ProcessedFileCount { get { return m_processedFileCount; } }
+                public long ProcessedFileSize { get { return m_processedFileSize; } }
+                public long TotalFileCount { get { return m_totalFileCount; } }
+                public long TotalFileSize { get { return m_totalFileSize; } }
+                public bool StillCounting { get { return m_stillCounting; } }
+                public ActiveTransfer[] ActiveTransfers => m_activeTransfers;
+                public ActiveFile[] ActiveFiles => m_activeFiles;
+                public long? SourceBytesRead => m_sourceBytesRead;
+                public long? BackendBytesUploaded => m_backendBytesUploaded;
+                public long? BackendBytesDownloaded => m_backendBytesDownloaded;
+                public int RemoteSyncDestinationIndex { get { return m_remoteSyncDestinationIndex; } }
+                public int RemoteSyncDestinationCount { get { return m_remoteSyncDestinationCount; } }
+                public TimeSpan? EstimatedTimeToCompletion { get { return m_estimatedTimeToCompletion; } }
+
+                #endregion
+            }
+
+            private readonly ProgressState m_state;
+            private Library.Main.IBackendProgress? m_backendProgress;
+            private Library.Main.IOperationProgress? m_operationProgress;
+            private readonly object m_lock = new object();
+
+            /// <summary>
+            /// The bytes of transfers that have completed, counted from the backend events
+            /// </summary>
+            private long m_completedBytesUploaded;
+            private long m_completedBytesDownloaded;
+
+            /// <summary>
+            /// Completed transfers that may still be listed as active; their progress is already counted
+            /// </summary>
+            private readonly HashSet<string> m_completedTransferPaths = new();
+
+            internal TaskCompletionSource<Library.Main.OperationPhase> m_phaseChangeTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public MessageSink(long taskId, string? backupId)
+            {
+                m_state = new ProgressState(taskId, backupId);
+            }
+
+            public Serialization.Interface.IProgressEventData Copy()
+            {
+                lock (m_lock)
+                {
+                    UpdateBackendBytes();
+
+                    if (m_backendProgress != null)
+                    {
+                        var transfers = m_backendProgress.GetActiveTransfers();
+                        m_state.m_activeTransfers = transfers
+                            .Select(st => new ActiveTransfer(
+                                st.Action.ToString(),
+                                st.Path,
+                                st.Size,
+                                st.Progress,
+                                st.BytesPerSecond,
+                                st.IsBlocking
+                            )).ToArray();
+
+                        if (transfers.Any())
+                        {
+                            var st = transfers.First();
+                            m_state.m_backendAction = st.Action;
+                            m_state.m_backendPath = st.Path;
+                            m_state.m_backendFileSize = st.Size;
+                            m_state.m_backendFileProgress = st.Progress;
+                            m_state.m_backendSpeed = st.BytesPerSecond;
+                            m_state.m_backendIsBlocking = st.IsBlocking;
+                        }
+                        else
+                        {
+                            m_state.m_backendAction = Library.Main.BackendActionType.Get;
+                            m_state.m_backendPath = null;
+                            m_state.m_backendFileSize = 0;
+                            m_state.m_backendFileProgress = 0;
+                            m_state.m_backendSpeed = -1;
+                            m_state.m_backendIsBlocking = false;
+                        }
+                    }
+                    if (m_operationProgress != null)
+                    {
+                        m_operationProgress.UpdateFile(out m_state.m_currentFilename, out m_state.m_currentFilesize, out m_state.m_currentFileoffset, out m_state.m_currentFilecomplete);
+                        m_operationProgress.UpdateOverall(out m_state.m_phase, out m_state.m_overallProgress, out m_state.m_processedFileCount, out m_state.m_processedFileSize, out m_state.m_totalFileCount, out m_state.m_totalFileSize, out m_state.m_stillCounting);
+                        m_operationProgress.UpdateRemoteSyncDestination(out m_state.m_remoteSyncDestinationIndex, out m_state.m_remoteSyncDestinationCount);
+                        m_state.m_estimatedTimeToCompletion = m_operationProgress.EstimatedTimeToCompletion;
+                        m_state.m_activeFiles = m_operationProgress.GetActiveFiles()
+                            .Select(x => new ActiveFile(x.Path, x.Size, x.Offset))
+                            .ToArray();
+                        m_state.m_sourceBytesRead = m_operationProgress.GetSourceBytesRead();
+                    }
+
+                    return m_state.Clone();
+                }
+            }
+
+            /// <summary>
+            /// Sets the transferred totals to the completed transfers plus the progress of the active ones.
+            /// Must be called with the lock held.
+            /// </summary>
+            private void UpdateBackendBytes()
+            {
+                long activeUploaded = 0, activeDownloaded = 0;
+                var activePaths = new HashSet<string>();
+                foreach (var transfer in m_backendProgress?.GetActiveTransfers() ?? [])
+                {
+                    activePaths.Add(transfer.Path);
+                    if (m_completedTransferPaths.Contains(transfer.Path))
+                        continue;
+
+                    if (transfer.Action == Library.Main.BackendActionType.Put)
+                        activeUploaded += Math.Max(0, transfer.Progress);
+                    else if (transfer.Action == Library.Main.BackendActionType.Get)
+                        activeDownloaded += Math.Max(0, transfer.Progress);
+                }
+
+                // Completed transfers are only remembered while they are still listed
+                m_completedTransferPaths.RemoveWhere(x => !activePaths.Contains(x));
+
+                m_state.m_backendBytesUploaded = m_completedBytesUploaded + activeUploaded;
+                m_state.m_backendBytesDownloaded = m_completedBytesDownloaded + activeDownloaded;
+            }
+
+            public Task PhaseChangedAsync { get { return m_phaseChangeTcs.Task; } }
+
+            #region IMessageSink implementation
+            public void BackendEvent(Duplicati.Library.Main.BackendActionType action, Duplicati.Library.Main.BackendEventType type, string path, long size)
+            {
+                lock (m_lock)
+                {
+                    // Count every completed transfer, as fast ones can start and finish between two progress reads
+                    if (type == Duplicati.Library.Main.BackendEventType.Completed && path != null && size > 0)
+                    {
+                        if (action == Library.Main.BackendActionType.Put)
+                        {
+                            m_completedBytesUploaded += size;
+                            m_completedTransferPaths.Add(path);
+                        }
+                        else if (action == Library.Main.BackendActionType.Get)
+                        {
+                            m_completedBytesDownloaded += size;
+                            m_completedTransferPaths.Add(path);
+                        }
+                    }
+
+                    if (path == m_state.m_currentFilename && type != Duplicati.Library.Main.BackendEventType.Started && type != Duplicati.Library.Main.BackendEventType.Progress)
+                    {
+                        m_state.m_backendFileSize = 0;
+                        m_state.m_backendFileProgress = 0;
+                        m_state.m_backendSpeed = 0;
+                    }
+                }
+            }
+
+            public void SetBackendProgress(Library.Main.IBackendProgress progress)
+            {
+                lock (m_lock)
+                    m_backendProgress = progress;
+            }
+
+            public void SetOperationProgress(Library.Main.IOperationProgress progress)
+            {
+                lock (m_lock)
+                {
+                    if (m_operationProgress != null)
+                        m_operationProgress.PhaseChanged -= OperationProgress_PhaseChanged;
+                    m_operationProgress = progress;
+
+                    if (m_operationProgress != null)
+                        m_operationProgress.PhaseChanged += OperationProgress_PhaseChanged;
+                }
+            }
+
+            private void OperationProgress_PhaseChanged(Library.Main.OperationPhase phase, Library.Main.OperationPhase previousPhase)
+            {
+                var prev = Interlocked.Exchange(ref m_phaseChangeTcs, new TaskCompletionSource<Library.Main.OperationPhase>(TaskCreationOptions.RunContinuationsAsynchronously));
+                prev.TrySetResult(phase);
+            }
+
+            public void WriteMessage(Library.Logging.LogEntry entry)
+            {
+                // Do nothing. Implementation needed for ILogDestination interface.
+            }
+            #endregion
+        }
+        public static string GetCommandLine(Connection databaseConnection, IRunnerData data)
+        {
+            var backup = data.Backup;
+            if (backup == null)
+                throw new ArgumentNullException(nameof(backup));
+
+            var options = ApplyOptions(databaseConnection, backup, GetCommonOptions(databaseConnection), out var url);
+            if (data.ExtraOptions != null)
+                foreach (var k in data.ExtraOptions)
+                    options[k.Key] = k.Value;
+
+            var cf = databaseConnection.Filters;
+            var bf = backup.Filters;
+
+            var sources =
+                (from n in backup.Sources
+                 let p = SpecialFolders.ExpandEnvironmentVariables(n)
+                 where !string.IsNullOrWhiteSpace(p)
+                 select p).ToArray();
+
+            var exe = System.IO.Path.Combine(
+                Library.AutoUpdater.UpdaterManager.INSTALLATIONDIR,
+                Library.AutoUpdater.PackageHelper.GetExecutableName(Library.AutoUpdater.PackageHelper.NamedExecutable.CommandLine)
+            );
+
+            var cmd = new System.Text.StringBuilder();
+            var mainOp = backup.OperationType switch
+            {
+                OperationType.Backup => "backup",
+                OperationType.Sync => "sync",
+                _ => throw new InvalidEnumArgumentException(nameof(backup.OperationType), (int)backup.OperationType, typeof(OperationType))
+            };
+            cmd.Append(Utility.WrapAsCommandLine([exe, mainOp, url], false));
+
+            cmd.Append(" ");
+            cmd.Append(Utility.WrapAsCommandLine(sources, true));
+
+            // TODO: We should check each option to see if it is a path, and allow expansion on that
+            foreach (var opt in options)
+                cmd.AppendFormat(" --{0}={1}", opt.Key, Utility.WrapCommandLineElement(opt.Value, false));
+
+            if (cf != null)
+                foreach (var f in cf)
+                    cmd.AppendFormat(" --{0}={1}", f.Include ? "include" : "exclude", Utility.WrapCommandLineElement(f.Expression, true));
+
+            if (bf != null)
+                foreach (var f in bf)
+                    cmd.AppendFormat(" --{0}={1}", f.Include ? "include" : "exclude", Utility.WrapCommandLineElement(f.Expression, true));
+
+            return cmd.ToString();
+        }
+
+        public static string[] GetCommandLineParts(Connection databaseConnection, IRunnerData data)
+        {
+            var backup = data.Backup;
+            if (backup == null)
+                throw new ArgumentNullException(nameof(backup));
+
+            var options = ApplyOptions(databaseConnection, backup, GetCommonOptions(databaseConnection), out var url);
+            if (data.ExtraOptions != null)
+                foreach (var k in data.ExtraOptions)
+                    options[k.Key] = k.Value;
+
+            var cf = databaseConnection.Filters;
+            var bf = backup.Filters;
+
+            var sources =
+                (from n in backup.Sources
+                 let p = SpecialFolders.ExpandEnvironmentVariables(n)
+                 where !string.IsNullOrWhiteSpace(p)
+                 select p).ToArray();
+
+            var parts = new List<string>
+            {
+                url
+            };
+            parts.AddRange(sources);
+
+            foreach (var opt in options)
+                parts.Add(string.Format("--{0}={1}", opt.Key, opt.Value));
+
+            if (cf != null)
+                foreach (var f in cf)
+                    parts.Add(string.Format("--{0}={1}", f.Include ? "include" : "exclude", f.Expression));
+
+            if (bf != null)
+                foreach (var f in bf)
+                    parts.Add(string.Format("--{0}={1}", f.Include ? "include" : "exclude", f.Expression));
+
+            return parts.ToArray();
+        }
+
+        public static Task<IBasicResults?> RunAsync(Connection databaseConnection, EventPollNotify eventPollNotify, INotificationUpdateService notificationUpdateService, IProgressStateProviderService progressStateProviderService, IApplicationSettings applicationSettings, IChangeTrackingService? changeTracking, IQueuedTask data, bool fromQueue)
+        {
+            if (data is IRunnerData runnerData)
+                return RunInternalAsync(databaseConnection, eventPollNotify, notificationUpdateService, progressStateProviderService, applicationSettings, changeTracking, runnerData, fromQueue);
+
+            throw new ArgumentException("Invalid task type", nameof(data));
+        }
+
+        private static async Task<IBasicResults?> RunInternalAsync(Connection databaseConnection, EventPollNotify eventPollNotify, INotificationUpdateService notificationUpdateService, IProgressStateProviderService progressStateProviderService, IApplicationSettings applicationSettings, IChangeTrackingService? changeTracking, IRunnerData data, bool fromQueue)
+        {
+            data.TaskStarted = DateTime.Now;
+            if (data is CustomRunnerTask task)
+            {
+                try
+                {
+                    var sink = new MessageSink(task.TaskID, null);
+                    progressStateProviderService.GenerateProgressState = sink.Copy;
+                    eventPollNotify.SignalNewEvent();
+                    eventPollNotify.SignalProgressUpdate(sink.Copy);
+
+                    // Attach a log scope that tags all messages to relay the TaskID and BackupID
+                    using var _ = Library.Logging.Log.StartScope(log =>
+                    {
+                        log[ILogWriteHandler.LiveLogEntry.LOG_EXTRA_TASKID] = data.TaskID.ToString();
+                    });
+
+                    // Keep emitting progress updates during the operation
+                    using var cts = new CancellationTokenSource();
+                    Task.Run(async () =>
+                    {
+                        while (!cts.IsCancellationRequested)
+                        {
+                            await Task.WhenAny(sink.PhaseChangedAsync, Task.Delay(Library.Main.ProgressReporting.Interval, cts.Token));
+                            if (!cts.IsCancellationRequested)
+                                eventPollNotify.SignalProgressUpdate(sink.Copy);
+                        }
+                    }).FireAndForget();
+
+                    task.Run(sink);
+                    eventPollNotify.SignalProgressUpdate(sink.Copy);
+                }
+                catch (Exception ex)
+                {
+                    databaseConnection.LogError(string.Empty, "Failed while executing custom task", ex);
+                }
+                finally
+                {
+                    eventPollNotify.SignalProgressUpdate(null);
+                    data.TaskFinished = DateTime.Now;
+                }
+
+                return null;
+            }
+
+            var backup = data.Backup;
+            if (backup == null)
+                throw new ArgumentNullException(nameof(backup));
+
+            backup.Metadata ??= new Dictionary<string, string>();
+            TempFolder? tempfolder = null;
+
+            try
+            {
+                var sink = new MessageSink(data.TaskID, backup.ID);
+                using var cts = new CancellationTokenSource();
+                // Non-queue are "wrong" tasks that are running directly and often cause
+                // timeouts. They should be removed, but for now we keep them,
+                // but do not report progress updates.
+                if (fromQueue)
+                {
+                    progressStateProviderService.GenerateProgressState = () => sink.Copy();
+                    eventPollNotify.SignalNewEvent();
+                    eventPollNotify.SignalProgressUpdate(sink.Copy);
+
+                    // Keep emitting progress updates during the operation
+                    Task.Run(async () =>
+                    {
+                        while (!cts.IsCancellationRequested)
+                        {
+                            await Task.WhenAny(sink.PhaseChangedAsync, Task.Delay(Library.Main.ProgressReporting.Interval, cts.Token));
+                            if (!cts.IsCancellationRequested)
+                                eventPollNotify.SignalProgressUpdate(sink.Copy);
+                        }
+                    }).FireAndForget();
+                }
+
+                var options = ApplyOptions(databaseConnection, backup, GetCommonOptions(databaseConnection), out var url);
+                if (data.ExtraOptions != null)
+                    foreach (var k in data.ExtraOptions)
+                        options[k.Key] = k.Value;
+
+                // The file watcher is a server concern; the engine must not see the option. It is
+                // opt-in per backup, so a server-wide default or an option for one run does not count
+                var useFileWatcher = IsFileWatcherEnabled(backup);
+                options.Remove(FILE_WATCHER_OPTION);
+
+                // Map AdditionalTargetURLs to remote-sync-json-config option for backup operations
+                if (data.Operation == DuplicatiOperation.BackupOrSync)
+                    ApplyAdditionalTargetUrls(databaseConnection, backup, options);
+
+                // Pack in the system or task config for easy restore
+                if (data.Operation == DuplicatiOperation.BackupOrSync)
+                    tempfolder = StoreTaskConfigAndGetTempFolder(databaseConnection, data, options);
+
+                // Always remove this option as it is a server-only option
+                options.Remove("store-task-config");
+
+                var useOutOfProcess = databaseConnection.ApplicationSettings.UseOutOfProcessController;
+
+                // Attach a log scope that tags all messages to relay the TaskID and BackupID
+                using (Library.Logging.Log.StartScope(log =>
+                {
+                    log[ILogWriteHandler.LiveLogEntry.LOG_EXTRA_TASKID] = data.TaskID.ToString();
+                    log[ILogWriteHandler.LiveLogEntry.LOG_EXTRA_BACKUPID] = data.BackupID;
+                }))
+                using (tempfolder)
+                using (var controller = await CreateControllerAsync(url, options, sink, useOutOfProcess).ConfigureAwait(false))
+                {
+                    try
+                    {
+                        if (options.ContainsKey("throttle-upload"))
+                            ((RunnerData)data).OriginalUploadSpeed = Duplicati.Library.Utility.Sizeparser.ParseSize(options["throttle-upload"], "kb");
+                    }
+                    catch (Exception ex)
+                    {
+                        Library.Logging.Log.WriteWarningMessage(LOGTAG, "ParseUploadThrottleError", ex, "Failed to parse throttle-upload, continuing without it: {0}", options["throttle-upload"]);
+                    }
+
+                    try
+                    {
+                        if (options.ContainsKey("throttle-download"))
+                            ((RunnerData)data).OriginalDownloadSpeed = Duplicati.Library.Utility.Sizeparser.ParseSize(options["throttle-download"], "kb");
+                    }
+                    catch (Exception ex)
+                    {
+                        Library.Logging.Log.WriteWarningMessage(LOGTAG, "ParseDownloadThrottleError", ex, "Failed to parse throttle-download, continuing without it: {0}", options["throttle-download"]);
+                    }
+
+                    data.SetController(controller);
+                    var appSettings = databaseConnection.ApplicationSettings;
+                    await data.UpdateThrottleSpeedsAsync(appSettings.UploadSpeedLimit, appSettings.DownloadSpeedLimit).ConfigureAwait(false);
+
+                    // Pass on the provider, will be replaced if configured in the backup
+                    await controller.SetSecretProviderAsync(applicationSettings.SecretProvider).ConfigureAwait(false);
+
+                    if (backup.Metadata.ContainsKey("LastCompactFinished"))
+                        await controller.SetLastCompactAsync(Utility.DeserializeDateTime(backup.Metadata["LastCompactFinished"])).ConfigureAwait(false);
+
+                    if (backup.Metadata.ContainsKey("LastVacuumFinished"))
+                        await controller.SetLastVacuumAsync(Utility.DeserializeDateTime(backup.Metadata["LastVacuumFinished"])).ConfigureAwait(false);
+
+                    if (backup.Metadata.ContainsKey("LastRestoreTestFinished"))
+                        await controller.SetLastRestoreTestAsync(Utility.DeserializeDateTime(backup.Metadata["LastRestoreTestFinished"])).ConfigureAwait(false);
+
+                    switch (data.Operation)
+                    {
+                        case DuplicatiOperation.BackupOrSync:
+                            {
+                                var filter = ApplyFilter(backup, GetCommonFilter(databaseConnection));
+                                var sources = GetExpandedSources(backup);
+
+                                IBasicResults r;
+                                if (backup.OperationType == OperationType.Sync)
+                                {
+                                    r = await controller.SyncAsync(sources, filter).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    // The handoff closes the recording when the engine asks for the
+                                    // list, after the snapshot exists, so it is installed before the run
+                                    var handoff = await PrepareChangeTrackingAsync(changeTracking, backup, sources, filter, options, useFileWatcher).ConfigureAwait(false);
+
+                                    IBackupResults? backupResults = null;
+                                    try
+                                    {
+                                        if (handoff != null)
+                                            await controller.SetChangeListProviderAsync(handoff).ConfigureAwait(false);
+
+                                        backupResults = await controller.BackupAsync(sources, filter).ConfigureAwait(false);
+                                    }
+                                    finally
+                                    {
+                                        if (handoff != null && changeTracking != null)
+                                            await CompleteChangeTrackingAsync(changeTracking, handoff, backupResults, Utility.ParseBoolOption(options, "dry-run")).ConfigureAwait(false);
+                                    }
+
+                                    r = backupResults;
+                                }
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.List:
+                            {
+                                var r = await controller.ListAsync(data.FilterStrings, null).ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.Repair:
+                            {
+                                var r = await controller.RepairAsync(data.FilterStrings == null ? null : new Library.Utility.FilterExpression(data.FilterStrings)).ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.RepairUpdate:
+                            {
+                                var r = await controller.UpdateDatabaseWithVersionsAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.Remove:
+                            {
+                                var r = await controller.DeleteAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.Restore:
+                            {
+                                var r = backup.OperationType == OperationType.Sync
+                                    ? await controller.SyncRestoreAsync(GetExpandedSources(backup), data.FilterStrings).ConfigureAwait(false)
+                                    : await controller.RestoreAsync(data.FilterStrings).ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.RestoreControlFiles:
+                            {
+                                var r = await controller.RestoreControlFilesAsync(data.FilterStrings).ConfigureAwait(false);
+                                return r;
+                            }
+                        case DuplicatiOperation.Verify:
+                            {
+                                var r = await controller.TestAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.Compact:
+                            {
+                                var r = await controller.CompactAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.RestoreTest:
+                            {
+                                var r = await controller.RestoreTestAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.CreateReport:
+                            {
+                                using (var tf = new Library.Utility.TempFile())
+                                {
+                                    var r = await controller.CreateLogDatabaseAsync(tf).ConfigureAwait(false);
+                                    var tempid = databaseConnection.RegisterTempFile("create-bug-report", r.TargetPath, DateTime.Now.AddDays(3));
+
+                                    if (string.Equals(tf, r.TargetPath, Utility.ClientFilenameStringComparison))
+                                        tf.Protected = true;
+
+                                    databaseConnection.RegisterNotification(
+                                        NotificationType.Information,
+                                        "Bugreport ready",
+                                        "Bugreport is ready for download",
+                                         null,
+                                         null,
+                                         "bug-report:created:" + tempid,
+                                         null,
+                                         "BugreportCreatedReady",
+                                         "",
+                                         (n, a) => n
+                                     );
+
+                                    return r;
+                                }
+                            }
+
+                        case DuplicatiOperation.ListRemote:
+                            {
+                                var r = await controller.ListRemoteAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+
+                        case DuplicatiOperation.Delete:
+                            {
+                                if (data.ExtraOptions != null)
+                                {
+                                    // A sync job leaves no backup volumes at the destination, only the
+                                    // copied files, which are kept, even if they look like volumes
+                                    if (backup.OperationType != OperationType.Sync && Utility.ParseBoolOption(data.ExtraOptions.AsReadOnly(), "delete-remote-files"))
+                                        await controller.DeleteAllRemoteFilesAsync().ConfigureAwait(false);
+
+                                    if (Utility.ParseBoolOption(data.ExtraOptions.AsReadOnly(), "delete-local-db"))
+                                    {
+                                        options.TryGetValue("dbpath", out var dbpath);
+
+                                        if (!string.IsNullOrWhiteSpace(dbpath) && System.IO.File.Exists(dbpath))
+                                            System.IO.File.Delete(dbpath);
+                                    }
+                                }
+                                // The connection tells the change tracking service, which stops the watcher
+                                databaseConnection.DeleteBackup(backup);
+                                (data as RunnerData)?.AfterTaskFinished?.Invoke(data);
+                                return null;
+                            }
+                        case DuplicatiOperation.Vacuum:
+                            {
+                                var r = await controller.VacuumAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+
+                        case DuplicatiOperation.ListFilesets:
+                            {
+                                if (backup.OperationType == OperationType.Sync)
+                                    return await controller.ListSyncVersionsAsync().ConfigureAwait(false);
+
+                                var r = await controller.ListFilesetsAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.SetVersionLabel:
+                            {
+                                var r = await controller.SetVersionLabelAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+                        case DuplicatiOperation.ListFolderContents:
+                            {
+                                if (backup.OperationType == OperationType.Sync)
+                                    return await controller.ListSyncFolderAsync(GetExpandedSources(backup), data.ExtraArguments, data.PageOffset * data.PageSize, data.PageSize).ConfigureAwait(false);
+
+                                return await controller.ListFolderAsync(data.ExtraArguments, data.PageOffset * data.PageSize, data.PageSize, data.ReturnExtendedData).ConfigureAwait(false);
+                            }
+
+                        case DuplicatiOperation.ListFileVersions:
+                            {
+                                return await controller.ListFileVersionsAsync(data.ExtraArguments, data.PageOffset * data.PageSize, data.PageSize).ConfigureAwait(false);
+                            }
+                        case DuplicatiOperation.SearchEntries:
+                            {
+                                var parsedfilter = new FilterExpression(data.FilterStrings);
+                                return await controller.SearchEntriesAsync(data.ExtraArguments, parsedfilter, data.CaseSensitiveSearch, data.PageOffset * data.PageSize, data.PageSize, data.ReturnExtendedData, data.SearchMetadata).ConfigureAwait(false);
+                            }
+
+                        case DuplicatiOperation.DeleteVersions:
+                            {
+                                var r = await controller.DeleteAsync().ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+
+                        case DuplicatiOperation.ListBrokenFiles:
+                            {
+                                var filter = data.FilterStrings == null ? null : new FilterExpression(data.FilterStrings);
+                                var r = await controller.ListBrokenFilesAsync(filter).ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+
+                        case DuplicatiOperation.PurgeBrokenFiles:
+                            {
+                                var filter = data.FilterStrings == null ? null : new FilterExpression(data.FilterStrings);
+                                var r = await controller.PurgeBrokenFilesAsync(filter).ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+
+                        case DuplicatiOperation.PurgeFiles:
+                            {
+                                var filter = data.FilterStrings == null ? null : new FilterExpression(data.FilterStrings);
+                                var r = await controller.PurgeFilesAsync(filter).ConfigureAwait(false);
+                                UpdateMetadataBase(databaseConnection, eventPollNotify, notificationUpdateService, backup, r);
+                                return r;
+                            }
+
+                        default:
+                            //TODO: Log this
+                            return null;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                databaseConnection.LogError(data.Backup?.ID, string.Format("Failed while executing {0} \"{1}\" (id: {2})", data.Operation, data.Backup?.Name, data.Backup?.ID), ex);
+                if (data.Backup != null)
+                    UpdateMetadataError(databaseConnection, notificationUpdateService, data.Backup, ex);
+                Library.UsageReporter.Reporter.Report(ex);
+
+                throw;
+            }
+            finally
+            {
+                data.SetController(null);
+                data.TaskFinished = DateTime.Now;
+                eventPollNotify.SignalProgressUpdate(progressStateProviderService?.GenerateProgressState);
+            }
+        }
+
+        /// <summary>
+        /// The server-only option that enables the file system watcher for a backup
+        /// </summary>
+        public const string FILE_WATCHER_OPTION = "use-file-watcher";
+
+        /// <summary>
+        /// Prepares the change tracking handoff for a backup run, when the watcher applies to it
+        /// </summary>
+        /// <param name="changeTracking">The change tracking service, if any</param>
+        /// <param name="backup">The backup</param>
+        /// <param name="sources">The expanded sources</param>
+        /// <param name="filter">The filter in use</param>
+        /// <param name="options">The options the engine will see</param>
+        /// <param name="useFileWatcher">Whether the backup has the watcher enabled</param>
+        /// <returns>The handoff to install on the controller, or null to scan everything</returns>
+        private static async Task<Handoff?> PrepareChangeTrackingAsync(IChangeTrackingService? changeTracking, IBackup backup, string[] sources, Library.Utility.IFilter? filter, Dictionary<string, string?> options, bool useFileWatcher)
+        {
+            if (changeTracking == null || !changeTracking.Enabled)
+                return null;
+
+            // The engine compares listed paths with full paths, so the watcher is given those
+            var localSources = sources
+                .Where(Library.Main.Operation.Common.SourceProviderFactory.IsLocalFileSource)
+                .Select(GetWatchedPath)
+                .ToList();
+
+            string? skipReason = null;
+            if (!useFileWatcher)
+                skipReason = "it is not enabled for the backup";
+            else if (new Library.Main.Options(options).GetChangeListUnsupportedReason() is string unsupported)
+                skipReason = unsupported;
+            else if (!string.IsNullOrWhiteSpace(options.GetValueOrDefault("changed-files")) || !string.IsNullOrWhiteSpace(options.GetValueOrDefault("changed-files-list")))
+                skipReason = "a change list is supplied by option";
+            else if (localSources.Count == 0)
+                skipReason = "the backup has no local file sources";
+
+            if (skipReason != null)
+            {
+                // A watcher left from an earlier run records changes nobody reads, so it is stopped
+                if (await changeTracking.StopAsync(backup.ID, CancellationToken.None).ConfigureAwait(false) || useFileWatcher)
+                    Library.Logging.Log.WriteInformationMessage(LOGTAG, "FileWatcherSkipped", "The file watcher is not used for backup {0} because {1}", backup.ID, skipReason);
+                return null;
+            }
+
+            try
+            {
+                return await changeTracking.PrepareHandoffAsync(backup.ID, localSources, ComputeChangeTrackingHash(sources, filter, options), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Library.Logging.Log.WriteWarningMessage(LOGTAG, "FileWatcherPrepareFailed", ex, "Could not prepare the file watcher for backup {0}, scanning all files", backup.ID);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Whether the backup itself has the file watcher enabled. The watcher is opt-in per
+        /// backup, so only the backup's own settings are read.
+        /// </summary>
+        /// <param name="backup">The backup</param>
+        /// <returns>True if the backup has the watcher enabled</returns>
+        internal static bool IsFileWatcherEnabled(IBackup backup)
+        {
+            // As when options are applied, an override with the prefix wins over a plain setting
+            var settings = backup.Settings ?? [];
+            var setting = settings.LastOrDefault(x => string.Equals(x.Name, "--" + FILE_WATCHER_OPTION, StringComparison.Ordinal))
+                ?? settings.LastOrDefault(x => string.Equals(x.Name, FILE_WATCHER_OPTION, StringComparison.Ordinal));
+            return setting != null && Utility.ParseBool(setting.Value, true);
+        }
+
+        /// <summary>
+        /// Options that change with every run and decide nothing about what a backup scans
+        /// </summary>
+        private static readonly HashSet<string> CHANGE_TRACKING_HASH_IGNORED_OPTIONS = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "next-scheduled-run",
+            "control-files",
+        };
+
+        /// <summary>
+        /// Gets the full path the watcher watches for a source
+        /// </summary>
+        /// <param name="source">The source</param>
+        /// <returns>The full path, or the source if it cannot be expanded</returns>
+        internal static string GetWatchedPath(string source)
+        {
+            try
+            {
+                // As the engine does, a bare drive means the root of the drive, not its current folder
+                return System.IO.Path.GetFullPath(Library.Common.IO.Util.ExpandBareDriveRoot(source));
+            }
+            catch
+            {
+                return source;
+            }
+        }
+
+        /// <summary>
+        /// The key for the settings hash. The hash covers every option, secrets included, and
+        /// is stored in the tracking database; a key that only lives in this process keeps it
+        /// from being tested against guesses. The database is recreated on every start, so a
+        /// stored hash never needs to outlive the key.
+        /// </summary>
+        private static readonly byte[] CHANGE_TRACKING_HASH_SALT = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
+
+        /// <summary>
+        /// Hashes everything that decides what a backup scans: the sources, the filter and
+        /// every option. Any change forces a full scan, which is coarse but safe.
+        /// </summary>
+        /// <param name="sources">The expanded sources</param>
+        /// <param name="filter">The filter in use</param>
+        /// <param name="options">The options the engine will see</param>
+        /// <returns>The hash</returns>
+        internal static string ComputeChangeTrackingHash(string[] sources, Library.Utility.IFilter? filter, IReadOnlyDictionary<string, string?> options)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var source in sources)
+                sb.Append("source:").Append(source).Append('\n');
+            if (filter != null)
+                foreach (var expression in Library.Utility.FilterExpression.Serialize(filter))
+                    sb.Append("filter:").Append(expression).Append('\n');
+            foreach (var (key, value) in options.OrderBy(x => x.Key, StringComparer.Ordinal))
+            {
+                // These change with every run and decide nothing about the scan: the scheduler
+                // passes the next run time, and the stored task configuration is a new temporary file
+                if (CHANGE_TRACKING_HASH_IGNORED_OPTIONS.Contains(key))
+                    continue;
+                sb.Append("option:").Append(key).Append('=').Append(value).Append('\n');
+            }
+
+            return Convert.ToHexString(System.Security.Cryptography.HMACSHA256.HashData(CHANGE_TRACKING_HASH_SALT, System.Text.Encoding.UTF8.GetBytes(sb.ToString())));
+        }
+
+        /// <summary>
+        /// Finishes the change tracking handoff after the run. Only a run that produced a
+        /// complete fileset lets the closed recording go.
+        /// </summary>
+        /// <param name="changeTracking">The change tracking service</param>
+        /// <param name="handoff">The handoff</param>
+        /// <param name="results">The results, or null if the run threw</param>
+        /// <param name="dryRun">Whether the run was a dry run, which stores nothing</param>
+        private static async Task CompleteChangeTrackingAsync(IChangeTrackingService changeTracking, Handoff handoff, IBackupResults? results, bool dryRun)
+        {
+            // A dry run leaves the previous fileset as the base, so its list is kept for the next run
+            var success = results != null
+                && results.ParsedResult is ParsedResultType.Success or ParsedResultType.Warning
+                && !results.PartialBackup
+                && !dryRun;
+
+            try
+            {
+                await changeTracking.CompleteHandoffAsync(handoff, success, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Library.Logging.Log.WriteWarningMessage(LOGTAG, "FileWatcherCompleteFailed", ex, "Could not finish the file watcher handoff for backup {0}", handoff.BackupId);
+            }
+        }
+
+        private static async Task<Library.Main.IController> CreateControllerAsync(string url, Dictionary<string, string?> options, MessageSink sink, bool useOutOfProcess)
+        {
+            if (useOutOfProcess)
+                return await Library.Main.IPC.ControllerRpcProxy.CreateProxyAsync(url, options, sink);
+            return new Library.Main.Controller(url, options, sink);
+        }
+
+        private static TempFolder? StoreTaskConfigAndGetTempFolder(Connection databaseConnection, IRunnerData data, Dictionary<string, string?> options)
+        {
+            if (data.Backup == null)
+                throw new ArgumentNullException(nameof(data.Backup));
+
+            var mode = ParseStoreTaskConfigMode(options.GetValueOrDefault("store-task-config"));
+            var encryptionEnabled = IsBackupEncryptionEnabled(options);
+            var effectiveMode = mode.ResolvedTaskConfigMode(encryptionEnabled);
+
+            if (effectiveMode == null)
+                return null;
+
+            var tempfolder = new TempFolder();
+            var temppath = System.IO.Path.Combine(tempfolder, TaskSetupFilename);
+            using (var tempfile = Library.Utility.TempFile.WrapExistingFile(temppath))
+            {
+                IEnumerable<Serializable.ImportExportStructure>? taskdata = null;
+                if (effectiveMode.IncludeAllTasks)
+                {
+                    taskdata = databaseConnection.Backups
+                        .Where(x => !x.IsTemporary)
+                        .Select(x => PrepareBackupForExport(databaseConnection, databaseConnection.GetBackup(x.ID)!, effectiveMode.RemoveSecrets));
+                }
+                else
+                {
+                    taskdata = [PrepareBackupForExport(databaseConnection, data.Backup, effectiveMode.RemoveSecrets)];
+                }
+
+                using (var fs = System.IO.File.OpenWrite(tempfile))
+                using (var sw = new System.IO.StreamWriter(fs, System.Text.Encoding.UTF8))
+                    Serializer.SerializeJson(sw, taskdata, true);
+
+                options.TryGetValue("control-files", out var controlfiles);
+
+                // Append this to any other control files
+                options["control-files"] = string.IsNullOrWhiteSpace(controlfiles)
+                    ? controlfiles = tempfile
+                    : controlfiles += System.IO.Path.PathSeparator + tempfile;
+
+                // Don't delete the file now, leave it for when the folder is deleted
+                tempfile.Protected = true;
+            }
+            return tempfolder;
+        }
+
+        private static void UpdateMetadataError(Connection databaseConnection, INotificationUpdateService notificationUpdateService, IBackup backup, Exception ex)
+        {
+            backup.Metadata["LastErrorDate"] = Utility.SerializeDateTime(DateTime.UtcNow);
+            backup.Metadata["LastErrorMessage"] = ex.Message;
+
+            if (!backup.IsTemporary)
+                databaseConnection.SetMetadata(backup.Metadata, long.Parse(backup.ID), null);
+
+            string? messageid = null;
+            if (ex is UserInformationException exception)
+                messageid = exception.HelpID;
+
+            notificationUpdateService.IncrementLastDataUpdateId();
+            databaseConnection.RegisterNotification(
+                NotificationType.Error,
+                backup.IsTemporary ?
+                    "Error" : string.Format("Error while running {0}", backup.Name),
+                ex.Message,
+                ex,
+                backup.ID,
+                "backup:show-log",
+                null,
+                messageid,
+                null,
+                (n, a) =>
+                {
+                    return a.FirstOrDefault(x => x.BackupID == backup.ID) ?? n;
+                }
+            );
+        }
+
+        private static void UpdateMetadataLastCompact(IBackup backup, ICompactResults r)
+        {
+            if (r != null)
+            {
+                backup.Metadata["LastCompactDuration"] = r.Duration.ToString();
+                backup.Metadata["LastCompactStarted"] = Utility.SerializeDateTime(r.BeginTime.ToUniversalTime());
+                backup.Metadata["LastCompactFinished"] = Utility.SerializeDateTime(r.EndTime.ToUniversalTime());
+            }
+        }
+
+        private static void UpdateMetadataLastVacuum(IBackup backup, IVacuumResults r)
+        {
+            if (r != null)
+            {
+                backup.Metadata["LastVacuumDuration"] = r.Duration.ToString();
+                backup.Metadata["LastVacuumStarted"] = Utility.SerializeDateTime(r.BeginTime.ToUniversalTime());
+                backup.Metadata["LastVacuumFinished"] = Utility.SerializeDateTime(r.EndTime.ToUniversalTime());
+            }
+        }
+
+        private static void UpdateMetadataLastRestoreTest(IBackup backup, IRestoreTestResults r)
+        {
+            if (r != null)
+            {
+                backup.Metadata["LastRestoreTestDuration"] = r.Duration.ToString();
+                backup.Metadata["LastRestoreTestStarted"] = Utility.SerializeDateTime(r.BeginTime.ToUniversalTime());
+                backup.Metadata["LastRestoreTestFinished"] = Utility.SerializeDateTime(r.EndTime.ToUniversalTime());
+            }
+        }
+
+        /// <summary>
+        /// Registers a notification for a restore test after a backup that did not pass. Such a
+        /// restore test does not change the backup result, so it needs its own notification.
+        /// A standalone restore test is covered by the notification for any failed operation.
+        /// </summary>
+        /// <param name="databaseConnection">The database connection</param>
+        /// <param name="backup">The backup that was tested</param>
+        /// <param name="r">The restore test results</param>
+        private static void RegisterRestoreTestNotification(Connection databaseConnection, IBackup backup, IRestoreTestResults r)
+        {
+            if (r.ParsedResult == ParsedResultType.Success)
+                return;
+
+            var isWarning = r.ParsedResult == ParsedResultType.Warning;
+            var message = r.FilesFailed > 0
+                ? $"{r.FilesFailed} of {r.FilesTested} restored file(s) failed verification."
+                : r.Errors?.FirstOrDefault() ?? r.Warnings?.FirstOrDefault() ?? $"The restore test completed with status {r.ParsedResult}.";
+
+            databaseConnection.RegisterNotification(
+                isWarning ? NotificationType.Warning : NotificationType.Error,
+                backup.IsTemporary ? "Restore test" : $"Restore test {(isWarning ? "warning" : "failed")} for {backup.Name}",
+                message,
+                null,
+                backup.ID,
+                "backup:show-log",
+                null,
+                null,
+                null,
+                (n, a) => n
+            );
+        }
+
+        /// <summary>
+        /// Records the outcome of a sync run in the backup metadata.
+        /// The run is recorded under the "LastSync*" keys, which readers find through
+        /// <see cref="LastRunMetadata"/>. This follows the same rule as a backup run:
+        /// an interrupted run did not cover everything it was asked to, so neither its
+        /// times nor its source numbers are recorded as the last completed run.
+        /// </summary>
+        /// <param name="backup">The backup to update the metadata for</param>
+        /// <param name="r">The sync results</param>
+        internal static void UpdateMetadataLastSync(IBackup backup, ISyncResults r)
+        {
+            if (r != null && !r.Interrupted)
+            {
+                backup.Metadata["SourceFilesSize"] = r.SizeOfSourceFiles.ToString();
+                backup.Metadata["SourceFilesCount"] = r.SourceFiles.ToString();
+                backup.Metadata["SourceSizeString"] = Utility.FormatSizeString(r.SizeOfSourceFiles);
+                backup.Metadata[LastRunMetadata.StartedKey(OperationType.Sync)] = Utility.SerializeDateTime(r.BeginTime.ToUniversalTime());
+                backup.Metadata[LastRunMetadata.FinishedKey(OperationType.Sync)] = Utility.SerializeDateTime(r.EndTime.ToUniversalTime());
+                backup.Metadata[LastRunMetadata.DurationKey(OperationType.Sync)] = r.Duration.ToString();
+            }
+        }
+
+        private static void UpdateMetadataStatistics(IBackup backup, IParsedBackendStatistics r)
+        {
+            if (r != null && r.RemoteCalls > 0)
+            {
+                backup.Metadata["LastBackupDate"] = Utility.SerializeDateTime(r.LastBackupDate.ToUniversalTime());
+                backup.Metadata["BackupListCount"] = r.BackupListCount.ToString();
+                backup.Metadata["TotalQuotaSpace"] = r.TotalQuotaSpace.ToString();
+                backup.Metadata["FreeQuotaSpace"] = r.FreeQuotaSpace.ToString();
+                backup.Metadata["AssignedQuotaSpace"] = r.AssignedQuotaSpace.ToString();
+
+                backup.Metadata["TargetFilesSize"] = r.KnownFileSize.ToString();
+                backup.Metadata["TargetFilesCount"] = r.KnownFileCount.ToString();
+                backup.Metadata["TargetFilesetsCount"] = r.KnownFilesets.ToString();
+                backup.Metadata["TargetSizeString"] = Utility.FormatSizeString(r.KnownFileSize);
+            }
+        }
+
+        internal static void UpdateMetadataBase(Connection databaseConnection, EventPollNotify eventPollNotify, INotificationUpdateService notificationUpdateService, IBackup backup, IBasicResults result)
+        {
+            if (result is IRestoreResults r1)
+            {
+                backup.Metadata["LastRestoreDuration"] = r1.Duration.ToString();
+                backup.Metadata["LastRestoreStarted"] = Utility.SerializeDateTime(result.BeginTime.ToUniversalTime());
+                backup.Metadata["LastRestoreFinished"] = Utility.SerializeDateTime(result.EndTime.ToUniversalTime());
+            }
+
+            if (result is IParsedBackendStatistics r2 && !result.Interrupted)
+            {
+                UpdateMetadataStatistics(backup, r2);
+            }
+
+            if (result is IBackendStatsticsReporter r3 && !result.Interrupted)
+            {
+                if (r3.BackendStatistics is IParsedBackendStatistics statistics)
+                    UpdateMetadataStatistics(backup, statistics);
+            }
+
+            if (result is ICompactResults r4 && !result.Interrupted)
+            {
+                UpdateMetadataLastCompact(backup, r4);
+
+                if (r4.VacuumResults != null)
+                    UpdateMetadataLastVacuum(backup, r4.VacuumResults);
+            }
+
+            if (result is IVacuumResults r5 && !result.Interrupted)
+            {
+                UpdateMetadataLastVacuum(backup, r5);
+            }
+
+            if (result is IRestoreTestResults rt && !result.Interrupted)
+            {
+                UpdateMetadataLastRestoreTest(backup, rt);
+            }
+
+            if (result is ISyncResults r6)
+            {
+                UpdateMetadataLastSync(backup, r6);
+            }
+
+            if (result is IDeleteResults r7)
+            {
+                if (r7.CompactResults != null)
+                {
+                    UpdateMetadataLastCompact(backup, r7.CompactResults);
+                    if (!r7.CompactResults.Interrupted && r7.CompactResults.DeletedFileCount > 0 && r7.CompactResults.BackendStatistics is IParsedBackendStatistics p)
+                        UpdateMetadataStatistics(backup, p);
+                }
+            }
+
+            if (result is IBackupResults r)
+            {
+                if (!result.Interrupted)
+                {
+                    backup.Metadata["SourceFilesSize"] = r.SizeOfExaminedFiles.ToString();
+                    backup.Metadata["SourceFilesCount"] = r.ExaminedFiles.ToString();
+                    backup.Metadata["SourceSizeString"] = Duplicati.Library.Utility.Utility.FormatSizeString(r.SizeOfExaminedFiles);
+                    backup.Metadata["LastBackupStarted"] = Utility.SerializeDateTime(r.BeginTime.ToUniversalTime());
+                    backup.Metadata["LastBackupFinished"] = Utility.SerializeDateTime(r.EndTime.ToUniversalTime());
+                    backup.Metadata["LastBackupDuration"] = r.Duration.ToString();
+
+                    if (r.CompactResults != null)
+                        UpdateMetadataLastCompact(backup, r.CompactResults);
+
+                    if (r.VacuumResults != null)
+                        UpdateMetadataLastVacuum(backup, r.VacuumResults);
+
+                    if (r.RestoreTestResults != null)
+                        UpdateMetadataLastRestoreTest(backup, r.RestoreTestResults);
+                }
+
+                // Only the latest run is reported, so the notifications of the earlier runs go,
+                // whether or not this run has a warning or error of its own
+                try
+                {
+                    databaseConnection.DismissNotificationsForBackup(backup.ID);
+                }
+                catch (Exception ex)
+                {
+                    databaseConnection.LogError(backup.ID, "Failed to dismiss notifications", ex);
+                }
+
+                if (r.FilesWithError > 0 || r.Warnings.Any() || r.Errors.Any())
+                {
+                    string message;
+                    string titleType;
+                    if (r.FilesWithError > 0)
+                    {
+                        message = $"Errors affected {r.FilesWithError} file(s).";
+                        titleType = "Error";
+                    }
+                    else if (r.Errors.Any())
+                    {
+                        message = r.Errors.Count() == 1 ? r.Errors.Single() : $"Encountered {r.Errors.Count()} errors.";
+                        titleType = "Error";
+                    }
+                    else
+                    {
+                        message = r.Warnings.Count() == 1 ? r.Warnings.Single() : $"Encountered {r.Warnings.Count()} warnings.";
+                        titleType = "Warning";
+                    }
+
+                    databaseConnection.RegisterNotification(
+                        r.FilesWithError == 0 && !r.Errors.Any() ? NotificationType.Warning : NotificationType.Error,
+                        backup.IsTemporary ? "Warning" : $"{titleType} while running {backup.Name}",
+                        message,
+                        null,
+                        backup.ID,
+                        "backup:show-log",
+                        null,
+                        null,
+                        null,
+                        (n, a) => n
+                    );
+                }
+            }
+            else if (result.ParsedResult != ParsedResultType.Success)
+            {
+                var type = result.ParsedResult == ParsedResultType.Warning
+                            ? NotificationType.Warning
+                            : NotificationType.Error;
+
+                var title = result.ParsedResult == ParsedResultType.Warning
+                                ? (backup.IsTemporary ?
+                                "Warning" : string.Format("Warning while running {0}", backup.Name))
+                            : (backup.IsTemporary ?
+                                "Error" : string.Format("Error while running {0}", backup.Name));
+
+                var message = result.ParsedResult == ParsedResultType.Warning
+                                    ? string.Format("Got {0} warning(s)", result.Warnings.Count())
+                                    : string.Format("Got {0} error(s)", result.Errors.Count());
+
+                // If there is only one error or warning, show the message
+                if (result.ParsedResult == ParsedResultType.Warning && result.Warnings.Count() == 1)
+                    message = $"Warning: {result.Warnings.Single()}";
+                else if (result.ParsedResult == ParsedResultType.Error && result.Errors.Count() == 1)
+                    message = $"Error: {result.Errors.Single()}";
+
+                databaseConnection.RegisterNotification(
+                    type,
+                    title,
+                    message,
+                    null,
+                    backup.ID,
+                    "backup:show-log",
+                    null,
+                    null,
+                    "backup:show-log",
+                    (n, a) => n
+                );
+            }
+
+            // Registered after the backup notifications, as a clean backup dismisses those
+            if (result is IBackupResults { RestoreTestResults: not null } backupResults && !result.Interrupted)
+                RegisterRestoreTestNotification(databaseConnection, backup, backupResults.RestoreTestResults);
+
+            if (!backup.IsTemporary)
+                databaseConnection.SetMetadata(backup.Metadata, long.Parse(backup.ID), null);
+
+            notificationUpdateService.IncrementLastDataUpdateId();
+            eventPollNotify.SignalNewEvent();
+            if (!backup.IsTemporary)
+                eventPollNotify.SignalBackupListUpdate();
+        }
+
+        private static bool TestIfOptionApplies()
+        {
+            //TODO: Implement to avoid warnings
+            return true;
+        }
+
+        private static void DisableModule(string module, Dictionary<string, string?> options)
+        {
+            if (options.TryGetValue("enable-module", out var enabledModules))
+            {
+                var emods = (enabledModules ?? "").Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                options["enable-module"] = string.Join(",", emods.Where(x => module.Equals(x, StringComparison.OrdinalIgnoreCase)));
+            }
+
+            options.TryGetValue("disable-module", out var disabledModules);
+            var mods = (disabledModules ?? "").Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            options["disable-module"] = string.Join(",", mods.Union(new string[] { module }).Distinct(StringComparer.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// Merges the remote control storage credentials into a Duplicati backend url.
+        /// The stored url never carries them, so every url that is handed to a backend
+        /// passes through here: the primary target, each additional target, and the
+        /// urls the web endpoints test or list. Any other scheme is returned unchanged.
+        /// </summary>
+        /// <param name="databaseConnection">The database connection holding the application settings.</param>
+        /// <param name="url">The url to patch.</param>
+        /// <returns>The url with the storage credentials merged in.</returns>
+        public static string ApplyDuplicatiStorageCredentials(Connection databaseConnection, string url)
+        {
+            var uri = new Library.Utility.RelaxedUri(url);
+            if (!uri.Scheme.Equals(Library.Backend.Duplicati.DuplicatiBackend.PROTOCOL, StringComparison.OrdinalIgnoreCase))
+                return url;
+
+            return Library.Backend.Duplicati.DuplicatiBackend.MergeArgsIntoUrl(
+                url,
+                databaseConnection.ApplicationSettings.RemoteControlStorageApiId,
+                databaseConnection.ApplicationSettings.RemoteControlStorageApiKey,
+                databaseConnection.ApplicationSettings.RemoteControlStorageEndpointUrl
+            );
+        }
+
+        /// <summary>
+        /// Maps the backup's AdditionalTargetURLs to the remote-sync-json-config option
+        /// so the RemoteSynchronizationModule can pick them up.
+        /// </summary>
+        /// <param name="databaseConnection">The database connection holding the application settings.</param>
+        /// <param name="backup">The backup containing additional target URLs.</param>
+        /// <param name="options">The options dictionary to update.</param>
+        internal static void ApplyAdditionalTargetUrls(Connection databaseConnection, IBackup backup, Dictionary<string, string?> options)
+        {
+            if (backup.AdditionalTargetURLs == null)
+                return;
+
+            var additionalTargets = backup.AdditionalTargetURLs.ToList();
+            if (additionalTargets.Count == 0)
+                return;
+
+            var destinations = new List<Dictionary<string, object?>>();
+            foreach (var target in additionalTargets)
+            {
+                var dest = new Dictionary<string, object?>
+                {
+                    ["url"] = ApplyDuplicatiStorageCredentials(databaseConnection, target.TargetUrl),
+                    ["mode"] = target.Mode
+                };
+
+                if (!string.IsNullOrWhiteSpace(target.Interval))
+                    dest["interval"] = target.Interval;
+
+                // Add options from the Options dictionary
+                if (target.Options != null)
+                {
+                    foreach (var opt in target.Options)
+                    {
+                        // Skip null values and already-handled properties
+                        if (opt.Value == null)
+                            continue;
+                        if (opt.Key.Equals("url", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        if (opt.Key.Equals("mode", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        if (opt.Key.Equals("interval", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        dest[opt.Key] = opt.Value;
+                    }
+                }
+
+                destinations.Add(dest);
+            }
+
+            var config = new Dictionary<string, object>
+            {
+                ["sync-on-warnings"] = true,
+                ["destinations"] = destinations
+            };
+
+            var jsonOptions = new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.KebabCaseLower
+            };
+            options["remote-sync-json-config"] = JsonSerializer.Serialize(config, jsonOptions);
+        }
+
+        /// <summary>
+        /// Returns the effective local database path for an <see cref="IQueuedTask"/> instance.
+        /// In production, all queued tasks are <see cref="IRunnerData"/> instances created by the
+        /// <c>Runner.Create*</c> factories, so this delegates to
+        /// <see cref="GetEffectiveDBPath(IRunnerData?)"/>. If the task is not an
+        /// <see cref="IRunnerData"/> (only possible in tests with mock <see cref="IQueuedTask"/>
+        /// implementations), the result is <c>null</c>.
+        /// </summary>
+        /// <returns>The effective path, or <c>null</c></returns>
+        public static string? GetEffectiveDBPath(IQueuedTask? runnerData)
+            => GetEffectiveDBPath(runnerData as IRunnerData);
+
+        /// <summary>
+        /// Returns the effective local database path for a <see cref="IRunnerData"/> instance.
+        /// The precedence mirrors <see cref="ApplyOptions"/>: the <c>dbpath</c> extra option takes
+        /// priority, then the backup's <c>--dbpath</c> advanced setting, then the stored
+        /// <see cref="Serialization.Interface.IBackup.DBPath"/>. If <c>no-local-db</c> is set
+        /// (either as an extra option or as a backup advanced setting), the result is <c>null</c>.
+        /// </summary>
+        /// <returns>The effective path, or <c>null</c></returns>
+        public static string? GetEffectiveDBPath(IRunnerData? runnerData)
+        {
+            if (runnerData == null)
+                return null;
+
+            if (runnerData.ExtraOptions != null)
+            {
+                if (runnerData.ExtraOptions.ContainsKey("no-local-db") && Utility.ParseBoolOption(runnerData.ExtraOptions.AsReadOnly(), "no-local-db"))
+                    return null;
+                if (runnerData.ExtraOptions.TryGetValue("dbpath", out var dbpath) && !string.IsNullOrWhiteSpace(dbpath))
+                    return dbpath;
+            }
+
+            if (runnerData.Backup == null)
+                return null;
+
+            var setting = runnerData.Backup.Settings?.FirstOrDefault(s => s.Name.Equals($"--no-local-db", StringComparison.OrdinalIgnoreCase));
+            if (setting != null && Utility.ParseBool(setting.Value, true))
+                return null;
+
+            return GetEffectiveDBPath(runnerData.Backup);
+        }
+
+        /// <summary>
+        /// Returns the effective local database path for a backup: the "--dbpath" advanced option if
+        /// it is set, otherwise the stored <see cref="Serialization.Interface.IBackup.DBPath"/>. This
+        /// mirrors the precedence applied by <see cref="ApplyOptions"/> so that every operation agrees
+        /// on which database file to use (see issue #1698).
+        /// </summary>
+        public static string GetEffectiveDBPath(Serialization.Interface.IBackup backup)
+        {
+            var dbpath = backup.Settings?
+                .FirstOrDefault(s => s.Name.Equals("--dbpath", StringComparison.OrdinalIgnoreCase))?.Value;
+            return string.IsNullOrWhiteSpace(dbpath) ? backup.DBPath : dbpath;
+        }
+
+        /// <summary>
+        /// The operations the remote controller accepts reports for. Names the controller sent that are not
+        /// operations are ignored, and a controller that has not said gets backup reports only.
+        /// </summary>
+        /// <param name="databaseConnection">The database connection</param>
+        /// <returns>The operation names to report</returns>
+        internal static IEnumerable<string> GetRemoteControlReportOperations(Connection databaseConnection)
+        {
+            var accepted = (databaseConnection.ApplicationSettings.RemoteControlReportOperations ?? string.Empty)
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(x => Enum.TryParse<OperationMode>(x, true, out _))
+                .ToList();
+
+            return accepted.Count == 0 ? [nameof(OperationMode.Backup)] : accepted;
+        }
+
+        /// <summary>
+        /// The prefix of the default backup id that is reported for a backup stored in the server database
+        /// </summary>
+        public const string ReportBackupIdPrefix = "DB-";
+
+        /// <summary>
+        /// The backup id in the remote controller's restore test intervals whose interval applies to every backup
+        /// it does not name. No backup reports an empty id, so it cannot clash with one.
+        /// </summary>
+        public const string DefaultRestoreTestIntervalBackupId = "";
+
+        /// <summary>
+        /// Gets the backup id a backup is reported with. The default is the database id with
+        /// <see cref="ReportBackupIdPrefix"/>, but the user can set <c>backup-id</c> on the backup, so the
+        /// reported id is resolved the same way the report module resolves it rather than assumed.
+        /// </summary>
+        /// <param name="databaseConnection">The database connection</param>
+        /// <param name="backup">The backup</param>
+        /// <returns>The backup id as it appears in the backup's reports</returns>
+        public static string GetReportedBackupId(Connection databaseConnection, Serialization.Interface.IBackup backup)
+        {
+            var options = ApplyOptions(databaseConnection, backup, GetCommonOptions(databaseConnection), out var url);
+            return ResolveReportedBackupId(options, url);
+        }
+
+        /// <summary>
+        /// Resolves the backup id from the options of a backup, as the report module does
+        /// </summary>
+        /// <param name="options">The options of the backup</param>
+        /// <param name="url">The target url of the backup</param>
+        /// <returns>The backup id as it appears in the backup's reports</returns>
+        private static string ResolveReportedBackupId(Dictionary<string, string?> options, string url)
+        {
+            var configured = options.GetValueOrDefault("backup-id");
+            return string.IsNullOrWhiteSpace(configured)
+                ? Library.Utility.Utility.CalculateBackupId(url)
+                : configured;
+        }
+
+        /// <summary>
+        /// Gets the restore test interval the remote controller requested for a backup: the one it sent for the
+        /// backup, otherwise the default it sent for every backup it did not name
+        /// </summary>
+        /// <param name="databaseConnection">The database connection</param>
+        /// <param name="reportedBackupId">The backup id as it appears in the backup's reports</param>
+        /// <returns>The interval as a timespan string, or null when the remote controller sent none</returns>
+        internal static string? GetRemoteControlRestoreTestInterval(Connection databaseConnection, string reportedBackupId)
+        {
+            var intervals = databaseConnection.ApplicationSettings.RemoteControlRestoreTestIntervals;
+            if (string.IsNullOrWhiteSpace(intervals))
+                return null;
+
+            Dictionary<string, string>? perBackup;
+            try
+            {
+                perBackup = JsonSerializer.Deserialize<Dictionary<string, string>>(intervals);
+            }
+            catch (Exception ex)
+            {
+                Library.Logging.Log.WriteWarningMessage(LOGTAG, "InvalidRestoreTestIntervals", ex, "Ignoring invalid restore test intervals: {0}", intervals);
+                return null;
+            }
+
+            if (perBackup == null)
+                return null;
+
+            // An empty reported id would otherwise pick up the default under its own name
+            if (!string.IsNullOrEmpty(reportedBackupId) && perBackup.TryGetValue(reportedBackupId, out var interval))
+                return interval;
+
+            return perBackup.GetValueOrDefault(DefaultRestoreTestIntervalBackupId);
+        }
+
+        internal static Dictionary<string, string?> ApplyOptions(Connection databaseConnection, Serialization.Interface.IBackup backup, Dictionary<string, string?> options, out string url)
+        {
+            url = backup.TargetURL;
+            options["backup-name"] = backup.Name;
+            options["dbpath"] = backup.DBPath;
+            options["backup-id"] = $"{ReportBackupIdPrefix}{backup.ID}";
+
+            // Apply normal options
+            foreach (var o in backup.Settings)
+                if (!o.Name.StartsWith("--", StringComparison.Ordinal) && TestIfOptionApplies())
+                    options[o.Name] = o.Value;
+
+            // Apply override options
+            foreach (var o in backup.Settings)
+                if (o.Name.StartsWith("--", StringComparison.Ordinal) && TestIfOptionApplies())
+                    options[o.Name.Substring(2)] = o.Value;
+
+            // Enable metadata storage if any of the backup's sources require it,
+            // even if the current operation is not a backup
+            var sources =
+                (from n in backup.Sources
+                 let p = SpecialFolders.ExpandEnvironmentVariables(n)
+                 where !string.IsNullOrWhiteSpace(p)
+                 select p).ToArray();
+            Library.Main.Operation.Common.SourceProviderFactory.EnableMetadataStorageIfRequiredBySources(sources, options);
+
+            // The filters must match the source in every operation, so the same applies to their case-sensitivity
+            Library.Main.Operation.Common.SourceProviderFactory.EnableCaseSensitiveFiltersIfRequiredBySources(sources, options);
+
+            // The server hangs if the module is enabled as there is no console attached
+            DisableModule("console-password-input", options);
+
+            // When the machine processes confidential or protected information, every report leaving it carries message ids only.
+            // The setting is applied by the server, so a per-backup value cannot switch it off.
+            if (databaseConnection.ApplicationSettings.IsReducedReportingActive)
+                options[Library.Logging.ReducedReportFormat.OPTION_REDUCED_REPORTING] = "true";
+
+            // Patch in additional report urls
+            var additionalReportUrl = databaseConnection.ApplicationSettings.AdditionalReportUrl;
+            if (!string.IsNullOrWhiteSpace(additionalReportUrl))
+            {
+                options["send-http-json-urls"] = string.Join(";",
+                    new[] {
+                        options.GetValueOrDefault("send-http-json-urls"),
+                        additionalReportUrl
+                    }.Where(x => !string.IsNullOrWhiteSpace(x))
+                );
+
+                // The additional report url gets reports for the operations the remote controller accepts.
+                // A controller that has not said accepts backup reports only.
+                options["send-http-operations"] = string.Join(",",
+                    new[] { options.GetValueOrDefault("send-http-operations") }
+                    .Concat(GetRemoteControlReportOperations(databaseConnection))
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .SelectMany(x => x!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                );
+            }
+
+            // Patch in additional activity urls
+            var additionalActivityUrl = databaseConnection.ApplicationSettings.AdditionalActivityUrl;
+            if (!string.IsNullOrWhiteSpace(additionalActivityUrl))
+            {
+                options["http-report-status-url"] = string.Join(";",
+                    new[] {
+                        options.GetValueOrDefault("http-report-status-url"),
+                        additionalActivityUrl
+                    }.Where(x => !string.IsNullOrWhiteSpace(x))
+                );
+            }
+
+            url = ApplyDuplicatiStorageCredentials(databaseConnection, url);
+
+            // Patch in the restore test interval, unless the user has set one. The backup is known to the
+            // remote controller by its reported id, which the backup settings applied above may have changed,
+            // so this runs once the url is final.
+            var restoreTestInterval = GetRemoteControlRestoreTestInterval(databaseConnection, ResolveReportedBackupId(options, url));
+            if (!string.IsNullOrWhiteSpace(restoreTestInterval) && string.IsNullOrWhiteSpace(options.GetValueOrDefault("perform-restore-test-after")))
+            {
+                try
+                {
+                    if (Library.Utility.Timeparser.ParseTimeSpan(restoreTestInterval) > TimeSpan.Zero)
+                        options["perform-restore-test-after"] = restoreTestInterval;
+                }
+                catch (Exception ex)
+                {
+                    Library.Logging.Log.WriteWarningMessage(LOGTAG, "InvalidRestoreTestInterval", ex, "Ignoring invalid restore test interval: {0}", restoreTestInterval);
+                }
+            }
+
+            return options;
+        }
+
+        private static Library.Utility.IFilter? ApplyFilter(IBackup backup, Library.Utility.IFilter? filter)
+        {
+            var f2 = backup.Filters;
+            if (f2 != null && f2.Length > 0)
+            {
+                var nf =
+                    (from n in f2
+                     let exp =
+                         n.Expression.StartsWith("[", StringComparison.Ordinal) && n.Expression.EndsWith("]", StringComparison.Ordinal)
+                         ? SpecialFolders.ExpandEnvironmentVariablesRegexp(n.Expression)
+                         : SpecialFolders.ExpandEnvironmentVariables(n.Expression)
+                     orderby n.Order
+                     select (Library.Utility.IFilter)new FilterExpression(exp, n.Include))
+                    .Aggregate((a, b) => FilterExpression.Combine(a, b));
+
+                filter = FilterExpression.Combine(filter, nf);
+            }
+
+            return filter;
+        }
+
+        public static Dictionary<string, string?> GetCommonOptions(Connection databaseConnection)
+        {
+            return
+                (from n in databaseConnection.Settings
+                 where TestIfOptionApplies()
+                 select n).ToDictionary(k => k.Name.StartsWith("--", StringComparison.Ordinal) ? k.Name.Substring(2) : k.Name, k => (string?)k.Value);
+        }
+
+        private static Library.Utility.IFilter? GetCommonFilter(Connection databaseConnection)
+        {
+            var filters = databaseConnection.Filters;
+            if (filters == null || filters.Length == 0)
+                return null;
+
+            return
+                (from n in filters
+                 orderby n.Order
+                 let exp = Environment.ExpandEnvironmentVariables(n.Expression)
+                 select (Library.Utility.IFilter)new FilterExpression(exp, n.Include))
+                .Aggregate((a, b) => FilterExpression.Combine(a, b));
+        }
+    }
+}
+

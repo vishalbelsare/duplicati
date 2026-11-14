@@ -1,9 +1,27 @@
-﻿using Duplicati.Library.Interface;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+using Duplicati.Library.Interface;
 using System;
-using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace Duplicati.Library.Backend.Storj
 {
@@ -16,14 +34,17 @@ namespace Duplicati.Library.Backend.Storj
         public DateTime LastAccess { get; set; }
 
         public DateTime LastModification { get; set; }
+        public DateTime Created { get; set; }
 
         public string Name { get; set; }
 
         public long Size { get; set; }
 
+        public bool IsArchived => false;
+
         public StorjFile()
         {
-
+            Name = string.Empty;
         }
 
         public StorjFile(uplink.NET.Models.Object tardigradeObject)
@@ -32,7 +53,7 @@ namespace Duplicati.Library.Backend.Storj
             var lastAccess = tardigradeObject.CustomMetadata.Entries.Where(e => e.Key == STORJ_LAST_ACCESS).FirstOrDefault();
             if (lastAccess != null && !string.IsNullOrEmpty(lastAccess.Value))
             {
-                LastAccess = DateTime.Parse(lastAccess.Value);
+                LastAccess = ParseTimestamp(lastAccess.Value);
             }
             else
             {
@@ -42,7 +63,7 @@ namespace Duplicati.Library.Backend.Storj
             var lastMod = tardigradeObject.CustomMetadata.Entries.Where(e => e.Key == STORJ_LAST_MODIFICATION).FirstOrDefault();
             if (lastMod != null && !string.IsNullOrEmpty(lastMod.Value))
             {
-                LastModification = DateTime.Parse(lastMod.Value);
+                LastModification = ParseTimestamp(lastMod.Value);
             }
             else
             {
@@ -52,5 +73,15 @@ namespace Duplicati.Library.Backend.Storj
             Name = tardigradeObject.Key;
             Size = tardigradeObject.SystemMetadata.ContentLength;
         }
+
+        /// <summary>
+        /// Parses a timestamp stored in the custom metadata, written by the backend as a round-trip
+        /// value in UTC such as "2026-07-15T12:00:00.0000000Z". The result is in UTC, so it compares
+        /// correctly against the timestamps of other backends.
+        /// </summary>
+        /// <param name="timestamp">The stored timestamp value.</param>
+        /// <returns>The timestamp in UTC.</returns>
+        private static DateTime ParseTimestamp(string timestamp)
+            => DateTime.Parse(timestamp, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
     }
 }

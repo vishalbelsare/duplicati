@@ -1,25 +1,33 @@
-//  Copyright (C) 2015, The Duplicati Team
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
 
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#nullable enable
+
 using System;
 using System.Linq;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using System.Globalization;
+using System.Diagnostics.CodeAnalysis;
+using System.Threading;
 
 namespace Duplicati.Library.Utility
 {
@@ -67,41 +75,56 @@ namespace Duplicati.Library.Utility
             /// <summary>
             /// The filter string
             /// </summary>
-            public readonly string Filter;
+            public readonly string? Filter;
             /// <summary>
             /// The regular expression version of the filter
             /// </summary>
-            public readonly Regex Regexp;
-            
+            public readonly Regex? Regexp;
             /// <summary>
-            /// The single wildcard character (DOS style)
+            /// The filter string with the casing it was written with,
+            /// where <see cref="Filter"/> is upper-cased for a wildcard filter that ignores case
+            /// </summary>
+            private readonly string? Original;
+            /// <summary>
+            /// A value indicating if the filter tells paths apart by their casing
+            /// </summary>
+            public readonly bool CaseSensitive;
+
+            /// <summary>
+            /// The single wildcard character
             /// </summary>
             private const char SINGLE_WILDCARD = '?';
             /// <summary>
-            /// The multiple wildcard character (DOS style)
+            /// The multiple wildcard character
             /// </summary>
             private const char MULTIPLE_WILDCARD = '*';
 
             /// <summary>
-            /// The regular expression flags
+            /// Gets the regular expression flags
             /// </summary>
-            private static readonly RegexOptions REGEXP_OPTIONS =
-                RegexOptions.Compiled |
-                RegexOptions.ExplicitCapture |
-                (Utility.IsFSCaseSensitive ? RegexOptions.None : RegexOptions.IgnoreCase) |
-                RegexOptions.Singleline;
+            /// <param name="caseSensitive">A value indicating if the expression tells paths apart by their casing</param>
+            /// <returns>The regular expression flags</returns>
+            private static RegexOptions GetRegexOptions(bool caseSensitive)
+                => RegexOptions.Compiled |
+                    RegexOptions.ExplicitCapture |
+                    (caseSensitive ? RegexOptions.None : RegexOptions.IgnoreCase) |
+                    RegexOptions.Singleline;
 
             // Since we might need to get the regex for a particular filter group multiple times
             // (e.g., when combining multiple FilterExpressions together, which discards the existing FilterEntries and recreates them from the Filter representations),
             // and since they don't change (and compiling them isn't a super cheap operation), we keep a cache of the ones we've built for re-use.
-            private static readonly Dictionary<FilterGroup, Regex> filterGroupRegexCache = new Dictionary<FilterGroup, Regex>();
+            private static readonly Dictionary<(FilterGroup Group, bool CaseSensitive), Regex> filterGroupRegexCache = new Dictionary<(FilterGroup Group, bool CaseSensitive), Regex>();
 
             /// <summary>
             /// Initializes a new instance of the <see cref="T:Duplicati.Library.Utility.FilterExpression.FilterEntry"/> struct.
             /// </summary>
             /// <param name="filter">The filter string to use.</param>
-            public FilterEntry(string filter)
+            /// <param name="caseSensitive">A value indicating if the filter tells paths apart by their casing</param>
+            public FilterEntry(string? filter, bool caseSensitive)
             {
+                this.CaseSensitive = caseSensitive;
+                var regexOptions = GetRegexOptions(caseSensitive);
+
                 if (string.IsNullOrEmpty(filter))
                 {
                     this.Type = FilterType.Empty;
@@ -112,13 +135,20 @@ namespace Duplicati.Library.Utility
                 {
                     this.Type = FilterType.Regexp;
                     this.Filter = filter.Substring(1, filter.Length - 2);
-                    this.Regexp = new Regex(this.Filter, REGEXP_OPTIONS);
+                    if (Filter.StartsWith("^") && Filter.EndsWith("$"))
+                    {
+                        this.Regexp = new Regex(this.Filter, regexOptions);
+                    }
+                    else
+                    {
+                        this.Regexp = new Regex("^(" + this.Filter + ")$", regexOptions);
+                    }
                 }
                 else if (filter.StartsWith("{", StringComparison.Ordinal) && filter.EndsWith("}", StringComparison.Ordinal))
                 {
                     this.Type = FilterType.Group;
                     this.Filter = filter.Substring(1, filter.Length - 2);
-                    this.Regexp = GetFilterGroupRegex(this.Filter);
+                    this.Regexp = GetFilterGroupRegex(this.Filter, caseSensitive);
                 }
                 else if (filter.StartsWith("@", StringComparison.Ordinal))
                 {
@@ -126,26 +156,30 @@ namespace Duplicati.Library.Utility
                     // characters as globbing characters
                     this.Type = FilterType.Simple;
                     this.Filter = filter.Substring(1);
-                    this.Regexp = new Regex(Utility.ConvertLiteralToRegExp(this.Filter), REGEXP_OPTIONS);
+                    this.Regexp = new Regex(Utility.ConvertLiteralToRegExp(this.Filter), regexOptions);
                 }
                 else
                 {
                     this.Type = (filter.Contains(MULTIPLE_WILDCARD) || filter.Contains(SINGLE_WILDCARD)) ? FilterType.Wildcard : FilterType.Simple;
-                    this.Filter = (!Utility.IsFSCaseSensitive && this.Type == FilterType.Wildcard) ? filter.ToUpper(CultureInfo.InvariantCulture) : filter;
-                    this.Regexp = new Regex(Utility.ConvertGlobbingToRegExp(filter), REGEXP_OPTIONS);
+                    this.Filter = (!caseSensitive && this.Type == FilterType.Wildcard) ? filter.ToUpper(CultureInfo.InvariantCulture) : filter;
+                    this.Regexp = new Regex(Utility.ConvertGlobbingToRegExp(filter), regexOptions);
+                    this.Original = filter;
+                    return;
                 }
+
+                this.Original = this.Filter;
             }
 
             /// <summary>
             /// Gets the regex that represents the given filter group
             /// </summary>
             /// <param name="filterGroupName">Filter group name</param>
+            /// <param name="caseSensitive">A value indicating if the regex tells paths apart by their casing</param>
             /// <returns>Group regex</returns>
-            private static Regex GetFilterGroupRegex(string filterGroupName)
+            private static Regex GetFilterGroupRegex(string filterGroupName, bool caseSensitive)
             {
                 FilterGroup filterGroup = FilterGroups.ParseFilterList(filterGroupName, FilterGroup.None);
-                Regex result;
-                if (FilterEntry.filterGroupRegexCache.TryGetValue(filterGroup, out result))
+                if (FilterEntry.filterGroupRegexCache.TryGetValue((filterGroup, caseSensitive), out var result))
                 {
                     return result;
                 }
@@ -181,14 +215,14 @@ namespace Duplicati.Library.Utility
                         regexString = "(" + string.Join(")|(", regexStrings) + ")";
                     }
 
-                    result = new Regex(regexString, REGEXP_OPTIONS);
+                    result = new Regex("^(" + regexString + ")$", GetRegexOptions(caseSensitive));
 
-                    FilterEntry.filterGroupRegexCache[filterGroup] = result;
+                    FilterEntry.filterGroupRegexCache[(filterGroup, caseSensitive)] = result;
 
                     return result;
                 }
             }
-            
+
             /// <summary>
             /// Tests whether specified string can be matched against provided pattern string. Pattern may contain single- and multiple-replacing
             /// wildcard characters.
@@ -211,7 +245,7 @@ namespace Duplicati.Library.Utility
                     inputPos++;
                     patternPos++;
                 }
-                
+
                 // Push this position to stack if it points to end of pattern or to a general wildcard
                 if (patternPos == pattern.Length || pattern[patternPos] == MULTIPLE_WILDCARD)
                 {
@@ -232,10 +266,10 @@ namespace Duplicati.Library.Utility
                     if (inputPos == input.Length && (patternPos == pattern.Length || (patternPos == pattern.Length - 1 && pattern[patternPos] == MULTIPLE_WILDCARD)))
                         matched = true;     // Reached end of both pattern and input string, hence matching is successful
                     else
-                    {   
+                    {
                         // First character in next pattern block is guaranteed to be multiple wildcard
                         // So skip it and search for all matches in value string until next multiple wildcard character is reached in pattern
-                        for(int curInputStart = inputPos; curInputStart < input.Length; curInputStart++)
+                        for (int curInputStart = inputPos; curInputStart < input.Length; curInputStart++)
                         {
                             int curInputPos = curInputStart;
                             int curPatternPos = patternPos + 1;
@@ -255,7 +289,7 @@ namespace Duplicati.Library.Utility
                             // If we have reached next multiple wildcard character in pattern without breaking the matching sequence, then we have another candidate for full match
                             // This candidate should be pushed to stack for further processing
                             // At the same time, pair (input position, pattern position) will be marked as tested, so that it will not be pushed to stack later again
-                            if (((curPatternPos == pattern.Length && curInputPos == input.Length) || (curPatternPos < pattern.Length && pattern[curPatternPos] == MULTIPLE_WILDCARD)) 
+                            if (((curPatternPos == pattern.Length && curInputPos == input.Length) || (curPatternPos < pattern.Length && pattern[curPatternPos] == MULTIPLE_WILDCARD))
                                 && !pointTested[curInputPos, curPatternPos])
                             {
                                 pointTested[curInputPos, curPatternPos] = true;
@@ -267,7 +301,7 @@ namespace Duplicati.Library.Utility
                 }
                 return matched;
             }
-            
+
             /// <summary>
             /// Gets a value indicating if the filter matches the path
             /// </summary>
@@ -277,19 +311,19 @@ namespace Duplicati.Library.Utility
                 switch (this.Type)
                 {
                     case FilterType.Simple:
-                        return string.Equals(this.Filter, path, Library.Utility.Utility.ClientFilenameStringComparison);
+                        return string.Equals(this.Filter, path, this.CaseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
                     case FilterType.Wildcard:
-                        return IsWildcardMatch(!Utility.IsFSCaseSensitive ? path.ToUpper(CultureInfo.InvariantCulture) : path, this.Filter);
+                        return IsWildcardMatch(!this.CaseSensitive ? path.ToUpper(CultureInfo.InvariantCulture) : path, this.Filter!);
                     case FilterType.Regexp:
                     case FilterType.Group:
-                        var m = this.Regexp.Match(path);
+                        var m = this.Regexp!.Match(path);
                         return m.Success && m.Length == path.Length;
                     default:
-                        return false;                            
+                        return false;
                 }
             }
 
-            public override string ToString()
+            public override string? ToString()
             {
                 switch (this.Type)
                 {
@@ -300,16 +334,84 @@ namespace Duplicati.Library.Utility
                     case FilterType.Simple:
                         return "@" + this.Filter;
                     default:
-                        return this.Filter;
+                        // The casing the filter was written with, so the string gives
+                        // the same filter back, also when it is read as case-sensitive
+                        return this.Original;
                 }
             }
         }
-    
+
+        /// <summary>
+        /// The case-sensitivity that applies to filters created in the current operation,
+        /// or <c>null</c> to use the case-sensitivity of the client filesystem
+        /// </summary>
+        private static readonly AsyncLocal<bool?> s_scopedCaseSensitivity = new AsyncLocal<bool?>();
+
+        /// <summary>
+        /// Gets the case-sensitivity used for a filter that is created without stating one.
+        /// This is the case-sensitivity of the client filesystem, unless the filter is created
+        /// inside a scope started with <see cref="StartCaseSensitivityScope(bool)"/>.
+        /// </summary>
+        public static bool DefaultCaseSensitive => s_scopedCaseSensitivity.Value ?? Utility.IsFSCaseSensitive;
+
+        /// <summary>
+        /// Sets the case-sensitivity used for the filters created in the current operation,
+        /// including the code it calls and awaits, until the returned instance is disposed.
+        /// </summary>
+        /// <param name="caseSensitive">A value indicating if filters tell paths apart by their casing</param>
+        /// <returns>An instance that restores the previous setting when disposed</returns>
+        public static IDisposable StartCaseSensitivityScope(bool caseSensitive)
+        {
+            var previous = s_scopedCaseSensitivity.Value;
+            s_scopedCaseSensitivity.Value = caseSensitive;
+            return new CaseSensitivityScope(previous);
+        }
+
+        /// <summary>
+        /// Restores the case-sensitivity that applied before a scope was started
+        /// </summary>
+        /// <param name="previous">The setting to restore</param>
+        private sealed class CaseSensitivityScope(bool? previous) : IDisposable
+        {
+            /// <inheritdoc />
+            public void Dispose() => s_scopedCaseSensitivity.Value = previous;
+        }
+
+        /// <summary>
+        /// Returns a filter that matches the same expressions with the given case-sensitivity
+        /// </summary>
+        /// <param name="filter">The filter to convert</param>
+        /// <param name="caseSensitive">A value indicating if the filter tells paths apart by their casing</param>
+        /// <returns>The filter with the given case-sensitivity; the same instance if nothing changes</returns>
+        [return: NotNullIfNotNull("filter")]
+        public static IFilter? WithCaseSensitivity(IFilter? filter, bool caseSensitive)
+        {
+            if (filter is FilterExpression expression)
+            {
+                if (expression.m_filters == null || expression.CaseSensitive == caseSensitive)
+                    return expression;
+
+                return new FilterExpression(expression.m_filters.Select(x => x.ToString()).WhereNotNull(), expression.Result, caseSensitive);
+            }
+
+            if (filter is JoinedFilterExpression joined)
+            {
+                var first = WithCaseSensitivity(joined.First, caseSensitive);
+                var second = WithCaseSensitivity(joined.Second, caseSensitive);
+                if (ReferenceEquals(first, joined.First) && ReferenceEquals(second, joined.Second))
+                    return joined;
+
+                return new JoinedFilterExpression(first, second);
+            }
+
+            return filter;
+        }
+
         /// <summary>
         /// The internal list of expressions
         /// </summary>
-        private readonly List<FilterEntry> m_filters;
-    
+        private readonly List<FilterEntry>? m_filters;
+
         /// <summary>
         /// Gets the type of the filter
         /// </summary>
@@ -319,6 +421,11 @@ namespace Duplicati.Library.Utility
         /// Gets the result returned if an entry matches
         /// </summary>        
         public readonly bool Result;
+
+        /// <summary>
+        /// Gets a value indicating if the filter tells paths apart by their casing
+        /// </summary>
+        public readonly bool CaseSensitive;
 
         /// <summary>
         /// Gets a value indicating whether this <see cref="FilterExpression"/> is empty.
@@ -337,13 +444,13 @@ namespace Duplicati.Library.Utility
             else
                 throw new InvalidOperationException($"Cannot extract simple list when the type is: {this.Type}");
         }
-        
+
         /// <summary>
         /// Gets a value indicating if the filter matches the path
         /// </summary>
         /// <param name="result">The match result</param>
         /// <param name="match">The filter that matched</param>
-        public bool Matches(string path, out bool result, out IFilter match)
+        public bool Matches(string path, out bool result, out IFilter? match)
         {
             result = false;
             if (this.Type == FilterType.Empty)
@@ -351,14 +458,14 @@ namespace Duplicati.Library.Utility
                 match = null;
                 return false;
             }
-            
-            if (m_filters.Any(x => x.Matches(path)))
+
+            if (m_filters != null && m_filters.Any(x => x.Matches(path)))
             {
                 match = this;
                 result = this.Result;
                 return true;
             }
-            
+
             match = null;
             return false;
         }
@@ -367,75 +474,116 @@ namespace Duplicati.Library.Utility
         public string GetFilterHash()
         {
             var hash = MD5HashHelper.GetHash(m_filters?.Select(x => x.Filter));
-			return Utility.ByteArrayAsHexString(hash);
+            return Utility.ByteArrayAsHexString(hash);
         }
 
         /// <summary>
         /// Creates a new <see cref="FilterExpression"/> instance, representing an empty filter.
         /// </summary>
         public FilterExpression()
-            : this((IEnumerable<string>)null, true)
+            : this((IEnumerable<string>?)null, true)
         {
         }
 
         /// <summary>
-        /// Creates a new <see cref="FilterExpression"/> instance.
+        /// Creates a new <see cref="FilterExpression"/> instance from a single filter string.
         /// </summary>
         /// <param name="filter">The filter string that represents the filter</param>
         public FilterExpression(string filter, bool result = true)
-            : this(Expand(filter), result)
+            : this([filter], result)
         {
         }
 
         /// <summary>
-        /// Creates a new <see cref="FilterExpression"/> instance.
+        /// Creates a new <see cref="FilterExpression"/> instance from one or more filter strings.
+        /// </summary>
+        /// <param name="filter">The filter strings that represent the filter</param>
+        /// <param name="result">Return value of <see cref="Matches(string,out bool,out IFilter)"/> in case of match</param>
+        public FilterExpression(IEnumerable<string>? filter, bool result = true)
+            : this(filter, result, DefaultCaseSensitive)
+        {
+        }
+
+        /// <summary>
+        /// Creates a new <see cref="FilterExpression"/> instance from a single filter string.
         /// </summary>
         /// <param name="filter">The filter string that represents the filter</param>
         /// <param name="result">Return value of <see cref="Matches(string,out bool,out IFilter)"/> in case of match</param>
-        public FilterExpression(IEnumerable<string> filter, bool result = true)
+        /// <param name="caseSensitive">A value indicating if the filter tells paths apart by their casing</param>
+        public FilterExpression(string filter, bool result, bool caseSensitive)
+            : this([filter], result, caseSensitive)
+        {
+        }
+
+        /// <summary>
+        /// Creates a new <see cref="FilterExpression"/> instance from one or more filter strings.
+        /// </summary>
+        /// <param name="filter">The filter strings that represent the filter</param>
+        /// <param name="result">Return value of <see cref="Matches(string,out bool,out IFilter)"/> in case of match</param>
+        /// <param name="caseSensitive">A value indicating if the filter tells paths apart by their casing</param>
+        public FilterExpression(IEnumerable<string>? filter, bool result, bool caseSensitive)
         {
             this.Result = result;
-            
+            this.CaseSensitive = caseSensitive;
+
+            filter = ExpandFilterGroups(filter);
+
             if (filter == null)
             {
                 this.Type = FilterType.Empty;
                 return;
             }
-            
+
             m_filters = Compact(
-                (from n in filter
-                let nx = new FilterEntry(n)
-                where nx.Type != FilterType.Empty
-                select nx)
+                filter
+                    .Select(x => new FilterEntry(x, caseSensitive))
+                    .Where(x => x.Type != FilterType.Empty),
+                caseSensitive
             );
-            
+
             if (m_filters.Count == 0)
                 this.Type = FilterType.Empty;
             else
                 this.Type = m_filters.Max((a) => a.Type);
         }
-        
-        private static IEnumerable<string> Expand(string filter)
+
+        /// <summary>
+        /// Expands any <c>{GroupName}</c> entries in <paramref name="filters"/> into the underlying
+        /// filter strings provided by <see cref="FilterGroups.GetFilterStrings(FilterGroup)"/>.
+        /// </summary>
+        /// <param name="filters">The raw filter strings to inspect. May be <see langword="null"/>.</param>
+        /// <returns>
+        /// A new sequence with group references replaced by their constituent filter strings, or
+        /// <see langword="null"/> when <paramref name="filters"/> is <see langword="null"/> or all
+        /// entries are empty/whitespace and/or reference unknown groups.
+        /// </returns>
+        private static IEnumerable<string>? ExpandFilterGroups(IEnumerable<string>? filters)
         {
-            if (string.IsNullOrWhiteSpace(filter))
+            if (filters == null)
                 return null;
 
-            if (filter.Length < 2 || (filter.StartsWith("[", StringComparison.Ordinal) && filter.EndsWith("]", StringComparison.Ordinal)))
+            var result = new List<string>();
+            foreach (var f in filters)
             {
-                return new string[] { filter };
-            }
+                if (string.IsNullOrWhiteSpace(f))
+                    continue;
 
-            if (filter.StartsWith("{", StringComparison.Ordinal) && filter.EndsWith("}", StringComparison.Ordinal))
-            {
-                string groupName = filter.Substring(1, filter.Length - 2);
-                FilterGroup filterGroup = FilterGroups.ParseFilterList(groupName, FilterGroup.None);
-                return (filterGroup == FilterGroup.None) ? null : FilterGroups.GetFilterStrings(filterGroup);
+                if (f.StartsWith("{", StringComparison.Ordinal) && f.EndsWith("}", StringComparison.Ordinal))
+                {
+                    string groupName = f.Substring(1, f.Length - 2);
+                    FilterGroup filterGroup = FilterGroups.ParseFilterList(groupName, FilterGroup.None);
+                    if (filterGroup != FilterGroup.None)
+                        result.AddRange(FilterGroups.GetFilterStrings(filterGroup));
+                }
+                else
+                {
+                    result.Add(f);
+                }
             }
-
-            return filter.Split(new char[] { System.IO.Path.PathSeparator }, StringSplitOptions.RemoveEmptyEntries);
+            return result.Count > 0 ? result : null;
         }
-        
-        private static List<FilterEntry> Compact(IEnumerable<FilterEntry> items)
+
+        private static List<FilterEntry> Compact(IEnumerable<FilterEntry> items, bool caseSensitive)
         {
             var r = new List<FilterEntry>();
             System.Text.StringBuilder combined = new System.Text.StringBuilder();
@@ -448,7 +596,7 @@ namespace Duplicati.Library.Utility
                     // since that would make their names much more difficult to interpret on the command line.
                     if (f.Type == FilterType.Simple || f.Type == FilterType.Wildcard || f.Type == FilterType.Group)
                         r.Add(f);
-                    else if (f.Type != FilterType.Empty)
+                    else if (f.Type != FilterType.Empty && f.Regexp != null)
                     {
                         combined.Append(f.Regexp.ToString());
                         first = true;
@@ -458,7 +606,7 @@ namespace Duplicati.Library.Utility
                 {
                     if (f.Type == FilterType.Simple || f.Type == FilterType.Wildcard || f.Type == FilterType.Group)
                     {
-                        r.Add(new FilterEntry("[" + combined.Append("]")));
+                        r.Add(new FilterEntry("[" + combined.Append("]"), caseSensitive));
                         r.Add(f);
                         combined.Clear();
                     }
@@ -476,9 +624,9 @@ namespace Duplicati.Library.Utility
             }
 
             if (combined.Length > 0)
-                r.Add(new FilterEntry("[" + combined.Append("]")));
+                r.Add(new FilterEntry("[" + combined.Append("]"), caseSensitive));
 
-            return r;                    
+            return r;
         }
 
         /// <summary>
@@ -507,16 +655,16 @@ namespace Duplicati.Library.Utility
         /// <param name="filter">The filter to examine</param>
         /// <param name="includes">True if the filter contains includes, false otherwise.</param>
         /// <param name="excludes">True if the filter contains excludes, false otherwise.</param>
-        public static void AnalyzeFilters(IFilter filter, out bool includes, out bool excludes)
+        public static void AnalyzeFilters(IFilter? filter, out bool includes, out bool excludes)
         {
             includes = false;
             excludes = false;
 
-            Tuple<bool, bool> cacheLookup = null;
+            Tuple<bool, bool>? cacheLookup = null;
 
             // Check for cached results
             if (filter != null)
-                lock(_matchLock)
+                lock (_matchLock)
                     if (_matchFallbackLookup.TryGetValue(filter, out cacheLookup))
                     {
                         includes = cacheLookup.Item1;
@@ -526,7 +674,7 @@ namespace Duplicati.Library.Utility
             // Figure out what components are in the filter
             if (cacheLookup == null)
             {
-                var q = new Queue<IFilter>();
+                var q = new Queue<IFilter?>();
                 q.Enqueue(filter);
 
                 while (q.Count > 0)
@@ -549,13 +697,90 @@ namespace Duplicati.Library.Utility
                 }
 
                 // Populate the cache
-                lock(_matchLock)
+                lock (_matchLock)
                 {
                     if (_matchFallbackLookup.Count > 10)
                         _matchFallbackLookup.Remove(_matchFallbackLookup.Keys.Skip(new Random().Next(0, _matchFallbackLookup.Count)).First());
-                    _matchFallbackLookup[filter] = new Tuple<bool, bool>(includes, excludes);
+                    if (filter != null)
+                        _matchFallbackLookup[filter] = new Tuple<bool, bool>(includes, excludes);
                 }
             }
+        }
+
+        /// <summary>
+        /// Checks if the filter has an "exclude everything" rule (e.g. <c>*</c>) that
+        /// appears before any include rules in the evaluation order, which would cause
+        /// all files to be excluded regardless of later includes. This is typically a
+        /// misconfiguration.
+        /// </summary>
+        /// <param name="filter">The filter to examine</param>
+        /// <returns>
+        /// <c>true</c> if an exclude-all rule is encountered before any include rule
+        /// in the filter's evaluation order; <c>false</c> otherwise.
+        /// </returns>
+        public static bool IsExcludeAllBeforeIncludes(IFilter? filter)
+        {
+            return CheckExcludeAllBeforeIncludes(filter);
+        }
+
+        /// <summary>
+        /// Recursively walks the filter tree in evaluation order (First before Second
+        /// in <see cref="JoinedFilterExpression"/>). Returns <c>true</c> if an
+        /// exclude-all expression is found before any include expression.
+        /// </summary>
+        private static bool CheckExcludeAllBeforeIncludes(IFilter? filter)
+        {
+            if (filter == null || filter.Empty)
+                return false;
+
+            if (filter is FilterExpression expression)
+            {
+                if (expression.Result)
+                    return false; // Include expression — not misconfigured from here
+                else
+                    return IsExcludeAllExpression(expression); // Exclude expression — check if it matches everything
+            }
+
+            if (filter is JoinedFilterExpression joined)
+            {
+                // First is evaluated before Second (short-circuit OR).
+                // If First is an exclude-all, it swallows everything before Second can match.
+                if (CheckExcludeAllBeforeIncludes(joined.First))
+                    return true;
+
+                // If First contains includes, they are evaluated first and the
+                // exclude-all in Second is a valid default-deny, not a misconfiguration.
+                AnalyzeFilters(joined.First, out var firstHasIncludes, out _);
+                if (firstHasIncludes)
+                    return false;
+
+                // First has no includes, so check Second
+                return CheckExcludeAllBeforeIncludes(joined.Second);
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Checks if a <see cref="FilterExpression"/> with <c>Result = false</c> (exclude)
+        /// contains an entry that matches every path (e.g. <c>*</c>).
+        /// </summary>
+        private static bool IsExcludeAllExpression(FilterExpression expression)
+        {
+            if (expression.Type == FilterType.Empty || expression.m_filters == null)
+                return false;
+
+            foreach (var entry in expression.m_filters)
+            {
+                // A "*" wildcard matches every path
+                if (entry.Type == FilterType.Wildcard && entry.Filter == "*")
+                    return true;
+                // A regex that matches everything also excludes all
+                if (entry.Type == FilterType.Regexp && entry.Filter == "^(.*)$")
+                    return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -564,22 +789,19 @@ namespace Duplicati.Library.Utility
         /// <param name="filter">The filter to evaluate</param>
         /// <param name="path">The path to evaluate</param>
         /// <param name="match">The filter that matched</param>
-        public static bool Matches(IFilter filter, string path, out IFilter match)
+        public static bool Matches(IFilter filter, string path, out IFilter? match)
         {
             if (filter == null || filter.Empty)
             {
                 match = null;
                 return true;
             }
-        
-            bool result;
-            if (filter.Matches(path, out result, out match))
+
+            if (filter.Matches(path, out bool result, out match))
                 return result;
 
-            bool includes;
-            bool excludes;
 
-            AnalyzeFilters(filter, out includes, out excludes);
+            AnalyzeFilters(filter, out bool includes, out bool excludes);
             match = null;
 
             // We have only include filters, we exclude files by default
@@ -594,22 +816,22 @@ namespace Duplicati.Library.Utility
             }
 
         }
-        
+
         /// <summary>
         /// Combine the specified filter expressions.
         /// </summary>
         /// <param name="first">First.</param>
         /// <param name="second">Second.</param>
-        public static FilterExpression Combine(FilterExpression first, FilterExpression second)
+        public static FilterExpression? Combine(FilterExpression? first, FilterExpression? second)
         {
-            if (first == null || first.Empty)
+            if (first?.m_filters == null || first.Empty)
                 return second;
-            if (second == null || second.Empty)
+            if (second?.m_filters == null || second.Empty)
                 return first;
 
             if (first.Result != second.Result)
                 throw new ArgumentException("Both filters must have the same result property");
-            return new FilterExpression(first.m_filters.Union(second.m_filters).Select(x => x.ToString()), first.Result);
+            return new FilterExpression(first.m_filters.Union(second.m_filters).Select(x => x.ToString()).WhereNotNull(), first.Result, first.CaseSensitive);
         }
 
         /// <summary>
@@ -617,7 +839,7 @@ namespace Duplicati.Library.Utility
         /// </summary>
         /// <param name="first">First.</param>
         /// <param name="second">Second.</param>
-        public static IFilter Combine(IFilter first, IFilter second)
+        public static IFilter? Combine(IFilter? first, IFilter? second)
         {
             if (second == null || second.Empty)
                 return first;
@@ -638,12 +860,12 @@ namespace Duplicati.Library.Utility
         {
             if (this.Empty)
                 return "";
-            
-            return 
+
+            return
                 "(" +
                 string.Join(") || (",
                     (from n in m_filters
-                        select n.ToString())
+                     select n.ToString())
                 ) +
                 ")";
         }
@@ -652,15 +874,13 @@ namespace Duplicati.Library.Utility
         /// Serializes the filter instance into a list of strings 
         /// that can be passed to the deserialize method
         /// </summary>
-        public string[] Serialize()
+        [return: NotNullIfNotNull("m_filters")]
+        public string[]? Serialize()
         {
-            if (this.Empty)
+            if (this.Empty || m_filters == null)
                 return null;
 
-            return
-                (from n in m_filters
-                    select $"{(this.Result ? "+" : "-")}{n.ToString()}"
-                ).ToArray();
+            return m_filters.Select(n => $"{(this.Result ? "+" : "-")}{n.ToString()}").ToArray();
         }
 
         /// <summary>
@@ -671,7 +891,7 @@ namespace Duplicati.Library.Utility
         {
             if (filter == null || filter.Empty)
                 return new string[0];
-            
+
             IEnumerable<string> res = new string[0];
             var work = new Stack<IFilter>();
             work.Push(filter);
@@ -681,7 +901,7 @@ namespace Duplicati.Library.Utility
                 var f = work.Pop();
 
                 if (f is FilterExpression expression)
-                    res = res.Union(expression.Serialize());
+                    res = res.Union(expression.Serialize() ?? []);
                 else if (f is JoinedFilterExpression filterExpression)
                 {
                     work.Push(filterExpression.Second);
@@ -699,13 +919,13 @@ namespace Duplicati.Library.Utility
         /// prefixed with either minus or plus
         /// </summary>
         /// <param name="filters">The filters to deserialize from.</param>
-        public static IFilter Deserialize(string[] filters)
+        public static IFilter? Deserialize(string[] filters)
         {
             if (filters == null || filters.Length == 0)
                 return null;
 
-            IFilter res = null;
-            foreach(var n in filters) 
+            IFilter? res = null;
+            foreach (var n in filters)
             {
                 bool include;
                 if (n.StartsWith("+", StringComparison.Ordinal))
@@ -726,15 +946,18 @@ namespace Duplicati.Library.Utility
         /// </summary>
         /// <returns>The log filter.</returns>
         /// <param name="value">The filter string to parse.</param>
-        public static IFilter ParseLogFilter(string value)
+        public static IFilter ParseLogFilter(string? value)
         {
             if (string.IsNullOrWhiteSpace(value))
                 return new FilterExpression();
 
+            // A log filter matches log tags, not paths, so it is not changed by the
+            // case-sensitivity that applies to the path filters of an operation
             return value
                 .Split(new char[] { System.IO.Path.PathSeparator, ':', ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(StringToIFilter)
-                .Aggregate(FilterExpression.Combine);
+                .Select(x => WithCaseSensitivity(StringToIFilter(x), Utility.IsFSCaseSensitive))
+                .Cast<IFilter>()
+                .Aggregate((a, b) => FilterExpression.Combine(a, b)!);
         }
 
         /// <summary>

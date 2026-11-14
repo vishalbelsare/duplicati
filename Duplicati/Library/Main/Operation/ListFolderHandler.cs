@@ -1,0 +1,112 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+#nullable enable
+
+using System.Linq;
+using System.Threading.Tasks;
+using Duplicati.Library.Common.IO;
+using Duplicati.Library.Interface;
+
+namespace Duplicati.Library.Main.Operation;
+
+/// <summary>
+/// Handler for listing folder contents
+/// </summary>
+internal static class ListFolderHandler
+{
+    /// <summary>
+    /// Lists the contents of a folder in a backup fileset
+    /// </summary>
+    /// <param name="options">The options to use</param>
+    /// <param name="result">The result class</param>
+    /// <param name="folders">The folders to list</param>
+    /// <param name="offset">The offset to start listing from</param>
+    /// <param name="limit">The maximum number of entries to list</param>
+    /// <param name="extendedData">Whether to include extended data</param>
+    /// <returns>A task representing the asynchronous operation</returns>
+    public static async Task RunAsync(Options options, ListFolderResults result, string[] folders, long offset, long limit, bool extendedData)
+    {
+        if (!System.IO.File.Exists(options.Dbpath) || options.NoLocalDb)
+            throw new UserInformationException("No local database found, this operation requires a local database", "NoLocalDatabase");
+
+        await using var db = await Database.Local.LocalListDatabase.CreateAsync(options.Dbpath, null, result.TaskControl.ProgressToken)
+            .ConfigureAwait(false);
+
+        // Neither a time nor a version means the latest fileset, as the help text says;
+        // version 0 is the newest. Without this, every fileset would match.
+        var versions = options.Version;
+        if (options.Time.Ticks == 0 && (versions == null || versions.Length == 0))
+            versions = [0];
+
+        var filesetIds = await db
+            .GetFilesetIDsAsync(options.Time, versions, singleTimeMatch: true, result.TaskControl.ProgressToken)
+            .ToArrayAsync(cancellationToken: result.TaskControl.ProgressToken)
+            .ConfigureAwait(false);
+
+        if (filesetIds.Length == 0)
+            throw new UserInformationException("No filesets found", "NoFilesetsFound");
+        if (filesetIds.Length > 1)
+            throw new UserInformationException("Multiple filesets found, please specify a single version or time", "MultipleFilesetsFound");
+
+        if (folders == null || folders.Length == 0 || folders[0] == "")
+        {
+            if (folders != null && folders.Length > 1)
+                throw new UserInformationException("When no folder is specified, only one folder can be listed", "MultipleFoldersFound");
+            var rootFolders = await db
+                .GetMinimalUniquePrefixEntriesAsync(filesetIds[0], result.TaskControl.ProgressToken)
+                .ToListAsync(cancellationToken: result.TaskControl.ProgressToken)
+                .ConfigureAwait(false);
+            result.Entries = new PaginatedResults<IListFolderEntry>(0, rootFolders.Count, 1, rootFolders.Count, rootFolders);
+        }
+        else
+        {
+            // A folder is stored as a prefix with a trailing directory separator; add it so a
+            // folder given without one, as a shell user would type it, is found as well.
+            // The separator is the one of the system that made the backup, which is not this
+            // one when a backup is restored on another system, so it is taken from the path
+            var prefixes = folders.Select(x => Util.AppendDirSeparator(x, Util.GuessDirSeparator(x)));
+            var entries = await db
+                .ListFolderAsync(
+                    db.GetPrefixIdsAsync(prefixes, result.TaskControl.ProgressToken).ToBlockingEnumerable(),
+                    filesetIds[0],
+                    offset,
+                    limit,
+                    result.TaskControl.ProgressToken
+                )
+                .ConfigureAwait(false);
+
+            result.Entries = entries;
+        }
+
+        if (extendedData)
+        {
+            var coreentries = result.Entries.Items.Cast<Database.Local.LocalListDatabase.FolderEntry>().ToArray();
+            var metadata = await db.GetMetadataForFilesetIdsAsync(coreentries.Select(e => e.FileId), result.TaskControl.ProgressToken).ConfigureAwait(false);
+            for (int i = 0; i < coreentries.Length; i++)
+            {
+                if (metadata.TryGetValue(coreentries[i].FileId, out var dict))
+                    coreentries[i] = coreentries[i] with { Metadata = dict };
+            }
+            result.Entries = new PaginatedResults<IListFolderEntry>(result.Entries.Page, result.Entries.PageSize, result.Entries.TotalPages, result.Entries.TotalCount, coreentries);
+        }
+    }
+}

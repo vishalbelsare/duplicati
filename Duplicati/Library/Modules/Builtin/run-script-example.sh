@@ -11,11 +11,14 @@
 # --run-script-before-required = <filename>
 # --run-script-timeout = <time>
 # --run-script-after = <filename>
+# --run-script-post-backup = <filename>
+# --run-script-with-arguments = <boolean>
 #
-# --run-script-before = <filename>
-# Duplicati will run the script before the backup job and waits for its 
-# completion for 60 seconds (default timeout value). After a timeout a 
-# warning is logged and the backup is started.
+# --run-script-before-required = <filename>
+# Duplicati will run the script before the backup job and wait for its 
+# completion for 60 seconds (default timeout value). The backup will only be
+# run if the script completes with an allowed exit code (0, 2, or 4). 
+# A timeout or any other exit code will abort the backup.
 # The following exit codes are supported:
 #
 # - 0: OK, run operation
@@ -26,11 +29,11 @@
 # - 5: Error don't run operation
 # - other: Error don't run operation
 #
-# --run-script-before-required = <filename>
-# Duplicati will run the script before the backup job and wait for its 
-# completion for 60 seconds (default timeout value). The backup will only be
-# run if the script completes with the exit code 0. Other exit codes or a
-# timeout will cancel the backup job.
+# --run-script-before = <filename>
+# Duplicati will run the script before the backup job and waits for its 
+# completion for 60 seconds (default timeout value). After a timeout a 
+# warning is logged and the backup is started.
+# Any other exit code than 0 will be logged as a warning.
 #
 # --run-script-timeout = <time>
 # Specify a new value for the timeout. Default is 60s. Accepted values are
@@ -41,9 +44,28 @@
 # Duplicati will run the script after the backup job and wait for its 
 # completion for 60 seconds (default timeout value). After a timeout a 
 # warning is logged.
-# The same exit codes as in --run-script-before are supported, but
-# the operation will always continue (i.e. 1 => 0, 3 => 2, 5 => 4)
-# as it has already completed so stopping it during stop is useless.
+# Any other exit code than 0 will be logged as a warning.
+#
+# --run-script-post-backup = <filename>
+# Duplicati will run the script after the backup data has been written and
+# source resources (like VSS snapshots) have been released, but before the
+# remote verification is performed. This allows scripts to run at the earliest
+# point where the backup is complete but verification has not yet started.
+# This is useful for scenarios where you want to minimize the time that
+# operations are suspended or paused. The script will wait for its completion
+# for 60 seconds (default timeout value). After a timeout a warning is logged.
+# Any other exit code than 0 will be logged as a warning.
+#
+# --run-script-with-arguments = <boolean>
+# If set to true, the script path will be parsed as a command line, and the
+# arguments will be passed to the script. If set to false (default), 
+# the script path will used as a single path.
+# If you do not have spaces in your script path or arguments, simply enter 
+# it as a string:
+# Example: --run-script-before="/path/to/script.sh arg1 arg2 --option=a"
+# If you have spaces in the path or arguements, use double- or single-quotes
+# around the elements that have spaces, similar to how you would do in a shell:
+# Example: --run-script-before="\"/path to/script.sh\" \"arg1 \" arg2"
 
 
 ###############################################################################
@@ -88,8 +110,9 @@
 ###############################################################################
 
 # DUPLICATI__EVENTNAME
-# Eventname is BEFORE if invoked as --run-script-before, and AFTER if 
-# invoked as --run-script-after. This value cannot be changed by writing
+# Eventname is BEFORE if invoked as --run-script-before, AFTER if 
+# invoked as --run-script-after, and POST-BACKUP if invoked as
+# --run-script-post-backup. This value cannot be changed by writing
 # it back!
 
 # DUPLICATI__OPERATIONNAME
@@ -150,6 +173,19 @@ then
 	else
 		# This will be ignored
 		echo "Got operation \"OPERATIONNAME\", ignoring"	
+	fi
+
+elif [ "$EVENTNAME" == "POST-BACKUP" ]
+then
+	# This event is triggered after the backup data has been written and
+	# source resources (like VSS snapshots) have been released, but before
+	# the remote verification is performed. This is the earliest point where
+	# you can safely resume operations that were suspended for the backup.
+
+	if [ "$OPERATIONNAME" == "Backup" ]
+	then
+		echo "Backup data written, resuming normal operations before verification"
+		# Add your post-backup logic here, e.g., resuming services
 	fi
 
 elif [ "$EVENTNAME" == "AFTER" ]

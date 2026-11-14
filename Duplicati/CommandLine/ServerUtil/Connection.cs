@@ -1,0 +1,825 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using System.Net.Http.Json;
+using System.Text.Json;
+using Duplicati.Library.AutoUpdater;
+using Duplicati.WebserverCore.Middlewares;
+using Duplicati.WebserverCore.Services;
+
+namespace Duplicati.CommandLine.ServerUtil;
+
+/// <summary>
+/// Implementation of actions performed on the server.
+/// </summary>
+public class Connection
+{
+    /// <summary>
+    /// The reported backup data
+    /// </summary>
+    /// <param name="ID">The ID of the backup</param>
+    /// <param name="Name">The name of the backup</param>
+    /// <param name="Description">The description of the backup</param>
+    /// <param name="Metadata">The metadata of the backup</param>
+    /// <param name="Schedule">The schedule of the backup</param>
+    /// <param name="OperationType">The operation the backup performs when it runs</param>
+    public sealed record BackupEntry(
+        string ID,
+        string Name,
+        string Description,
+        Dictionary<string, string>? Metadata,
+        BackupSchedule? Schedule,
+        Server.Serialization.OperationType OperationType
+    );
+
+    /// <summary>
+    /// The schedule attached to a backup
+    /// </summary>
+    /// <param name="Time">The time when the backup runs</param>
+    /// <param name="Repeat">The </param>
+    /// <param name="LastRun"></param>
+    /// <param name="Rule"></param>
+    /// <param name="AllowedDays"></param>
+    public sealed record BackupSchedule(
+        string? Time,
+        string? Repeat,
+        string? LastRun,
+        string? Rule,
+        string[]? AllowedDays
+    );
+
+    /// <summary>
+    /// The response backup data returned from the server
+    /// </summary>
+    /// <param name="Backup">The backup details</param>
+    /// <param name="Schedule">The schedule of the backup</param>
+    private sealed record ResponseBackupEntry(ResponseBackupEntry.ResponseBackupDetailsEntry Backup, BackupSchedule? Schedule)
+    {
+        /// <summary>
+        /// The response backup details entry
+        /// </summary>
+        /// <param name="ID">The ID of the backup</param>
+        /// <param name="Name">The name of the backup</param>
+        /// <param name="Description">The description of the backup</param>
+        /// <param name="DBPath">The path to the local database</param>
+        /// <param name="Metadata">The metadata of the backup</param>
+        /// <param name="OperationType">The name of the operation type; missing from older servers</param>
+        public sealed record ResponseBackupDetailsEntry(
+            string ID,
+            string Name,
+            string? Description,
+            string? DBPath,
+            Dictionary<string, string>? Metadata,
+            string? OperationType
+        );
+
+        /// <summary>
+        /// Converts the response backup entry to a backup entry
+        /// </summary>
+        /// <returns>The backup entry</returns>
+        public BackupEntry ToBackupEntry()
+            => new BackupEntry(Backup.ID, Backup.Name, Backup.Description ?? "", Backup.Metadata, Schedule,
+                Enum.TryParse<Server.Serialization.OperationType>(Backup.OperationType, true, out var operationType)
+                    ? operationType
+                    : Server.Serialization.OperationType.Backup);
+    }
+
+    /// <summary>
+    /// The task entry
+    /// </summary>
+    /// <param name="TaskID">The ID of the task</param>
+    /// <param name="BackupID">The ID of the backup</param>
+    /// <param name="Operation">The operation of the task</param>
+    public sealed record TaskEntry(
+        long TaskID,
+        string BackupID,
+        string Operation
+    );
+
+    /// <summary>
+    /// The server state
+    /// </summary>
+    /// <param name="ActiveTask">The active task, if any</param>
+    /// <param name="ProgramState">The state of the server</param>
+    /// <param name="SchedulerQueueIds">The IDs of the tasks in the scheduler queue</param>
+    public sealed record ServerState(
+        Tuple<long, string>? ActiveTask,
+        string ProgramState,
+        IList<Tuple<long, string>> SchedulerQueueIds
+    );
+
+    /// <summary>
+    /// The stop level
+    /// </summary>
+    public enum StopLevel
+    {
+        /// <summary>
+        /// Stop after the current file
+        /// </summary>
+        AfterCurrentFile,
+        /// <summary>
+        /// Stop now
+        /// </summary>
+        StopNow,
+        /// <summary>
+        /// Stop immediately
+        /// </summary>
+        Abort
+    }
+
+    /// <summary>
+    /// The HTTP client used to connect to the server
+    /// </summary>
+    private readonly HttpClient client;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Connection"/> class
+    /// </summary>
+    private Connection(HttpClient client)
+    {
+        this.client = client;
+    }
+
+    /// <summary>
+    /// Creates the HTTP handler for requests to the server, which trusts the certificates given in the settings
+    /// and the self-signed certificate of a server whose database can be read
+    /// </summary>
+    /// <param name="settings">The settings to use for the connection</param>
+    /// <param name="console">Console messages interceptor</param>
+    /// <returns>The handler</returns>
+    private static HttpClientHandler CreateHttpHandler(Settings settings, OutputInterceptor? console)
+    {
+        var trustedCertificateHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(settings.AcceptedHostCertificate))
+            trustedCertificateHashes.UnionWith(settings.AcceptedHostCertificate.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+        // If we can read the server database and the user has not supplied any certificate
+        // hashes, discover the server's self-signed certificate hash from the local database.
+        // Don't try to look at the database if the password is already set.
+        if (string.IsNullOrWhiteSpace(settings.Password) && settings.HostUrl.Scheme == "https" && trustedCertificateHashes.Count == 0)
+        {
+            try
+            {
+                if (File.Exists(Path.Combine(DataFolderManager.GetDataFolder(DataFolderManager.AccessMode.ProbeOnly), DataFolderManager.SERVER_DATABASE_FILENAME)))
+                {
+                    var opts = new Dictionary<string, string>();
+                    if (settings.Key != null)
+                        opts["settings-encryption-key"] = settings.Key.Key;
+                    using (var dbConnection = Server.Program.GetDatabaseConnection(new ApplicationSettings(), opts, true, false))
+                    {
+                        if (dbConnection.ApplicationSettings.ServerSSLCertificate != null)
+                        {
+                            var selfSignedCertHash = dbConnection.ApplicationSettings.ServerSSLCertificate?.FirstOrDefault(x => x.HasPrivateKey)?.GetCertHashString();
+                            if (!string.IsNullOrWhiteSpace(selfSignedCertHash))
+                                trustedCertificateHashes.Add(selfSignedCertHash);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (console != null)
+                    console.AppendExceptionMessage($"Failed to read server certificate from local database: {ex.Message}");
+                else
+                    Console.WriteLine($"Failed to read server certificate from local database: {ex.Message}");
+            }
+        }
+
+        // Configure the client for requests using the shared certificate validator.
+        // The validator handles accept-all, specific hashes and the ignore-revocation-failure
+        // option in a single place, instead of each call-site replicating the logic.
+        // Only install the custom callback when the user actually requested a certificate
+        // override; otherwise leave it unset so the OS default validation (which includes
+        // revocation/CRL checks) is preserved.
+        var httpHandler = new HttpClientHandler();
+        var acceptAll = settings.Insecure || trustedCertificateHashes.Contains("*");
+        if (acceptAll || trustedCertificateHashes.Count > 0 || settings.IgnoreRevocationFailure)
+        {
+            Duplicati.Library.Utility.HttpClientHelper.ConfigureHandlerCertificateValidator(
+                httpHandler,
+                acceptAll,
+                acceptAll ? null : [.. trustedCertificateHashes],
+                settings.IgnoreRevocationFailure);
+        }
+
+        return httpHandler;
+    }
+
+    /// <summary>
+    /// Creates a client that sends a fixed bearer token, does not log in, and has no request timeout.
+    /// It is used for the MCP endpoint, where a call can wait for minutes, and with an MCP token,
+    /// which the login endpoints do not accept.
+    /// </summary>
+    /// <param name="settings">The settings to use for the connection</param>
+    /// <param name="token">The token to send</param>
+    /// <param name="console">Console messages interceptor</param>
+    /// <returns>The client</returns>
+    public static HttpClient CreateTokenClient(Settings settings, string token, OutputInterceptor? console)
+    {
+        var client = new HttpClient(CreateHttpHandler(settings, console)) { Timeout = Timeout.InfiniteTimeSpan };
+        client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+        return client;
+    }
+
+    /// <summary>
+    /// The access token this connection sends, or <c>null</c> if it has none.
+    /// Access tokens are short-lived, so a long-running caller has to connect again when it is refused.
+    /// </summary>
+    public string? AccessToken => client.DefaultRequestHeaders.Authorization?.Parameter;
+
+    /// <summary>
+    /// Connects to the server
+    /// </summary>
+    /// <param name="settings">The settings to use for the connection</param>
+    /// <param name="obtainRefreshToken">Whether to obtain a refresh token</param>
+    /// <param name="console">Console messages interceptor</param>
+    /// <returns>The connection</returns>
+    public static async Task<Connection> ConnectAsync(Settings settings, bool obtainRefreshToken = false, OutputInterceptor? console = null)
+    {
+        if (console != null)
+            console.AppendConsoleMessage($"Connecting to {settings.HostUrl}...");
+        else
+            Console.WriteLine($"Connecting to {settings.HostUrl}...");
+
+        var httpHandler = CreateHttpHandler(settings, console);
+
+        var client = new HttpClient(httpHandler)
+        {
+            BaseAddress = new Uri(settings.HostUrl + "api/v1/")
+        };
+
+        // If we already have a refresh token, try that first
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(settings.RefreshToken))
+            {
+                var (accessToken, refreshToken, refreshNonce) = await LoginWithRefreshTokenAsync(client, settings.RefreshToken, settings.RefreshNonce);
+                if (string.IsNullOrWhiteSpace(accessToken))
+                    throw new InvalidOperationException("Failed to get access token");
+                if (string.IsNullOrWhiteSpace(refreshToken))
+                    throw new InvalidOperationException("Failed to get refresh token");
+
+                (settings with { RefreshToken = refreshToken, RefreshNonce = refreshNonce }).Save(console);
+                return CreateConnectionWithClient(client, accessToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (console != null)
+                console.AppendExceptionMessage($"Failed to use refresh token: {ex.Message}");
+            else
+                Console.WriteLine($"Failed to use refresh token: {ex.Message}");
+        }
+
+        // If we can read the server database, try to create a signin token
+        // But don't try to look at the database if the password is already set.
+        if (string.IsNullOrWhiteSpace(settings.Password))
+        {
+            try
+            {
+                var opts = new Dictionary<string, string>();
+                if (settings.Key != null)
+                    opts["settings-encryption-key"] = settings.Key.Key;
+                if (File.Exists(Path.Combine(DataFolderManager.GetDataFolder(DataFolderManager.AccessMode.ProbeOnly), DataFolderManager.SERVER_DATABASE_FILENAME)))
+                {
+                    string? cfg = null;
+                    using (var connection = Server.Program.GetDatabaseConnection(new ApplicationSettings(), opts, true, false))
+                    {
+                        cfg = connection.ApplicationSettings.JWTConfig;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(cfg))
+                    {
+                        var jwtConfig = JsonSerializer.Deserialize<JWTConfig>(cfg)
+                            ?? throw new InvalidOperationException("Failed to deserialize JWTConfig");
+                        var signinjwt = new JWTTokenProvider(() => jwtConfig).CreateSigninToken("server-cli");
+
+                        var responseTask = client.PostAsync("auth/signin", JsonContent.Create(new { SigninToken = signinjwt, RememberMe = obtainRefreshToken }));
+                        var (accessToken, refreshToken, refreshNonce) = await ParseAuthResponseAsync(responseTask);
+                        if (string.IsNullOrWhiteSpace(accessToken))
+                            throw new InvalidOperationException("Failed to get access token");
+
+                        if (!string.IsNullOrWhiteSpace(refreshToken) && obtainRefreshToken)
+                            (settings with { RefreshToken = refreshToken, RefreshNonce = refreshNonce }).Save(console);
+
+                        return CreateConnectionWithClient(client, accessToken);
+                    }
+                }
+                else if (!string.IsNullOrWhiteSpace(DataFolderManager.GetDataFolder(DataFolderManager.AccessMode.ProbeOnly)))
+                {
+                    if (console != null)
+                        console.AppendConsoleMessage($"No database found in {DataFolderManager.GetDataFolder(DataFolderManager.AccessMode.ProbeOnly)}");
+                    else
+                        Console.WriteLine($"No database found in {DataFolderManager.GetDataFolder(DataFolderManager.AccessMode.ProbeOnly)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (console != null)
+                    console.AppendConsoleMessage($"Failed to obtain a signin token: {ex.Message}");
+                else
+                    Console.WriteLine($"Failed to obtain a signin token: {ex.Message}");
+            }
+        }
+
+        // Otherwise, we need a password to log in
+        try
+        {
+            // Try obtaining the password from the user
+            if (string.IsNullOrWhiteSpace(settings.Password))
+            {
+                // A password cannot be typed when the input is not a terminal, as with the mcp command, where the input carries the protocol
+                if (Console.IsInputRedirected)
+                    throw new UserReportedException("A password is needed and cannot be asked for, as the input is not a terminal. Pass it with --password, or run the login command first.");
+
+                settings = settings with { Password = Library.Utility.Utility.ReadSecretFromConsole("Enter server password: ") };
+            }
+
+            if (string.IsNullOrWhiteSpace(settings.Password))
+                throw new UserReportedException("Password is required");
+
+            var (accessToken, refreshToken, refreshNonce) = await LoginWithPasswordAsync(client, settings.Password, obtainRefreshToken);
+            if (string.IsNullOrWhiteSpace(accessToken))
+                throw new InvalidOperationException("Failed to get access token");
+
+            if (!string.IsNullOrWhiteSpace(refreshToken) && obtainRefreshToken)
+                (settings with { RefreshToken = refreshToken, RefreshNonce = refreshNonce }).Save(console);
+
+            return CreateConnectionWithClient(client, accessToken);
+        }
+        catch (Exception ex)
+        {
+            client.Dispose();
+            throw new UserReportedException($"Failed to connect to server: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// Creates the connection and adds the authorization header
+    /// </summary>
+    /// <param name="client">The HTTP client</param>
+    /// <param name="accessToken">The access token</param>
+    /// <returns>The connection</returns>
+    private static Connection CreateConnectionWithClient(HttpClient client, string accessToken)
+    {
+        client.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
+        return new Connection(client);
+    }
+
+    /// <summary>
+    /// Logs in with a password
+    /// </summary>
+    /// <param name="client">The HTTP client</param>
+    /// <param name="password">The password to use</param>
+    /// <param name="obtainRefreshToken">Whether to obtain a refresh token</param>
+    /// <returns>The access and refresh tokens</returns>
+    private static Task<(string AccessToken, string? RefreshToken, string? RefreshNonce)> LoginWithPasswordAsync(HttpClient client, string password, bool obtainRefreshToken)
+        => ParseAuthResponseAsync(
+            client.PostAsync("auth/login", JsonContent.Create(new { Password = password, RememberMe = obtainRefreshToken }))
+        );
+
+    /// <summary>
+    /// Logs in with a refresh token
+    /// </summary>
+    /// <param name="client">The HTTP client</param>
+    /// <param name="refreshToken">The refresh token to use</param>
+    /// <returns>The access token, refresh tokens, and nonce</returns>
+    private static Task<(string AccessToken, string? RefreshToken, string? RefreshNonce)> LoginWithRefreshTokenAsync(HttpClient client, string refreshToken, string? nonce)
+    {
+        return ParseAuthResponseAsync(client.SendAsync(new HttpRequestMessage(HttpMethod.Post, "auth/refresh")
+        {
+            Headers = { { "Cookie", $"RefreshToken_{client.BaseAddress!.Port}={refreshToken}" } },
+            Content = string.IsNullOrWhiteSpace(nonce) ? null : JsonContent.Create(new { Nonce = nonce })
+        }));
+    }
+
+
+    /// <summary>
+    /// Parses the authentication response
+    /// </summary>
+    /// <param name="responseTask">The task producing the response to parse</param>
+    /// <returns>The access and refresh tokens</returns>
+    private static async Task<(string AccessToken, string? RefreshToken, string? RefreshNonce)> ParseAuthResponseAsync(Task<HttpResponseMessage> responseTask)
+    {
+        var response = await responseTask;
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+        var json = JsonSerializer.Deserialize<Dictionary<string, string>>(await response.Content.ReadAsStringAsync())
+            ?? throw new InvalidOperationException("Failed to parse response");
+
+        if (!json.TryGetValue("AccessToken", out var accessToken))
+            throw new InvalidOperationException("Failed to get access token");
+
+        json.TryGetValue("RefreshNonce", out var refreshNonce);
+
+        response.Headers.TryGetValues("Set-Cookie", out var cookies);
+        var refreshToken = cookies?.SelectMany(c => c.Split(';')).FirstOrDefault(c => c.StartsWith("RefreshToken_"))?.Split('=', 2)[1];
+
+        return (accessToken, refreshToken, refreshNonce);
+    }
+
+    /// <summary>
+    /// Pauses the server
+    /// </summary>
+    /// <param name="duration">The duration to pause for</param>
+    /// <returns>The task</returns>
+    public async Task PauseAsync(string? duration)
+    {
+        var query = string.IsNullOrWhiteSpace(duration) ? "" : $"?duration={Uri.EscapeDataString(duration)}";
+        var response = await client.PostAsync($"serverstate/pause{query}", null);
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+    }
+
+    /// <summary>
+    /// Resumes the server
+    /// </summary>
+    /// <returns>The task</returns>
+    public async Task ResumeAsync()
+    {
+        var response = await client.PostAsync("serverstate/resume", null);
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+    }
+
+    /// <summary>
+    /// Lists the backups configured on the server
+    /// </summary>
+    /// <returns>The backups</returns>
+    public async Task<IEnumerable<BackupEntry>> ListBackupsAsync()
+    {
+        var response = await client.GetAsync("backups");
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+
+        return (JsonSerializer.Deserialize<IEnumerable<ResponseBackupEntry>>(await response.Content.ReadAsStringAsync())
+            ?? throw new UserReportedException("Failed to parse response"))
+            .Select(x => x.ToBackupEntry())
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Gets a backup by ID
+    /// </summary>
+    /// <param name="backupId">The ID of the backup</param>
+    /// <returns>The backup</returns>
+    public async Task<BackupEntry> GetBackupAsync(string backupId)
+    {
+        var response = await client.GetAsync($"backup/{Uri.EscapeDataString(backupId)}");
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+
+        return (JsonSerializer.Deserialize<ResponseBackupEntry>(await response.Content.ReadAsStringAsync())
+            ?? throw new UserReportedException("Failed to parse response"))
+            .ToBackupEntry();
+    }
+
+    /// <summary>
+    /// Runs a backup
+    /// </summary>
+    /// <param name="backupId">The ID of the backup</param>
+    /// <param name="skipQueue">Whether to skip the queue</param>
+    /// <returns>The task</returns>
+    public async Task RunBackupAsync(string backupId, bool skipQueue)
+    {
+        var response = await client.PostAsync($"backup/{Uri.EscapeDataString(backupId)}/run?skipqueue={skipQueue}", null);
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+    }
+
+    /// <summary>
+    /// Queues a restore test for a backup
+    /// </summary>
+    /// <param name="backupId">The ID of the backup</param>
+    /// <returns>The task</returns>
+    public async Task RunRestoreTestAsync(string backupId)
+    {
+        // The client base address is the v1 API, so step up to reach the v2 endpoint
+        var response = await client.PostAsync("../v2/backup/restore-test", JsonContent.Create(new { BackupId = backupId }));
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+    }
+
+    /// <summary>
+    /// Deletes a backup
+    /// </summary>
+    /// <param name="backupId">The ID of the backup</param>
+    /// <param name="deleteRemoteFiles">Whether to delete remote files</param>
+    /// <param name="deleteLocalDb">Whether to delete the local database</param>
+    /// <param name="force">Whether to force the deletion even if the backup is running at the moment</param>
+    /// <returns>The task</returns>
+    public async Task DeleteBackupAsync(string backupId, bool deleteRemoteFiles, bool deleteLocalDb, bool force)
+    {
+        var response = await client.DeleteAsync($"backup/{Uri.EscapeDataString(backupId)}?delete-remote-files={deleteRemoteFiles}&delete-local-db={deleteLocalDb}&force={force}");
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+    }
+
+    /// <summary>
+    /// Gets the server state
+    /// </summary>
+    /// <returns>The server state</returns>
+    public async Task<ServerState> GetServerStateAsync()
+    {
+        var response = await client.GetAsync("serverstate");
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+        return await response.Content.ReadFromJsonAsync<ServerState>()
+            ?? throw new InvalidDataException("Failed to parse server response");
+    }
+
+    /// <summary>
+    /// Gets a backup's most recent log status by backup ID
+    /// </summary>
+    /// <param name="backupId">The ID of the backup</param>
+    /// <returns>The status of the most recent backup log</returns>
+    public async Task<string> GetBackupStatusAsync(string backupId)
+    {
+        var response = await client.GetAsync($"backup/{Uri.EscapeDataString(backupId)}/log");
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+
+        var parsedLogs = await response.Content.ReadFromJsonAsync<List<Dictionary<string, object>>>()
+            ?? throw new UserReportedException("Failed to parse response");
+        if (parsedLogs.Count < 1)
+        {
+            return "No log generated";
+        }
+        try
+        {
+            var lastLogResultString = ((JsonElement)parsedLogs[0]["Message"]).GetString() ?? throw new InvalidOperationException("Failed to get last log message");
+            var lastLogResult = JsonSerializer.Deserialize<JsonElement>(lastLogResultString);
+            return lastLogResult.GetProperty("ParsedResult").ToString();
+        }
+        catch
+        {
+            return "Failed to parse backup log";
+        }
+    }
+
+    /// <summary>
+    /// Runs a backup
+    /// </summary>
+    /// <param name="backupId">The ID of the backup</param>
+    /// <returns>The task</returns>
+    public async Task WaitForBackupAsync(string backupId, TimeSpan delay, Action<string> statusMessage)
+    {
+        var state = await GetServerStateAsync();
+
+        if (!state.SchedulerQueueIds.Any(x => x.Item2 == backupId) && state.ActiveTask?.Item2 != backupId)
+            throw new UserReportedException("Backup is not queued or running");
+
+        var hasStarted = state.ActiveTask?.Item2 == backupId;
+
+        while (true)
+        {
+            await Task.Delay(delay);
+            state = await GetServerStateAsync();
+
+            if (state.ActiveTask?.Item2 == backupId)
+            {
+                statusMessage("Backup is running ...");
+                hasStarted = true;
+                continue;
+            }
+
+            if (!hasStarted && state.SchedulerQueueIds.Any(x => x.Item2 == backupId))
+            {
+                statusMessage("Backup is queued ...");
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    /// <summary>
+    /// Lists the active tasks
+    /// </summary>
+    /// <returns>The tasks</returns>
+    public async Task<IEnumerable<TaskEntry>> ListTasksAsync()
+    {
+        var response = await client.GetAsync("tasks");
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+
+        return JsonSerializer.Deserialize<IEnumerable<TaskEntry>>(await response.Content.ReadAsStringAsync())
+            ?? throw new InvalidOperationException("Failed to parse response");
+    }
+
+    /// <summary>
+    /// Stops a task
+    /// </summary>
+    /// <param name="taskId">The ID of the task</param>
+    /// <param name="level">The level to stop at</param>
+    /// <returns>The task</returns>
+    public async Task StopTaskAsync(string taskId, StopLevel level = StopLevel.AfterCurrentFile)
+    {
+        var levelString = level switch
+        {
+            StopLevel.AfterCurrentFile => "stopaftercurrentfile",
+            StopLevel.StopNow => "stopnow",
+            StopLevel.Abort => "abort",
+            _ => throw new ArgumentOutOfRangeException(nameof(level))
+        };
+        var response = await client.PostAsync($"task/{Uri.EscapeDataString(taskId)}/{levelString}", null);
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+    }
+
+    /// <summary>
+    /// Logs out of the server
+    /// </summary>
+    /// <param name="settings">The settings to use</param>
+    /// <param name="output"></param>
+    /// <returns>The task</returns>
+    public async Task LogoutAsync(Settings settings, OutputInterceptor output)
+    {
+        var response = await client.SendAsync(new HttpRequestMessage(HttpMethod.Post, "auth/refresh/logout")
+        {
+            Headers = { { "Cookie", $"RefreshToken_{client.BaseAddress!.Port}={settings.RefreshToken}" } }
+        });
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+        (settings with { RefreshToken = null }).Save(output);
+    }
+
+    /// <summary>
+    /// Changes the server password
+    /// </summary>
+    /// <param name="newPassword">The new password to use</param>
+    /// <returns>The task</returns>
+    public async Task ChangePasswordAsync(string newPassword)
+    {
+        var response = await client.PutAsync("serversetting/server-passphrase", JsonContent.Create(newPassword));
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+    }
+
+    /// <summary>
+    /// Imports a backup
+    /// </summary>
+    /// <param name="file">The file to import</param>
+    /// <param name="password">The password to use</param>
+    /// <param name="importMetadata">Whether to import metadata</param>
+    /// <param name="extraSettings">Extra settings to apply to the imported backup</param>
+    /// <returns>The backup</returns>
+    public async Task<BackupEntry> ImportBackupAsync(string file, string? password, bool importMetadata, Dictionary<string, string> extraSettings)
+    {
+        var payload = JsonContent.Create(new
+        {
+            config = Convert.ToBase64String(await File.ReadAllBytesAsync(file)),
+            import_metadata = importMetadata,
+            passphrase = password,
+            direct = true,
+            replace_settings = extraSettings
+        });
+        var response = await client.PostAsync("backups/import", payload);
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+
+        var json = JsonSerializer.Deserialize<Dictionary<string, string>>(await response.Content.ReadAsStringAsync())
+            ?? throw new UserReportedException("Failed to parse response");
+        if (!json.TryGetValue("Id", out var id))
+            throw new UserReportedException("Added backup but failed to get from response");
+
+        return await GetBackupAsync(id);
+    }
+
+    /// <summary>
+    /// Exports a backup
+    /// </summary>
+    /// <param name="backupId">The ID of the backup</param>
+    /// <param name="passphrase">The passphrase to use, if encrypting</param>
+    /// <param name="includeKeys">Whether to include sensitive keys</param>
+    /// <returns>The stream with the exported backup</returns>
+    public async Task<Stream> ExportBackupAsync(string backupId, string? passphrase, bool includeKeys)
+    {
+        var exportTokenResponse = await client.PostAsync("auth/issuetoken/export", null);
+        await EnsureSuccessStatusCodeWithParsingAsync(exportTokenResponse);
+        var values = JsonSerializer.Deserialize<Dictionary<string, string>>(await exportTokenResponse.Content.ReadAsStringAsync())
+            ?? throw new UserReportedException("Failed to parse response");
+
+        if (!values.TryGetValue("Token", out var token))
+            throw new UserReportedException("Failed to get export token");
+
+        var response = await client.GetAsync($"backup/{Uri.EscapeDataString(backupId)}/export?passphrase={Uri.EscapeDataString(passphrase ?? "")}&export-passwords={includeKeys}&token={token}");
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+
+        return await response.Content.ReadAsStreamAsync();
+    }
+
+    /// <summary>
+    /// Creates a forever token
+    /// </summary>
+    /// <returns>The token</returns>
+    public async Task<string> CreateForeverTokenAsync()
+    {
+        var (accessToken, _, _) = await ParseAuthResponseAsync(client.PostAsync("auth/issue-forever-token", null));
+        return accessToken;
+    }
+
+
+    /// <summary>
+    /// The options for reading the MCP token responses, which use the server's property names and enum names
+    /// </summary>
+    private static readonly JsonSerializerOptions McpTokenJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() }
+    };
+
+    /// <summary>
+    /// Issues a token that gives an agent access to the MCP endpoint
+    /// </summary>
+    /// <param name="input">The name and scope of the token</param>
+    /// <returns>The description of the token, and the token itself</returns>
+    public async Task<WebserverCore.Dto.V2.CreateMcpTokenOutputDto> CreateMcpTokenAsync(WebserverCore.Dto.V2.CreateMcpTokenInputDto input)
+        => await ReadV2ResultAsync<WebserverCore.Dto.V2.CreateMcpTokenOutputDto>(
+            client.PostAsync(V2Uri("mcp/tokens"), JsonContent.Create(input, options: McpTokenJsonOptions)))
+            ?? throw new UserReportedException("Failed to parse response");
+
+    /// <summary>
+    /// Lists the issued MCP tokens
+    /// </summary>
+    /// <returns>The descriptions of the tokens</returns>
+    public async Task<WebserverCore.Dto.V2.McpTokenDto[]> ListMcpTokensAsync()
+        => await ReadV2ResultAsync<WebserverCore.Dto.V2.McpTokenDto[]>(client.GetAsync(V2Uri("mcp/tokens")))
+            ?? throw new UserReportedException("Failed to parse response");
+
+    /// <summary>
+    /// Revokes an MCP token
+    /// </summary>
+    /// <param name="id">The ID of the token</param>
+    /// <returns>The task</returns>
+    public async Task DeleteMcpTokenAsync(string id)
+        => await ReadV2ResultAsync<object>(client.DeleteAsync(V2Uri($"mcp/token/{Uri.EscapeDataString(id)}")));
+
+    /// <summary>
+    /// Builds the address of a V2 API endpoint; the client itself is rooted at the V1 API
+    /// </summary>
+    /// <param name="path">The path below the V2 API</param>
+    /// <returns>The address</returns>
+    private Uri V2Uri(string path)
+        => new(client.BaseAddress!, $"../v2/{path}");
+
+    /// <summary>
+    /// Reads the response of a V2 API endpoint, which reports failures in its envelope and not in the HTTP status
+    /// </summary>
+    /// <typeparam name="T">The type of the data in the envelope</typeparam>
+    /// <param name="responseTask">The task producing the response</param>
+    /// <returns>The data</returns>
+    private static async Task<T?> ReadV2ResultAsync<T>(Task<HttpResponseMessage> responseTask)
+    {
+        var response = await responseTask;
+        await EnsureSuccessStatusCodeWithParsingAsync(response);
+        var envelope = await response.Content.ReadFromJsonAsync<WebserverCore.Dto.V2.ResponseEnvelope<T>>(McpTokenJsonOptions)
+            ?? throw new UserReportedException("Failed to parse response");
+        if (!envelope.Success)
+            throw new UserReportedException(envelope.Error ?? $"The server reported the error {envelope.StatusCode}");
+
+        return envelope.Data;
+    }
+
+    /// <summary>
+    /// The server error structure for JSON deserialization
+    /// </summary>
+    /// <param name="Error">The error message</param>
+    /// <param name="Code">The error code</param>
+    private sealed record ServerError(string Error, int Code);
+
+    /// <summary>
+    /// Ensures the response is successful or extracts an error message
+    /// </summary>
+    /// <param name="message">The message to check</param>
+    /// <returns>The task</returns>
+    private static async Task EnsureSuccessStatusCodeWithParsingAsync(HttpResponseMessage? message)
+    {
+        if (message is null)
+            throw new UserReportedException("No response received");
+
+        if (message.IsSuccessStatusCode)
+            return;
+
+        var content = await message.Content.ReadAsStringAsync();
+        if (string.IsNullOrWhiteSpace(content))
+            message.EnsureSuccessStatusCode();
+
+        ServerError? errMsg = null;
+        try
+        {
+            errMsg = JsonSerializer.Deserialize<ServerError>(content);
+        }
+        catch
+        {
+        }
+
+        if (errMsg is not null)
+            throw new UserReportedException($"Server error ({errMsg.Code}): {errMsg.Error}");
+
+        throw new UserReportedException($"Failed to parse response ({message.StatusCode}): {content}");
+    }
+}

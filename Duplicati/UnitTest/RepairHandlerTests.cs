@@ -1,68 +1,110 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+#nullable enable
+
 using System;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Main;
 using Duplicati.Library.Main.Database;
+using Duplicati.Library.Main.Database.Local;
+using Duplicati.Library.Main.Volumes;
 using Duplicati.Library.SQLiteHelper;
+using Duplicati.Library.Utility;
 using NUnit.Framework;
+using NUnit.Framework.Legacy;
+using Assert = NUnit.Framework.Legacy.ClassicAssert;
 
 namespace Duplicati.UnitTest
 {
     [TestFixture]
     public class RepairHandlerTests : BasicSetupHelper
     {
-        public override void SetUp()
+        [SetUp]
+        public void SetUp()
         {
-            base.SetUp();
-            File.WriteAllBytes(Path.Combine(this.DATAFOLDER, "file"), new byte[] {0});
+            File.WriteAllBytes(Path.Combine(this.DATAFOLDER, "file"), new byte[] { 0 });
+        }
+
+        public void ModifyFile()
+        {
+            File.WriteAllBytes(Path.Combine(this.DATAFOLDER, "file"), new byte[] { 1 });
         }
 
         [Test]
         [Category("RepairHandler")]
-        public void RepairMissingBlocklistHashes()
+        [TestCase(150 * 1024)]
+        // With 10kib blocksize, we can have 10240/32 = 320 hashes
+        // Test near limits of blocklist to check split blocklist
+        [TestCase(319 * 10240)]
+        [TestCase(320 * 10240)]
+        [TestCase(320 * 10240 + 5)]
+        [TestCase(320 * 10240 * 2)]
+        [TestCase(320 * 10240 * 2 + 5)]
+        [TestCase(320 * 10240 * 3)]
+        [TestCase(320 * 10240 * 3 + 5)]
+        public async Task RepairMissingBlocklistHashesAsync(int dataSize)
         {
-            byte[] data = new byte[150 * 1024];
-            Random rng = new Random();
-            for (int k = 0; k < 2; k++)
+            var data = new byte[dataSize];
+            var rng = new Random();
+            for (var k = 0; k < 2; k++)
             {
                 rng.NextBytes(data);
                 File.WriteAllBytes(Path.Combine(this.DATAFOLDER, $"{k}"), data);
             }
 
-            Dictionary<string, string> options = new Dictionary<string, string>(this.TestOptions);
-            using (Controller c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            var options = new Dictionary<string, string>(this.TestOptions);
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
             {
-                IBackupResults backupResults = c.Backup(new[] {this.DATAFOLDER});
+                var backupResults = await c.BackupAsync([this.DATAFOLDER]);
                 Assert.AreEqual(0, backupResults.Errors.Count());
                 Assert.AreEqual(0, backupResults.Warnings.Count());
             }
 
             // Mimic a damaged database that needs to be repaired.
             const string selectStatement = @"SELECT BlocksetID, ""Index"", Hash FROM BlocklistHash ORDER BY Hash ASC";
-            List<int> expectedBlocksetIDs = new List<int>();
-            List<int> expectedIndexes = new List<int>();
-            List<string> expectedHashes = new List<string>();
-            using (IDbConnection connection = SQLiteLoader.LoadConnection(options["dbpath"]))
+            var expectedBlocksetIDs = new List<int>();
+            var expectedIndexes = new List<int>();
+            var expectedHashes = new List<string?>();
+            using (var connection = await SQLiteLoader.LoadConnectionAsync(options["dbpath"]))
             {
                 // Read the contents of the BlocklistHash table so that we can
                 // compare them to the contents after the repair operation.
-                using (IDbCommand command = connection.CreateCommand())
-                {
-                    using (IDataReader reader = command.ExecuteReader(selectStatement))
+                using (var command = connection.CreateCommand())
+                using (var reader = command.ExecuteReader(selectStatement))
+                    while (reader.Read())
                     {
-                        while (reader.Read())
-                        {
-                            expectedBlocksetIDs.Add(reader.GetInt32(0));
-                            expectedIndexes.Add(reader.GetInt32(1));
-                            expectedHashes.Add(reader.GetString(2));
-                        }
+                        expectedBlocksetIDs.Add(reader.GetInt32(0));
+                        expectedIndexes.Add(reader.GetInt32(1));
+                        expectedHashes.Add(reader.ConvertValueToString(2));
                     }
-                }
 
-                using (IDbCommand command = connection.CreateCommand())
+                using (var command = connection.CreateCommand())
                 {
                     command.ExecuteNonQuery(@"DELETE FROM BlocklistHash");
                     using (IDataReader reader = command.ExecuteReader(selectStatement))
@@ -72,30 +114,26 @@ namespace Duplicati.UnitTest
                 }
             }
 
-            using (Controller c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
             {
-                IRepairResults repairResults = c.Repair();
+                var repairResults = await c.RepairAsync();
                 Assert.AreEqual(0, repairResults.Errors.Count());
                 Assert.AreEqual(0, repairResults.Warnings.Count());
             }
 
-            List<int> repairedBlocksetIDs = new List<int>();
-            List<int> repairedIndexes = new List<int>();
-            List<string> repairedHashes = new List<string>();
-            using (IDbConnection connection = SQLiteLoader.LoadConnection(options["dbpath"]))
+            var repairedBlocksetIDs = new List<int>();
+            var repairedIndexes = new List<int>();
+            var repairedHashes = new List<string?>();
+            using (var connection = await SQLiteLoader.LoadConnectionAsync(options["dbpath"]))
             {
-                using (IDbCommand command = connection.CreateCommand())
-                {
-                    using (IDataReader reader = command.ExecuteReader(selectStatement))
+                using (var command = connection.CreateCommand())
+                using (var reader = command.ExecuteReader(selectStatement))
+                    while (reader.Read())
                     {
-                        while (reader.Read())
-                        {
-                            repairedBlocksetIDs.Add(reader.GetInt32(0));
-                            repairedIndexes.Add(reader.GetInt32(1));
-                            repairedHashes.Add(reader.GetString(2));
-                        }
+                        repairedBlocksetIDs.Add(reader.GetInt32(0));
+                        repairedIndexes.Add(reader.GetInt32(1));
+                        repairedHashes.Add(reader.ConvertValueToString(2));
                     }
-                }
             }
 
             CollectionAssert.AreEqual(expectedBlocksetIDs, repairedBlocksetIDs);
@@ -103,9 +141,9 @@ namespace Duplicati.UnitTest
             CollectionAssert.AreEqual(expectedHashes, repairedHashes);
 
             // A subsequent backup should run without errors.
-            using (Controller c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
             {
-                IBackupResults backupResults = c.Backup(new[] {this.DATAFOLDER});
+                var backupResults = await c.BackupAsync([this.DATAFOLDER]);
                 Assert.AreEqual(0, backupResults.Errors.Count());
                 Assert.AreEqual(0, backupResults.Warnings.Count());
             }
@@ -115,34 +153,732 @@ namespace Duplicati.UnitTest
         [Category("RepairHandler")]
         [TestCase("true")]
         [TestCase("false")]
-        public void RepairMissingIndexFiles(string noEncryption)
+        public async Task RepairMissingIndexFilesAsync(string noEncryption)
         {
-            Dictionary<string, string> options = new Dictionary<string, string>(this.TestOptions) {["no-encryption"] = noEncryption};
-            using (Controller c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            var options = new Dictionary<string, string>(this.TestOptions) { ["no-encryption"] = noEncryption };
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
             {
-                IBackupResults backupResults = c.Backup(new[] {this.DATAFOLDER});
+                var backupResults = await c.BackupAsync([this.DATAFOLDER]);
                 Assert.AreEqual(0, backupResults.Errors.Count());
                 Assert.AreEqual(0, backupResults.Warnings.Count());
             }
 
-            string[] dindexFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*dindex*").ToArray();
+            var dindexFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*.dindex.*").ToArray();
             Assert.Greater(dindexFiles.Length, 0);
-            foreach (string f in dindexFiles)
-            {
+            foreach (var f in dindexFiles)
                 File.Delete(f);
-            }
 
-            using (Controller c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
             {
-                IRepairResults repairResults = c.Repair();
+                var repairResults = await c.RepairAsync();
                 Assert.AreEqual(0, repairResults.Errors.Count());
                 Assert.AreEqual(0, repairResults.Warnings.Count());
             }
 
-            foreach (string file in dindexFiles)
+            var recreatedIndexFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*dindex*").ToArray();
+            Assert.AreEqual(dindexFiles.Length, recreatedIndexFiles.Length);
+        }
+
+        [Test]
+        [Category("RepairHandler"), Category("Targeted")]
+        public async Task RepairMissingIndexFilesBlocklistAsync()
+        {
+            // See issue #3202
+            var options = new Dictionary<string, string>(this.TestOptions)
             {
-                Assert.IsTrue(File.Exists(Path.Combine(this.TARGETFOLDER, file)));
+                ["blocksize"] = "1KB",
+                ["no-encryption"] = "true"
+            };
+            var filename = Path.Combine(this.DATAFOLDER, "file");
+            using (var s = File.Create(filename))
+            {
+                var size = 1024 * 32 + 1; // Blocklist size + 1
+                await s.WriteAsync(new byte[size], 0, size);
             }
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var backupResults = await c.BackupAsync(new[] { this.DATAFOLDER });
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                Assert.AreEqual(0, backupResults.Warnings.Count());
+                using (var s = File.OpenWrite(filename))
+                {
+                    // Change first byte
+                    s.WriteByte(1);
+                }
+                backupResults = await c.BackupAsync(new[] { this.DATAFOLDER });
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                Assert.AreEqual(0, backupResults.Warnings.Count());
+            }
+
+            var dindexFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*.dindex.*").ToArray();
+            Assert.Greater(dindexFiles.Length, 0);
+            foreach (var f in dindexFiles)
+            {
+                File.Delete(f);
+            }
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var repairResults = await c.RepairAsync();
+                Assert.AreEqual(0, repairResults.Errors.Count());
+                Assert.AreEqual(0, repairResults.Warnings.Count());
+            }
+
+            var recreatedIndexFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*dindex*").ToArray();
+            Assert.AreEqual(dindexFiles.Length, recreatedIndexFiles.Length);
+        }
+
+        [Test]
+        [Category("RepairHandler"), Category("Targeted")]
+        public async Task RecreateWithDefectIndexBlockAsync()
+        {
+            // See issue #3202
+            var options = new Dictionary<string, string>(this.TestOptions)
+            {
+                ["blocksize"] = "1KB",
+                ["no-encryption"] = "true"
+            };
+            var filename = Path.Combine(this.DATAFOLDER, "file");
+            using (var s = File.Create(filename))
+            {
+                var size = 1024 * 32 + 1; // Blocklist size + 1
+                await s.WriteAsync(new byte[size], 0, size);
+            }
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var backupResults = await c.BackupAsync(new[] { this.DATAFOLDER });
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                Assert.AreEqual(0, backupResults.Warnings.Count());
+                using (var s = File.OpenWrite(filename))
+                {
+                    // Change first byte
+                    s.WriteByte(1);
+                }
+                backupResults = await c.BackupAsync(new[] { this.DATAFOLDER });
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                Assert.AreEqual(0, backupResults.Warnings.Count());
+            }
+
+            var dindexFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*dindex*").ToArray();
+            Assert.Greater(dindexFiles.Length, 0);
+
+            // Corrupt the first index file
+            using (var tmp = new TempFile())
+            {
+                using (var zip = new ZipArchive(File.Open(tmp, FileMode.Create, FileAccess.ReadWrite), ZipArchiveMode.Create))
+                using (var sourceZip = new ZipArchive(File.Open(dindexFiles[0], FileMode.Open, FileAccess.ReadWrite)))
+                {
+                    foreach (var entry in sourceZip.Entries)
+                    {
+                        using (var s = entry.Open())
+                        {
+                            var newEntry = zip.CreateEntry(entry.FullName);
+                            using (var d = newEntry.Open())
+                            {
+                                if (entry.FullName.StartsWith("list/"))
+                                {
+                                    using (var ms = new MemoryStream())
+                                    {
+                                        await s.CopyToAsync(ms);
+                                        ms.Position = 0;
+                                        ms.WriteByte(42);
+                                        ms.Position = 0;
+                                        await ms.CopyToAsync(d);
+                                    }
+                                }
+                                else
+                                {
+                                    await s.CopyToAsync(d);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                File.Copy(tmp, dindexFiles[0], true);
+            }
+
+            // Delete database and recreate
+            File.Delete(options["dbpath"]);
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var repairResults = await c.RepairAsync();
+                Assert.AreEqual(0, repairResults.Errors.Count());
+                Assert.AreEqual(1, repairResults.Warnings.Count());
+            }
+
+            File.Delete(dindexFiles[0]);
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var repairResults = await c.RepairAsync();
+                Assert.AreEqual(0, repairResults.Errors.Count());
+                Assert.AreEqual(0, repairResults.Warnings.Count());
+            }
+
+            // Delete database and recreate
+            File.Delete(options["dbpath"]);
+
+            // No errors with recreated index file
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var repairResults = await c.RepairAsync();
+                Assert.AreEqual(0, repairResults.Errors.Count());
+                Assert.AreEqual(0, repairResults.Warnings.Count());
+            }
+
+        }
+
+        [Test]
+        [Category("RepairHandler"), Category("Targeted")]
+        public async Task AutoCleanupRepairDoesNotLockDatabaseAsync()
+        {
+            // See issue #3635, #4631
+            var options = new Dictionary<string, string>(this.TestOptions)
+            {
+                ["blocksize"] = "1KB",
+                ["no-encryption"] = "true",
+                ["auto-cleanup"] = "true"
+            };
+            var delaytime = TimeSpan.FromSeconds(3);
+            var filename = Path.Combine(this.DATAFOLDER, "file");
+            using (var s = File.Create(filename))
+                s.SetLength(1024 * 38); // Random size
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var backupResults = await c.BackupAsync([this.DATAFOLDER]);
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                Assert.AreEqual(0, backupResults.Warnings.Count());
+            }
+
+            var dblockFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*dblock*").ToArray();
+            Assert.Greater(dblockFiles.Length, 0);
+            var sourcename = Path.GetFileName(dblockFiles.First());
+            var p = VolumeBase.ParseFilename(sourcename);
+            var guid = VolumeWriterBase.GenerateGuid();
+            var time = p.Time.Ticks == 0 ? p.Time : p.Time.AddSeconds(1);
+            var newname = VolumeBase.GenerateFilename(p.FileType, p.Prefix, guid, time, p.CompressionModule, p.EncryptionModule);
+
+            File.Copy(Path.Combine(this.TARGETFOLDER, sourcename), Path.Combine(this.TARGETFOLDER, newname));
+
+            System.Threading.Thread.Sleep(delaytime);
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var backupResults = await c.BackupAsync([this.DATAFOLDER]);
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                // 1 extra file + 1 warning
+                Assert.AreEqual(2, backupResults.Warnings.Count());
+            }
+
+            // Auto-cleanup should have removed the renamed file
+            Assert.IsFalse(File.Exists(Path.Combine(this.TARGETFOLDER, newname)));
+
+            // Insert the extra file back
+            File.Copy(Path.Combine(this.TARGETFOLDER, sourcename), Path.Combine(this.TARGETFOLDER, newname));
+
+            // Delete the database
+            File.Delete(options["dbpath"]);
+
+            // Recreate with an extra volume
+            System.Threading.Thread.Sleep(delaytime);
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var backupResults = await c.BackupAsync([this.DATAFOLDER]);
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                // First will recreate (4 files + 1 warning)
+                Assert.AreEqual(5, backupResults.Warnings.Count());
+            }
+        }
+
+        [Test]
+        [Category("RepairHandler")]
+        [TestCase("true")]
+        [TestCase("false")]
+        public async Task RepairExtraIndexFilesAsync(string noEncryption)
+        {
+            // Extra index files will be added to the database and should have a correct link established
+            var options = new Dictionary<string, string>(this.TestOptions) { ["no-encryption"] = noEncryption };
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            var dindexFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*dindex*").ToArray();
+            Assert.Greater(dindexFiles.Length, 0);
+            var origFile = dindexFiles.First();
+            // Duplicate index file
+            var dupFile = Path.Combine(TARGETFOLDER, Path.GetFileName(origFile).Replace(".dindex", "1.dindex"));
+            File.Copy(origFile, dupFile);
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.RepairAsync());
+
+            // Check database block link
+            using (var db = await LocalDatabase.CreateLocalDatabaseAsync(DBFILE, "Test", true, null, CancellationToken.None).ConfigureAwait(false))
+            {
+                var indexVolumeId = await db
+                    .GetRemoteVolumeIDAsync(Path.GetFileName(origFile), CancellationToken.None)
+                    .ConfigureAwait(false);
+                var duplicateVolumeId = await db
+                    .GetRemoteVolumeIDAsync(Path.GetFileName(dupFile), CancellationToken.None)
+                    .ConfigureAwait(false);
+                Assert.AreNotEqual(-1, indexVolumeId);
+                Assert.AreNotEqual(-1, duplicateVolumeId);
+
+                using (var cmd = db.Connection.CreateCommand())
+                {
+                    var sql = @"SELECT ""BlockVolumeID"" FROM ""IndexBlockLink"" WHERE ""IndexVolumeID"" = @VolumeId";
+                    var linkedIndexId = await cmd
+                        .SetCommandAndParameters(sql)
+                        .SetParameterValue("@VolumeId", indexVolumeId)
+                        .ExecuteScalarInt64Async(-1, CancellationToken.None)
+                        .ConfigureAwait(false);
+                    var linkedDuplicateId = await cmd
+                        .SetCommandAndParameters(sql)
+                        .SetParameterValue("@VolumeId", duplicateVolumeId)
+                        .ExecuteScalarInt64Async(-1, CancellationToken.None)
+                        .ConfigureAwait(false);
+                    Assert.AreEqual(linkedIndexId, linkedDuplicateId);
+                }
+            }
+        }
+
+        [Test]
+        [Category("RepairHandler")]
+        public async Task RepairMissingDlistFileAsync()
+        {
+            // Make two backups
+            var options = this.TestOptions;
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            ModifyFile();
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            // Find and delete a dlist file
+            var dlistFile = Directory.EnumerateFiles(this.TARGETFOLDER, "*.dlist.*").First();
+            File.Delete(dlistFile);
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                IRepairResults repairResults = await c.RepairAsync();
+                TestUtils.AssertResults(repairResults);
+                Assert.AreEqual(2, Directory.EnumerateFiles(this.TARGETFOLDER, "*.dlist.*").Count());
+            }
+        }
+
+        [Test]
+        [Category("RepairHandler")]
+        [TestCase("true")]
+        [TestCase("false")]
+        public async Task RepairMissingDlistVolumeAsync(bool deleteRemoteFile)
+        {
+            // Make two backups
+            var options = this.TestOptions;
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            ModifyFile();
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            // Find a dlist file
+            var dlistFiles = Directory.EnumerateFiles(this.TARGETFOLDER, "*.dlist.*")
+                .OrderByDescending(x => x)
+                .AsEnumerable();
+
+            // Randomly delete the first or last file
+            if (Random.Shared.Next(2) == 0)
+                dlistFiles = dlistFiles.Reverse();
+
+            var dlistFile = dlistFiles.First();
+            using (var con = await SQLiteLoader.LoadConnectionAsync(options["dbpath"]))
+            using (var cmd = con.CreateCommand("DELETE FROM RemoteVolume WHERE Name = @Name"))
+                Assert.AreEqual(1, await cmd.SetParameterValue("@Name", Path.GetFileName(dlistFile)).ExecuteNonQueryAsync());
+
+            if (deleteRemoteFile)
+                File.Delete(dlistFile);
+
+            // Should catch this in validation
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                Assert.ThrowsAsync<DatabaseInconsistencyException>(async () => await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var repairResults = await c.RepairAsync();
+                TestUtils.AssertResults(repairResults);
+                Assert.AreEqual(2, Directory.EnumerateFiles(this.TARGETFOLDER, "*.dlist.*").Count());
+                Assert.AreEqual(2, (await c.ListAsync()).Filesets.Count());
+            }
+
+            // Check that the entry was recreated
+            using (var con = await SQLiteLoader.LoadConnectionAsync(options["dbpath"]))
+            using (var cmd = con.CreateCommand("SELECT COUNT(*) FROM RemoteVolume WHERE Name LIKE '%.dlist.%' AND State != @State"))
+                Assert.AreEqual(2, cmd.SetParameterValue("@State", RemoteVolumeState.Deleted.ToString()).ExecuteScalarInt64(-1));
+
+            // Delete the database and check that the result is correct
+            File.Delete(options["dbpath"]);
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var repairResults = await c.RepairAsync();
+                TestUtils.AssertResults(repairResults);
+                Assert.AreEqual(2, (await c.ListAsync()).Filesets.Count());
+
+                var r = await c.TestAsync(long.MaxValue);
+                Assert.AreEqual(0, r.Errors.Count());
+                Assert.AreEqual(0, r.Warnings.Count());
+                Assert.IsFalse(r.Verifications.Any(p => p.Value.Any()));
+            }
+        }
+
+        [Test]
+        [Category("RepairHandler")]
+        public async Task RepairMissingFilesetVolumeAsync()
+        {
+            // Make two backups
+            var options = this.TestOptions;
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            // Make room for a new backup
+            Thread.Sleep(2000);
+
+            ModifyFile();
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            // Remove a fileset
+            using (var con = await SQLiteLoader.LoadConnectionAsync(options["dbpath"]))
+            using (var cmd = con.CreateCommand())
+            {
+                var filesetId = cmd.ExecuteScalarInt64("SELECT Id FROM Fileset ORDER BY Id DESC LIMIT 1");
+                Assert.AreEqual(1, await cmd.SetCommandAndParameters("DELETE FROM Fileset WHERE Id = @FilesetId")
+                    .SetParameterValue("@FilesetId", filesetId)
+                    .ExecuteNonQueryAsync());
+
+                // No longer needed because the recreate will wipe the table before restoring
+                // cmd.SetCommandAndParameters("DELETE FROM FilesetEntry WHERE FilesetId = @FilesetId")
+                //     .SetParameterValue("@FilesetId", filesetId)
+                //     .ExecuteNonQuery();
+            }
+
+            // Should catch this in validation
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                Assert.ThrowsAsync<DatabaseInconsistencyException>(() => c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            // Since we have removed the entry that is being checked here, we need to disable the check
+            var repairOptions = new Dictionary<string, string>(options) { ["repair-ignore-outdated-database"] = "true" };
+            using (var c = new Controller("file://" + this.TARGETFOLDER, repairOptions, null))
+            {
+                var repairResults = await c.RepairAsync();
+                Assert.AreEqual(0, repairResults.Errors.Count());
+                Assert.AreEqual(0, repairResults.Warnings.Where(x => x.IndexOf("RemoteFilesNewerThanLocalDatabase", StringComparison.OrdinalIgnoreCase) < 0).Count());
+                Assert.AreEqual(2, Directory.EnumerateFiles(this.TARGETFOLDER, "*.dlist.*").Count());
+                Assert.AreEqual(2, (await c.ListAsync()).Filesets.Count());
+            }
+
+            // Check that entry was recreated
+            using (var con = await SQLiteLoader.LoadConnectionAsync(options["dbpath"]))
+            using (var cmd = con.CreateCommand())
+                Assert.AreEqual(2, cmd.ExecuteScalarInt64("SELECT COUNT(*) FROM Fileset"));
+        }
+
+        [Test]
+        [Category("RepairHandler")]
+        public async Task ManufactureMissingFilesAsync()
+        {
+            // Make two backups
+            var options = this.TestOptions;
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            // Make room for a new backup
+            Thread.Sleep(2000);
+
+            ModifyFile();
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            // Remove a fileset
+            long filesetEntries;
+            long fileLookupEntries;
+            using (var con = await SQLiteLoader.LoadConnectionAsync(options["dbpath"]))
+            using (var cmd = con.CreateCommand())
+            {
+                filesetEntries = cmd.ExecuteScalarInt64("SELECT COUNT(*) FROM FilesetEntry");
+                fileLookupEntries = cmd.ExecuteScalarInt64("SELECT COUNT(*) FROM FileLookup");
+                var fileId = cmd.ExecuteScalarInt64("SELECT FileId FROM FilesetEntry INNER JOIN FileLookup ON FilesetEntry.FileID = FileLookup.Id WHERE FileLookup.BlocksetID != -100 ORDER BY FilesetId DESC LIMIT 1");
+                Assert.AreEqual(1, await cmd.SetCommandAndParameters("DELETE FROM FileLookup WHERE Id = @FileId").SetParameterValue("@FileId", fileId).ExecuteNonQueryAsync());
+            }
+
+            // Should catch this in validation
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                Assert.ThrowsAsync<DatabaseInconsistencyException>(() => c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var repairResults = await c.RepairAsync();
+                Assert.AreEqual(0, repairResults.Errors.Count());
+                Assert.AreEqual(0, repairResults.Warnings.Where(x => x.IndexOf("RemoteFilesNewerThanLocalDatabase", StringComparison.OrdinalIgnoreCase) < 0).Count());
+                Assert.AreEqual(2, Directory.EnumerateFiles(this.TARGETFOLDER, "*.dlist.*").Count());
+                Assert.AreEqual(2, (await c.ListAsync()).Filesets.Count());
+            }
+
+            // Check that entry was recreated
+            using (var con = await SQLiteLoader.LoadConnectionAsync(options["dbpath"]))
+            using (var cmd = con.CreateCommand())
+            {
+                Assert.AreEqual(filesetEntries, cmd.ExecuteScalarInt64("SELECT COUNT(*) FROM FilesetEntry"));
+                Assert.AreEqual(fileLookupEntries, cmd.ExecuteScalarInt64("SELECT COUNT(*) FROM FileLookup"));
+            }
+        }
+
+        /// <summary>
+        /// Writes a file into the data folder and gives it a distinct modification time, so that it gets a
+        /// Metadataset row of its own instead of sharing one with a file written in the same clock tick.
+        /// </summary>
+        /// <param name="name">The file name to write.</param>
+        /// <param name="contents">The contents to write.</param>
+        /// <param name="dayOffset">A per-file offset that keeps the modification times apart.</param>
+        private void WriteFileWithDistinctMetadata(string name, string contents, int dayOffset)
+        {
+            var path = Path.Combine(this.DATAFOLDER, name);
+            File.WriteAllText(path, contents);
+            File.SetLastWriteTimeUtc(path, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddDays(dayOffset));
+        }
+
+        /// <summary>
+        /// Points the metadata of one file at a zero-length blockset, and returns the metadata id.
+        /// </summary>
+        private static async Task<long> BreakOneMetadataEntryAsync(string dbpath, string path)
+        {
+            using var con = await SQLiteLoader.LoadConnectionAsync(dbpath);
+            using var cmd = con.CreateCommand();
+
+            var metaId = cmd.SetCommandAndParameters(@"SELECT ""MetadataID"" FROM ""File"" WHERE ""Path"" LIKE @Path")
+                .SetParameterValue("@Path", "%" + path).ExecuteScalarInt64(-1);
+            Assert.That(metaId, Is.GreaterThanOrEqualTo(0), $"No metadata found for {path}");
+
+            // Metadata is deduplicated on the hash of its contents, and those contents include the
+            // filesystem timestamps, so files written in the same clock tick share one Metadataset row.
+            // Corrupting a shared row would affect more than the one file this test is about.
+            var sharingFiles = cmd.SetCommandAndParameters(@"SELECT COUNT(*) FROM ""FileLookup"" WHERE ""MetadataID"" = @Id")
+                .SetParameterValue("@Id", metaId).ExecuteScalarInt64(0);
+            Assert.That(sharingFiles, Is.EqualTo(1), $"The metadata of {path} is shared with {sharingFiles - 1} other entrie(s)");
+
+            var blocksetId = cmd.SetCommandAndParameters(@"SELECT ""BlocksetID"" FROM ""Metadataset"" WHERE ""ID"" = @Id")
+                .SetParameterValue("@Id", metaId).ExecuteScalarInt64(-1);
+            await cmd.SetCommandAndParameters(@"UPDATE ""Blockset"" SET ""Length"" = 0 WHERE ""ID"" = @Id")
+                .SetParameterValue("@Id", blocksetId).ExecuteNonQueryAsync();
+
+            return metaId;
+        }
+
+        /// <summary>
+        /// Counts the metadata entries that cannot be restored because their blockset has a length of 0.
+        /// </summary>
+        private static async Task<long> CountZeroLengthMetadataAsync(string dbpath)
+        {
+            using var con = await SQLiteLoader.LoadConnectionAsync(dbpath);
+            using var cmd = con.CreateCommand();
+
+            return cmd.ExecuteScalarInt64(@"SELECT COUNT(*) FROM Metadataset JOIN Blockset ON Metadataset.BlocksetID = Blockset.ID WHERE Blockset.Length = 0");
+        }
+
+        [Test]
+        [Category("RepairHandler")]
+        public async Task RepairReportsZeroLengthMetadataAsync()
+        {
+            var options = new Dictionary<string, string>(this.TestOptions);
+            WriteFileWithDistinctMetadata("a.txt", "a", 1);
+            WriteFileWithDistinctMetadata("b.txt", "b", 2);
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            await BreakOneMetadataEntryAsync(options["dbpath"], "a.txt");
+
+            // Repair reports the damage and changes nothing: the metadata is recorded in the filelists at
+            // the destination, so a local replacement would be undone by the next recreate, and until then
+            // it would hide the damage from purge-broken-files
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                {
+                    var res = await c.RepairAsync();
+                    Assert.AreEqual(0, res.Errors.Count());
+                    Assert.AreEqual(1, res.Warnings.Count(x => x.Contains("ZeroLengthMetadataNotRepaired")), "Repair should report that it will not fix the metadata");
+                    // The closing consistency check reports the condition itself, from the database layer
+                    Assert.AreEqual(1, res.Warnings.Count(x => x.Contains("-ZeroLengthMetadata]")), "The consistency check should report the unrestorable metadata");
+                    // The blockset was left with a length of 0 while keeping its blocks, which repair reports
+                    // but must not "fix" by stripping the blocks
+                    Assert.AreEqual(1, res.Warnings.Count(x => x.Contains("BlocksetLengthMismatch")), "Repair should report the unrepairable length mismatch");
+                    Assert.AreEqual(3, res.Warnings.Count(), "Warnings were: " + string.Join(" | ", res.Warnings));
+                }
+
+                // Repeating this must not fail and must not change anything: a repair loop that kept
+                // "fixing" the same entry forever is what users reported
+                Assert.AreEqual(1, await CountZeroLengthMetadataAsync(options["dbpath"]), "Repair must not change the metadata");
+            }
+
+            // purge-broken-files is the command that can resolve it
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var res = await c.PurgeBrokenFilesAsync(null);
+                Assert.AreEqual(0, res.Errors.Count());
+                Assert.AreEqual(1, res.Warnings.Count(x => x.Contains("MetadataReplacedWithEmpty")));
+            }
+
+            Assert.AreEqual(0, await CountZeroLengthMetadataAsync(options["dbpath"]), "purge-broken-files should have resolved it");
+
+            // After that, repair no longer reports unrestorable metadata. The corrupt blockset row itself
+            // survives, unreferenced, because repair deliberately does not delete unreferenced blocksets -
+            // it needs them to recreate file entries from the filelists - so the length mismatch is still
+            // reported, and only that.
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var res = await c.RepairAsync();
+                Assert.AreEqual(0, res.Errors.Count());
+                Assert.AreEqual(0, res.Warnings.Count(x => x.Contains("ZeroLengthMetadata")), "Warnings were: " + string.Join(" | ", res.Warnings));
+                TestUtils.AssertResults(await c.TestAsync(int.MaxValue));
+            }
+
+            Thread.Sleep(2000);
+            File.WriteAllText(Path.Combine(this.DATAFOLDER, "c.txt"), "c");
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+        }
+
+        [Test]
+        [Category("RepairHandler")]
+        public async Task RepairIsRepeatableAsync()
+        {
+            var options = new Dictionary<string, string>(this.TestOptions);
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.BackupAsync(new[] { this.DATAFOLDER }));
+
+            for (var i = 0; i < 3; i++)
+                using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                    TestUtils.AssertResults(await c.RepairAsync());
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.TestAsync(int.MaxValue));
+        }
+
+        /// <summary>
+        /// A repair that is aborted while it opens the local database must not treat the database
+        /// as unreadable. It used to set it aside and start recreating it from the remote files,
+        /// so aborting a repair right after it started could replace a healthy database.
+        /// </summary>
+        [Test]
+        [Category("RepairHandler")]
+        public async Task AbortedRepairDoesNotSetTheDatabaseAsideAsync()
+        {
+            File.WriteAllBytes(Path.Combine(this.DATAFOLDER, "file"), [1, 2, 3]);
+            using (var c = new Controller("file://" + this.TARGETFOLDER, this.TestOptions, null))
+                TestUtils.AssertResults(await c.BackupAsync([this.DATAFOLDER]));
+
+            // A database of its own, as the teardown does not delete the .backup files a repair
+            // leaves, and one left by an earlier run would be taken for one made by this run
+            var dbpath = Path.Combine(BASEFOLDER, $"aborted-repair-{Guid.NewGuid():N}.sqlite");
+            File.Copy(this.DBFILE, dbpath);
+            var options = new Options(new Dictionary<string, string?>(this.TestOptions) { ["dbpath"] = dbpath });
+
+            // The state an abort leaves the repair in: the progress token is cancelled. Aborting
+            // through the controller does the same, but only lands at this point by timing.
+            var results = new RepairResults();
+            results.TaskControl.Terminate();
+
+            var renames = new List<string>();
+            Exception? error = null;
+            using (Library.Logging.Log.StartScope(e =>
+            {
+                if (e.Id == "RenamingDatabase")
+                    lock (renames)
+                        renames.Add(e.FormattedMessage);
+            }))
+            using (var backend = new Library.Main.Backend.BackendManager("file://" + this.TARGETFOLDER, options, results.BackendWriter, results.TaskControl, collectDatabaseMessages: true))
+            {
+                try
+                {
+                    await new Library.Main.Operation.RepairHandler(options, results).RunAsync(backend, null!);
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+                }
+            }
+
+            Assert.IsEmpty(renames, "The aborted repair set the database aside");
+            Assert.IsInstanceOf<OperationCanceledException>(error, $"The aborted repair ended with {error}");
+            Assert.IsTrue(File.Exists(dbpath), "The database is gone");
+            Assert.IsEmpty(Directory.GetFiles(BASEFOLDER, Path.GetFileNameWithoutExtension(dbpath) + ".backup*"), "The database was renamed");
+        }
+
+        /// <summary>
+        /// A repair that cannot read the local database sets it aside and recreates it from the remote files.
+        /// In #2265 the database could not be upgraded ("table Operation already exists"), and setting it aside
+        /// then failed because the failed read still had the file open.
+        /// </summary>
+        [Test]
+        [Category("RepairHandler")]
+        [TestCase("garbage")]
+        [TestCase("tables-without-version")]
+        public async Task RepairSetsAsideAnUnreadableDatabaseAndRecreatesItAsync(string damage)
+        {
+            File.WriteAllBytes(Path.Combine(this.DATAFOLDER, "file"), [1, 2, 3]);
+            using (var c = new Controller("file://" + this.TARGETFOLDER, this.TestOptions, null))
+                TestUtils.AssertResults(await c.BackupAsync([this.DATAFOLDER]));
+
+            // A database of its own, as the teardown does not delete the .backup files a repair leaves
+            var dbpath = Path.Combine(BASEFOLDER, $"unreadable-{damage}-{Guid.NewGuid():N}.sqlite");
+            if (damage == "garbage")
+            {
+                File.WriteAllText(dbpath, "This is not a database, but it is long enough to have a header of one. " + new string('x', 200));
+            }
+            else
+            {
+                // A schema without the version table, as a database stopped half way through being created has
+                using var con = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbpath};Pooling=false");
+                con.Open();
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = @"CREATE TABLE ""Operation"" (""ID"" INTEGER PRIMARY KEY, ""Description"" TEXT NOT NULL, ""Timestamp"" INTEGER NOT NULL)";
+                cmd.ExecuteNonQuery();
+            }
+            var original = File.ReadAllBytes(dbpath);
+
+            var options = new Dictionary<string, string>(this.TestOptions) { ["dbpath"] = dbpath };
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+            {
+                var results = await c.RepairAsync();
+                Assert.That(results.Errors, Is.Empty, "The repair recreated the database");
+            }
+
+            var setAside = Directory.GetFiles(BASEFOLDER, Path.GetFileNameWithoutExtension(dbpath) + ".backup*");
+            Assert.That(setAside, Has.Length.EqualTo(1), "The unreadable database was set aside");
+            if (damage == "garbage")
+            {
+                Assert.That(File.ReadAllBytes(setAside[0]), Is.EqualTo(original), "The set aside file is unchanged");
+            }
+            else
+            {
+                // Opening the database may switch its journal mode, so the bytes can differ but the tables cannot
+                using var con = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={setAside[0]};Pooling=false;Mode=ReadOnly");
+                con.Open();
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = @"SELECT ""name"" FROM ""sqlite_master"" WHERE ""type"" = 'table'";
+                using var rd = cmd.ExecuteReader();
+                var tables = new List<string>();
+                while (rd.Read())
+                    tables.Add(rd.GetString(0));
+                Assert.That(tables, Is.EqualTo(new[] { "Operation" }), "The set aside database has the tables it had");
+            }
+
+            using (var c = new Controller("file://" + this.TARGETFOLDER, options, null))
+                TestUtils.AssertResults(await c.TestAsync(int.MaxValue));
         }
     }
 }

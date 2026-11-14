@@ -1,0 +1,331 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using System.Net.Http.Headers;
+using Duplicati.Library.Logging;
+using Duplicati.Library.RemoteControl;
+using Duplicati.Server.Database;
+using Duplicati.Server.Serialization;
+using Duplicati.WebserverCore.Abstractions;
+using Newtonsoft.Json;
+
+namespace Duplicati.WebserverCore.Services;
+
+/// <summary>
+/// Controller for handling remote control messages.
+/// </summary>
+/// <param name="connection">The connection to the database</param>
+/// <param name="httpClientFactory">The HTTP client factory</param>
+/// <param name="jwtTokenProvider">The JWT token provider</param>
+public class RemoteControllerHandler(Connection connection, IHttpClientFactory httpClientFactory, IJWTTokenProvider jwtTokenProvider, IApplicationSettings applicationSettings, IQueueRunnerService queueRunnerService, IUpdateInstallService updateInstallService) : IRemoteControllerHandler
+{
+    /// <summary>
+    /// The connect metadata key set to "true" when the console can ask this client to install an update
+    /// </summary>
+    public const string UpdateInstallFeatureKey = "feature:update-install";
+
+    /// <summary>
+    /// How long the update check of the install update command may take; the console waits for the answer
+    /// </summary>
+    private static readonly TimeSpan UpdateCheckTimeout = TimeSpan.FromSeconds(25);
+
+    /// <summary>
+    /// The log tag for this class.
+    /// </summary>
+    private static readonly string LOGTAG = Log.LogTagFromType<RemoteControllerHandler>();
+
+    /// <summary>
+    /// The name of the http client used to forward remote commands to the local server.
+    /// </summary>
+    public const string ForwardingHttpClientName = "remote-control-forwarding";
+
+    /// <inheritdoc/>
+    public Task<Dictionary<string, string?>> OnConnectAsync(Dictionary<string, string?> metadata)
+    {
+        metadata["feature:additional-report-url"] = connection.ApplicationSettings.AdditionalReportUrl;
+        metadata["feature:additional-activity-url"] = connection.ApplicationSettings.AdditionalActivityUrl;
+        // The console can tell that this client honours the confidential or protected information setting, and what the effective state is
+        metadata["feature:reduced-reporting-handled"] = "true";
+        metadata["feature:reduced-reporting-source"] = connection.ApplicationSettings.ReducedReportingSetByConsole
+            ? "console"
+            : connection.ApplicationSettings.ReducedReporting ? "local" : "off";
+        // The console can queue restore tests with the restore test control command
+        metadata["feature:restore-test"] = "true";
+        // The console can ask for the newest update to be installed with the install update command
+        if (CanInstallUpdateForConsole())
+            metadata[UpdateInstallFeatureKey] = "true";
+        if (connection.Settings != null)
+        {
+            var lookup = connection.Settings
+                .GroupBy(k => k.Name.StartsWith("--", StringComparison.Ordinal) ? k.Name.Substring(2) : k.Name, k => k.Value)
+                .ToDictionary(x => x.Key, x => x.FirstOrDefault(), StringComparer.OrdinalIgnoreCase);
+
+            var machineId = lookup.GetValueOrDefault("machine-id");
+            var machineName = lookup.GetValueOrDefault("machine-name");
+            if (!string.IsNullOrWhiteSpace(machineId))
+                metadata["machine-id"] = machineId;
+            if (!string.IsNullOrWhiteSpace(machineName))
+                metadata["machine-name"] = machineName;
+        }
+        return Task.FromResult(metadata);
+    }
+
+    /// <inheritdoc/>
+    public Task ReKeyAsync(ClaimedClientData data)
+    {
+        var oldCerts = connection.ApplicationSettings.RemoteControlConfig == null
+            ? null
+            : JsonConvert.DeserializeObject<RemoteControlConfig>(connection.ApplicationSettings.RemoteControlConfig)?.ServerCertificates;
+
+        connection.ApplicationSettings.RemoteControlConfig = JsonConvert.SerializeObject(new RemoteControlConfig
+        {
+            Token = data.JWT,
+            ServerCertificates = data.ServerCertificates ?? oldCerts ?? [],
+            ServerUrl = data.ServerUrl,
+            CertificateUrl = data.CertificateUrl
+        });
+
+        if (!applicationSettings.SettingsEncryptionKeyProvidedExternally)
+        {
+            // TODO: Implement changing the encryption key
+            // if (!string.IsNullOrWhiteSpace(data.LocalEncryptionKey) && data.LocalEncryptionKey != connection.ApplicationSettings.SettingsEncryptionKey)
+            //     connection.ChangeDbKey(keydata.LocalEncryptionKey);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// True when the console may ask this client to install updates: console control is allowed and the
+    /// installation can update itself
+    /// </summary>
+    private bool CanInstallUpdateForConsole()
+    {
+        if (connection.ApplicationSettings.DisableConsoleControl)
+            return false;
+
+        try
+        {
+            return updateInstallService.Support.Supported;
+        }
+        catch (Exception ex)
+        {
+            Log.WriteMessage(LogMessageType.Warning, LOGTAG, "UpdateInstallSupport", ex, "Failed to determine whether updates can be installed automatically");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Checks for an update and installs it, now or when the client is idle
+    /// </summary>
+    /// <returns>The response values for the console</returns>
+    private async Task<Dictionary<string, string?>> InstallUpdateAsync()
+    {
+        if (connection.ApplicationSettings.DisableConsoleControl)
+            throw new InvalidOperationException("Remote control is disabled.");
+
+        using var timeout = new CancellationTokenSource(UpdateCheckTimeout);
+        var outcome = await updateInstallService.InstallLatestForConsoleAsync(timeout.Token).ConfigureAwait(false);
+        return new Dictionary<string, string?>
+        {
+            [ControlResponseMessage.UpdateStatusKey] = outcome.Status.ToString().ToLowerInvariant(),
+            [ControlResponseMessage.UpdateVersionKey] = outcome.Version
+        };
+    }
+
+    /// <inheritdoc/>
+    public async Task OnControlAsync(KeepRemoteConnection.ControlMessage message)
+    {
+        Dictionary<string, string?>? result = null;
+        var refreshSettingsBy = DateTimeOffset.MinValue;
+
+        Log.WriteMessage(LogMessageType.Verbose, LOGTAG, "OnControl", "Received control message: {0}", message);
+        try
+        {
+            if (string.Equals(message.ControlRequestMessage.Command, ControlRequestMessage.InstallUpdateCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                result = await InstallUpdateAsync();
+            }
+            else if (string.Equals(message.ControlRequestMessage.Command, ControlRequestMessage.RestoreTestCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                result = new Dictionary<string, string?>
+                {
+                    [ControlResponseMessage.QueuedBackupIdsKey] = string.Join(",", QueueRestoreTests(message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.BackupIdsKey)))
+                };
+            }
+            else if (string.Equals(message.ControlRequestMessage.Command, ControlRequestMessage.UpdateSettingsCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                result = new Dictionary<string, string?>
+                {
+                    [ControlResponseMessage.SettingsVersionKey] = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.SettingsVersionKey)
+                };
+
+                connection.ApplicationSettings.AdditionalReportUrl = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.ReportUrlKey);
+                connection.ApplicationSettings.AdditionalActivityUrl = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.ActivityUrlKey);
+                connection.ApplicationSettings.RemoteControlDashboardUrl = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.DashboardUrlKey);
+                connection.ApplicationSettings.RemoteControlStorageApiId = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.StorageApiIdKey);
+                connection.ApplicationSettings.RemoteControlStorageApiKey = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.StorageApiKeyKey);
+                connection.ApplicationSettings.RemoteControlStorageEndpointUrl = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.StorageEndpointUrlKey);
+                connection.ApplicationSettings.RemoteControlRestoreTestIntervals = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.RestoreTestIntervalsKey);
+                connection.ApplicationSettings.RemoteControlReportOperations = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.ReportOperationsKey);
+
+                // Full-replace semantics like the other keys: a missing key means the console does not enforce confidential or protected information.
+                // The operator's own setting is never touched from here.
+                connection.ApplicationSettings.ReducedReportingSetByConsole = Library.Utility.Utility.ParseBool(
+                    message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.ReducedReportingKey), false);
+
+                var newLicenseKey = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.ClientLicenseKeyKey);
+                var currentLicenseKey = connection.ApplicationSettings.ClientLicenseKey;
+
+                if (newLicenseKey != currentLicenseKey)
+                {
+                    connection.ApplicationSettings.ClientLicenseKey = newLicenseKey;
+                    Duplicati.Proprietary.LicenseChecker.LicenseHelper.SetRemoteClientLicenseKey(newLicenseKey);
+                }
+
+                var backupConfigs = message.ControlRequestMessage.Parameters
+                    .Where(kv => kv.Key.StartsWith(ControlRequestMessage.BackupConfigKeyPrefix, StringComparison.OrdinalIgnoreCase))
+                    .Select(kv => kv.Key)
+                    .ToHashSet();
+
+                var existingBackups = connection.Backups.Where(x => !string.IsNullOrWhiteSpace(x.ExternalID) && x.ExternalID.StartsWith(ControlRequestMessage.BackupConfigKeyPrefix, StringComparison.OrdinalIgnoreCase))
+                    .ToDictionary(x => x.ExternalID!, x => x);
+
+                var deletedBackupIds = existingBackups.Where(kv => !backupConfigs.Contains(kv.Key)).Select(kv => kv.Value.ID).ToList();
+                foreach (var id in deletedBackupIds)
+                    connection.DeleteBackup(long.Parse(id));
+
+                foreach (var externalId in backupConfigs)
+                {
+                    var config = message.ControlRequestMessage.Parameters.GetValueOrDefault(externalId);
+                    if (string.IsNullOrWhiteSpace(config))
+                        continue;
+
+                    using var reader = new StringReader(config);
+                    var importData = Serializer.Deserialize<Server.Serializable.ImportExportStructure>(reader);
+                    if (importData?.Backup == null)
+                        continue;
+
+                    importData.Backup.ExternalID = externalId;
+                    importData.Backup.ID = null;
+                    importData.Backup.SetDBPath(null);
+                    importData.Backup.Metadata = null;
+
+                    // Keep ID, DBPath and the enabled state if the backup already exists.
+                    // Enabling and disabling is a local choice, so a settings push from the
+                    // console must not re-enable a backup the user disabled here.
+                    if (existingBackups.TryGetValue(externalId, out var existing))
+                    {
+                        importData.Backup.ID = existing.ID;
+                        importData.Backup.Enabled = existing.Enabled;
+                    }
+
+                    connection.AddOrUpdateBackupAndSchedule(importData.Backup, importData.Schedule);
+                }
+
+                try
+                {
+                    // Check if we need to delay the next reconnection
+                    var refreshSettingsByValue = message.ControlRequestMessage.Parameters.GetValueOrDefault(ControlRequestMessage.RefreshSettingsByKey);
+                    if (!string.IsNullOrWhiteSpace(refreshSettingsByValue) && long.TryParse(refreshSettingsByValue, out var refreshSettingsByLong) && refreshSettingsByLong > 0)
+                    {
+                        var target = DateTimeOffset.FromUnixTimeSeconds(refreshSettingsByLong);
+                        if (target > DateTimeOffset.UtcNow)
+                            refreshSettingsBy = target;
+
+                        // Agent keeps its own config, and does not support connection delays
+                        if (applicationSettings.Origin != "Agent")
+                        {
+                            var connstr = connection.ApplicationSettings.RemoteControlConfig;
+                            if (!string.IsNullOrWhiteSpace(connstr))
+                            {
+                                var prevCfg = JsonConvert.DeserializeObject<RemoteControlConfig>(connstr);
+                                if (prevCfg != null)
+                                    connection.ApplicationSettings.RemoteControlConfig = JsonConvert.SerializeObject(
+                                        prevCfg with { RefreshSettingsBy = target }
+                                    );
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.WriteMessage(LogMessageType.Error, LOGTAG, "OnControl", ex, "Failed to update refreshSettingsBy");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.WriteMessage(LogMessageType.Error, LOGTAG, "OnControl", ex, "Failed to handle control message: {0}", message);
+            message.Respond(new ControlResponseMessage(false, null, ex.Message));
+            return;
+        }
+
+        // Respond first, then disconnect if needed
+        message.Respond(new ControlResponseMessage(true, result, null));
+
+        if (refreshSettingsBy > DateTimeOffset.UtcNow)
+        {
+            Log.WriteMessage(LogMessageType.Information, LOGTAG, "OnControl", "Requesting disconnect after responding to control message");
+            message.RequestDisconnect(refreshSettingsBy);
+        }
+    }
+
+
+    /// <summary>
+    /// Queues a restore test for each of the backups the console names by their reported id
+    /// </summary>
+    /// <param name="backupIds">The comma separated backup ids, as reported in the backup reports</param>
+    /// <returns>The backup ids a restore test is queued or running for</returns>
+    private IReadOnlyList<string> QueueRestoreTests(string? backupIds)
+    {
+        if (connection.ApplicationSettings.DisableConsoleControl)
+            throw new InvalidOperationException("Remote control is disabled.");
+
+        return RestoreTestQueueing.QueueForReportedBackupIds(connection, queueRunnerService,
+            (backupIds ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    }
+
+    /// <inheritdoc/>
+    public async Task OnMessageAsync(KeepRemoteConnection.CommandMessage commandMessage)
+    {
+        if (connection.ApplicationSettings.DisableConsoleControl)
+        {
+            commandMessage.Respond(new CommandResponseMessage(501, "Remote control is disabled.", null));
+            return;
+        }
+
+        using var httpClient = httpClientFactory.CreateClient(ForwardingHttpClientName);
+        var token = jwtTokenProvider.CreateAccessToken("remote-control", jwtTokenProvider.TemporaryFamilyId, TimeSpan.FromMinutes(2));
+
+        httpClient.BaseAddress = new Uri($"{(connection.ApplicationSettings.UseHTTPS ? "https" : "http")}://127.0.0.1:{connection.ApplicationSettings.LastWebserverPort}");
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        var psk = Middlewares.PreSharedKeyFilter.PreSharedKey;
+        if (!string.IsNullOrWhiteSpace(psk))
+            httpClient.DefaultRequestHeaders.Add(Middlewares.PreSharedKeyFilter.HeaderName, psk);
+
+        // Mark the request as originating from this process, so NAS integrated authentication does not reject it
+        httpClient.DefaultRequestHeaders.Add(Middlewares.LocalForwardingKey.HeaderName, Middlewares.LocalForwardingKey.Key);
+
+        await commandMessage.HandleAsync(httpClient);
+    }
+}

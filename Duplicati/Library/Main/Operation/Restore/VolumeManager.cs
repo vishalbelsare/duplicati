@@ -1,0 +1,493 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using CoCoL;
+using Duplicati.Library.Main.Volumes;
+using Duplicati.Library.Utility;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+#nullable enable
+
+namespace Duplicati.Library.Main.Operation.Restore
+{
+
+    /// <summary>
+    /// Process that manages the volumes that the `VolumeDownloader` process has downloaded.
+    /// It is responsible for fetching the volumes from the backend and caching them.
+    /// </summary>
+    internal class VolumeManager
+    {
+        /// <summary>
+        /// The log tag for this class.
+        /// </summary>
+        private static readonly string LOGTAG = Logging.Log.LogTagFromType<VolumeManager>();
+
+        /// <summary>
+        /// Number of disk-pressure evictions that must occur before a mid-run warning is emitted.
+        /// </summary>
+        private const int CACHE_PRESSURE_WARNING_THRESHOLD = 5;
+
+        /// <summary>
+        /// Returns the free space of the drive that holds the given folder, or <c>null</c> if it
+        /// could not be determined. Tests replace it to simulate a disk that is nearly full.
+        /// </summary>
+        internal static Func<string, long?> GetAvailableFreeSpace = path => Library.Utility.Utility.GetFreeSpaceForPath(path)?.FreeSpace;
+
+        /// <summary>
+        /// Helper class to read from either of two channels.
+        /// This is a workaround for the fact that CoCoL seems to deadlock on ReadFroAnyAsync
+        /// </summary>
+        /// <param name="channel1">The first channel to read from.</param>
+        /// <param name="channel2">The second channel to read from.</param>
+        private sealed class ReadFromEither(IReadChannel<object> channel1, IReadChannel<object> channel2)
+        {
+            /// <summary>
+            /// The first task that is reading from the channels.
+            /// </summary>
+            private Task<object>? t1;
+            /// <summary>
+            /// The second task that is reading from the channels.
+            /// </summary>
+            private Task<object>? t2;
+            /// <summary>
+            /// The token sources of the reads in <see cref="t1"/> and <see cref="t2"/>.
+            /// </summary>
+            /// <remarks>
+            /// A channel read registers a callback on the token it is given, and the registration stays
+            /// when the read completes. Each read therefore gets a token of its own, linked to the token
+            /// of the restore and disposed when the read completes. Otherwise the restore token would hold
+            /// a callback for every volume request, and the memory would grow with the number of blocks.
+            /// </remarks>
+            private CancellationTokenSource? c1, c2;
+
+            /// <summary>
+            /// Reads from either of the two channels asynchronously.
+            /// </summary>
+            /// <returns>The object read from the channel.</returns>
+            public async Task<object> ReadFromEitherAsync(CancellationToken token)
+            {
+                // NOTE: This is not a correct external choice,
+                // as we have actually consumed from both channels,
+                // but we only process one of them
+                // This is safe here, because the shutdown only happens on failure termination
+                if (t1 == null)
+                {
+                    c1 = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    t1 = channel1.ReadAsync(c1.Token);
+                }
+                if (t2 == null)
+                {
+                    c2 = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    t2 = channel2.ReadAsync(c2.Token);
+                }
+
+                var r = await Task.WhenAny(t1, t2).ConfigureAwait(false);
+                if (r == t1)
+                {
+                    t1 = null;
+                    c1?.Dispose();
+                    c1 = null;
+                    return await r.ConfigureAwait(false);
+                }
+                else
+                {
+                    t2 = null;
+                    c2?.Dispose();
+                    c2 = null;
+                    return await r.ConfigureAwait(false);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Runs the volume manager process.
+        /// </summary>
+        /// <param name="channels">The named channels for the restore operation.</param>
+        /// <param name="options">The restore options.</param>
+        public static Task RunAsync(Channels channels, Options options, RestoreResults results)
+        {
+            return AutomationExtensions.RunTask(
+                new
+                {
+                    VolumeRequest = channels.VolumeRequest.AsRead(),
+                    VolumeResponse = channels.VolumeResponse.AsRead(),
+                    DecompressRequest = channels.DecompressionRequest.AsWrite(),
+                    DecompressAck = channels.DecompressionAck.AsRead(),
+                    DownloadRequest = channels.DownloadRequest.AsWrite(),
+                },
+                async self =>
+                {
+                    // The maximum number of volumes to have in cache at once. If this is exceeded, we'll try to evict the least recently used volume that is not actively in use.
+                    // -1 = unlimited (disk-space-aware), 0 = disabled, >0 = hard cap in bytes.
+                    long cache_max = options.RestoreVolumeCacheHint;
+                    // Minimum free space (bytes) to maintain in temp dir — used only in unlimited mode.
+                    long cache_min_free = options.RestoreVolumeCacheMinFree;
+                    // Temp directory path used for free space queries in unlimited mode.
+                    string temp_dir = options.TempDir;
+                    // Cache of volume readers.
+                    Dictionary<long, VolumeWrapper> cache = [];
+                    // Current size of the cache in bytes.
+                    long cache_size = 0;
+                    // Maximum cache size reached during this restore run.
+                    long cache_size_max_consumed = 0;
+                    // List of which volume was accessed last. Used for cache eviction.
+                    List<long> cache_last_touched = [];
+                    // Dictionary to keep track of active downloads. Used for grouping requests to the same volume.
+                    Dictionary<long, List<BlockRequest>> in_flight_downloads = [];
+                    // Disk-pressure counters (unlimited cache mode only).
+                    HashSet<long> previously_evicted_volume_ids = [];
+                    HashSet<long> all_accessed_volume_ids = [];
+                    long disk_pressure_evictions = 0;
+                    long disk_pressure_redownloads = 0;
+                    long total_volumes_accessed = 0;
+                    bool cache_exhausted_warned = false;
+
+                    Stopwatch? sw_cache_set = options.InternalProfiling ? new() : null;
+                    Stopwatch? sw_cache_evict = options.InternalProfiling ? new() : null;
+                    Stopwatch? sw_cache_lru = options.InternalProfiling ? new() : null;
+                    Stopwatch? sw_query = options.InternalProfiling ? new() : null;
+                    Stopwatch? sw_backend = options.InternalProfiling ? new() : null;
+                    Stopwatch? sw_request = options.InternalProfiling ? new() : null;
+                    Stopwatch? sw_wakeup = options.InternalProfiling ? new() : null;
+
+                    // The largest volume seen so far, used to estimate the room a download needs.
+                    // Before any is seen, the volume size option is the estimate.
+                    long largest_volume = 0;
+                    long volume_size_estimate() => largest_volume > 0 ? largest_volume : options.VolumeSize;
+                    // Volumes that wait for room in the temporary folder before they are downloaded, in request order.
+                    Dictionary<long, List<BlockRequest>> pending_downloads = [];
+                    List<long> pending_order = [];
+
+                    // The free space in the temporary folder. When it cannot be determined, it is
+                    // treated as unlimited, so nothing is evicted and no download waits.
+                    bool free_space_unknown_warned = false;
+                    long free_space()
+                    {
+                        var free = GetAvailableFreeSpace(temp_dir);
+                        if (free.HasValue)
+                            return free.Value;
+
+                        if (!free_space_unknown_warned)
+                        {
+                            free_space_unknown_warned = true;
+                            Logging.Log.WriteWarningMessage(LOGTAG, "FreeSpaceUnknown", null, "Could not determine the free space in '{0}'. The restore volume cache will not be limited by disk space.", temp_dir);
+                        }
+                        return long.MaxValue;
+                    }
+
+                    // Evicts cached volumes for disk pressure (unlimited cache mode only).
+                    long evict_for_disk_pressure()
+                    {
+                        var evict_id = evict_lru();
+                        previously_evicted_volume_ids.Add(evict_id);
+                        disk_pressure_evictions++;
+                        if (disk_pressure_evictions == CACHE_PRESSURE_WARNING_THRESHOLD)
+                            Logging.Log.WriteWarningMessage(LOGTAG, "CachePressure", null, "Restore volume cache has begun evicting cached volumes due to low disk space in '{0}'. Restore performance may be degraded.", temp_dir);
+                        return free_space();
+                    }
+
+                    // Free space is otherwise only checked when a decrypted volume is added to the
+                    // cache. A volume that is downloaded and decrypted needs room before that: the
+                    // downloaded file and the decrypted file, about twice its size, for each volume
+                    // in flight. Without this, the volumes in flight could fill the disk while
+                    // decrypting, above the minimum free space (#6606). Cached volumes are evicted
+                    // to make room, and when that is not enough, the download waits until a volume
+                    // in flight is done. One volume is always allowed, so the restore goes on.
+                    bool make_room_for_download()
+                    {
+                        var needed = cache_min_free + (in_flight_downloads.Count + 1) * 2 * volume_size_estimate();
+                        var available_free_space = free_space();
+                        // The most recently used volume is kept, as its blocks are likely still
+                        // being requested; evicting it would only download it again
+                        while (available_free_space < needed && cache_last_touched.Count > 1)
+                            available_free_space = evict_for_disk_pressure();
+                        return available_free_space >= needed || in_flight_downloads.Count == 0;
+                    }
+
+                    async Task start_download(long volume_id, List<BlockRequest> requests)
+                    {
+                        await self.DownloadRequest.WriteAsync(volume_id).ConfigureAwait(false);
+                        in_flight_downloads[volume_id] = requests;
+                    }
+
+                    // Starts the downloads that waited for room, as long as there is room for them
+                    async Task start_pending_downloads()
+                    {
+                        while (pending_order.Count > 0 && make_room_for_download())
+                        {
+                            var volume_id = pending_order[0];
+                            pending_order.RemoveAt(0);
+                            pending_downloads.Remove(volume_id, out var requests);
+                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Downloading volume {0}, which waited for room in the temporary folder", volume_id);
+                            await start_download(volume_id, requests!).ConfigureAwait(false);
+                        }
+                    }
+
+                    void handle_add(long volume_id, VolumeWrapper volume)
+                    {
+                        largest_volume = Math.Max(largest_volume, volume.Size);
+                        cache[volume_id] = volume;
+                        cache_size += volume.Size;
+                        cache_size_max_consumed = Math.Max(cache_size_max_consumed, cache_size);
+                        cache_last_touched.Add(volume_id);
+                    }
+
+                    void handle_evict(long volume_id)
+                    {
+                        Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Evicting volume {0} from cache", volume_id);
+                        sw_cache_evict?.Start();
+                        cache.Remove(volume_id, out var volume);
+                        if (volume != null)
+                        {
+                            cache_size -= volume.Size;
+                            volume.Dispose();
+                            cache_last_touched.Remove(volume_id);
+                        }
+                        sw_cache_evict?.Stop();
+                    }
+
+                    long evict_lru()
+                    {
+                        sw_cache_lru?.Start();
+                        long volume_id = -1;
+                        if (cache_last_touched.Count > 0)
+                        {
+                            // Pop the last element of cache_last_touched
+                            volume_id = cache_last_touched[0];
+                            handle_evict(volume_id);
+                        }
+                        sw_cache_lru?.Stop();
+
+                        return volume_id;
+                    }
+
+                    await results.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false);
+
+                    var rfa = new ReadFromEither(self.VolumeResponse, self.VolumeRequest);
+                    try
+                    {
+                        while (true)
+                        {
+                            // TODO: CoCol ReadFromAnyAsync deadlocks, so we use a workaround
+                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Waiting for volume request or response");
+                            var msg = await rfa.ReadFromEitherAsync(results.TaskControl.ProgressToken).ConfigureAwait(false);
+                            switch (msg)
+                            {
+                                case BlockRequest request:
+                                    switch (request.RequestType)
+                                    {
+                                        case BlockRequestType.CacheEvict:
+                                            {
+                                                Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Evicting volume {0} from cache by request", request.VolumeID);
+                                                handle_evict(request.VolumeID);
+                                            }
+                                            break;
+                                        case BlockRequestType.Download:
+                                            {
+                                                Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Got a request for block {0} from volume {1}", request.BlockID, request.VolumeID);
+                                                sw_request?.Start();
+                                                if (cache.TryGetValue(request.VolumeID, out var volume))
+                                                {
+                                                    Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Block {0} found in cache", request.BlockID);
+
+                                                    if (cache_max != 0)
+                                                    {
+                                                        // Move the accessed volume to the end of the LRU list.
+                                                        cache_last_touched.Remove(request.VolumeID);
+                                                        cache_last_touched.Add(request.VolumeID);
+                                                    }
+                                                    volume.Reference();
+
+                                                    Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Requesting decompression of block {0} from cached volume {1}", request.BlockID, request.VolumeID);
+                                                    await self.DecompressRequest.WriteAsync((request, volume)).ConfigureAwait(false);
+                                                }
+                                                else
+                                                {
+                                                    Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Block {0} not found in cache, requesting volume {1}", request.BlockID, request.VolumeID);
+                                                    if (in_flight_downloads.TryGetValue(request.VolumeID, out var waiters)
+                                                        || pending_downloads.TryGetValue(request.VolumeID, out waiters))
+                                                    {
+                                                        waiters.Add(request);
+                                                    }
+                                                    else
+                                                    {
+                                                        if (all_accessed_volume_ids.Add(request.VolumeID))
+                                                            total_volumes_accessed++;
+                                                        if (previously_evicted_volume_ids.Contains(request.VolumeID))
+                                                            disk_pressure_redownloads++;
+                                                        if (cache_max >= 0 || make_room_for_download())
+                                                        {
+                                                            await start_download(request.VolumeID, [request]).ConfigureAwait(false);
+                                                        }
+                                                        else
+                                                        {
+                                                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Volume {0} waits for room in the temporary folder", request.VolumeID);
+                                                            pending_downloads[request.VolumeID] = [request];
+                                                            pending_order.Add(request.VolumeID);
+                                                        }
+                                                    }
+                                                }
+                                                sw_request?.Stop();
+                                            }
+                                            break;
+                                        default:
+                                            throw new InvalidOperationException($"Unexpected request type: {request.RequestType}");
+                                    }
+                                    break;
+                                case (long volume_id, VolumeWrapper volume):
+                                    {
+                                        sw_cache_set?.Start();
+                                        volume.Reference(in_flight_downloads[volume_id].Count);
+                                        if (cache_max == 0)
+                                        {
+                                            // Caching disabled — dispose immediately.
+                                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Not caching volume {0} (caching disabled)", volume_id);
+                                            volume.Dispose();
+                                        }
+                                        else if (cache_max > 0)
+                                        {
+                                            // Hard-cap LRU: evict until the new volume fits.
+                                            while (cache_size > 0 && (cache_size + volume.Size) > cache_max)
+                                            {
+                                                // TODO switch based of the eviction strategy.
+                                                // fifo / lifo based on both when they were downloaded and when they were used
+                                                // random
+                                                // Heuristic based of accesses and recency
+
+                                                // Cache would overflow if we request another; we have to evict something, or store the request for later.
+                                                Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Cache full ({0} + {1} > {2}), evicting LRU", cache_size, volume.Size, cache_max);
+                                                evict_lru();
+                                            }
+
+                                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Caching volume {0} ({1} + {2} <= {3})", volume_id, cache_size, volume.Size, cache_max);
+                                            handle_add(volume_id, volume);
+                                        }
+                                        else
+                                        {
+                                            // Unlimited mode (cache_max < 0): evict LRU while free space is below the minimum.
+                                            var available_free_space = free_space();
+                                            while (available_free_space < cache_min_free && cache_size > 0)
+                                                available_free_space = evict_for_disk_pressure();
+
+                                            if (!cache_exhausted_warned && cache_size == 0 && available_free_space < cache_min_free)
+                                            {
+                                                cache_exhausted_warned = true;
+                                                Logging.Log.WriteWarningMessage(LOGTAG, "CacheExhausted", null, "Restore volume cache is empty but disk space in '{0}' is still below the configured minimum. Performance impact is likely.", temp_dir);
+                                            }
+
+                                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Caching volume {0} in unlimited mode (free space: {1})", volume_id, available_free_space);
+                                            handle_add(volume_id, volume);
+                                        }
+                                        sw_cache_set?.Stop();
+                                        sw_wakeup?.Start();
+
+                                        foreach (var request in in_flight_downloads[volume_id])
+                                        {
+                                            // Request the decompressions
+                                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeRequest", "Requesting block {0} from newly cached volume {1}", request.BlockID, volume_id);
+                                            await self.DecompressRequest.WriteAsync((request, volume)).ConfigureAwait(false);
+                                        }
+                                        in_flight_downloads.Remove(volume_id);
+                                        if (pending_order.Count > 0)
+                                            await start_pending_downloads().ConfigureAwait(false);
+                                        sw_wakeup?.Stop();
+                                        break;
+                                    }
+                                default:
+                                    throw new InvalidOperationException("Unexpected message type");
+                            }
+                        }
+                    }
+                    catch (RetiredException)
+                    {
+                        Logging.Log.WriteVerboseMessage(LOGTAG, "RetiredProcess", null, "Volume manager retired");
+
+                        results.CachePressureEvictions = disk_pressure_evictions;
+                        results.CachePressureRedownloads = disk_pressure_redownloads;
+                        results.TotalVolumesAccessed = total_volumes_accessed;
+
+                        if (options.InternalProfiling)
+                        {
+                            Logging.Log.WriteProfilingMessage(LOGTAG, "InternalTimings", $"CacheSet: {sw_cache_set?.ElapsedMilliseconds}ms, CacheEvict: {sw_cache_evict?.ElapsedMilliseconds}ms, CacheLRU: {sw_cache_lru?.ElapsedMilliseconds}ms, Query: {sw_query?.ElapsedMilliseconds}ms, Backend: {sw_backend?.ElapsedMilliseconds}ms, Request: {sw_request?.ElapsedMilliseconds}ms, Wakeup: {sw_wakeup?.ElapsedMilliseconds}ms");
+                            Logging.Log.WriteProfilingMessage(LOGTAG, "CacheUsage", $"Max used cache size: {Duplicati.Library.Utility.Utility.FormatSizeString(cache_size_max_consumed)}");
+                        }
+                    }
+                    catch (Exception) when (RestoreCancellation.IsShutdownRequested(results.TaskControl))
+                    {
+                        // An abort is an orderly shutdown that arrived by a different signal
+                        // than retirement, so it is reported the same way retirement is.
+                        Logging.Log.WriteVerboseMessage(LOGTAG, "CancelledProcess", null, "Volume manager cancelled");
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        Logging.Log.WriteErrorMessage(LOGTAG, "VolumeManagerError", ex, "Error during volume manager");
+                        throw;
+                    }
+                    finally
+                    {
+                        // Nothing else disposes what is left in the cache. `handle_evict` is
+                        // only reached from a `CacheEvict` request or from an eviction, so on
+                        // any early exit the cached volumes keep their decrypted temporary
+                        // files open. The finalizer in `TempFile` cannot recover them either,
+                        // because the volume reader holds the file without `FileShare.Delete`,
+                        // so the delete fails and is swallowed. On Windows that leaves the
+                        // files behind until the 30-day cleanup.
+                        //
+                        // Placed in a `finally` rather than in the catch blocks so it also
+                        // covers a non-exceptional exit, and it reuses `handle_evict` so that
+                        // `cache_size` and `cache_last_touched` stay consistent. `cache.Keys`
+                        // has to be copied because `handle_evict` removes from the dictionary.
+                        try
+                        {
+                            foreach (var volume_id in cache.Keys.ToList())
+                                handle_evict(volume_id);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Disposing a volume reaches a compression module's `Dispose`, and
+                            // an exception from there must not replace the exception that is
+                            // currently unwinding.
+                            Logging.Log.WriteWarningMessage(LOGTAG, "CacheDrainError", ex, "Failed to dispose the cached volumes");
+                        }
+
+                        // This process is the only reader of the volume requests and of the decrypted
+                        // volumes, and leaving the task does not retire those channels. Without this,
+                        // a block request or a decrypted volume written after a failure elsewhere in
+                        // the network fills the buffer and then waits for a reader that is gone, so the
+                        // restore never finishes. The retirement has to be immediate: a plain `Retire`
+                        // waits for the buffer to be read first, so with no reader left it never
+                        // completes and every writer, the ones already waiting and any later one,
+                        // stays blocked.
+                        await self.VolumeRequest.RetireAsync(true).ConfigureAwait(false);
+                        await self.VolumeResponse.RetireAsync(true).ConfigureAwait(false);
+                    }
+                }
+            );
+        }
+    }
+
+}

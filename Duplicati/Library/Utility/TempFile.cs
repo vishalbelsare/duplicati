@@ -1,22 +1,24 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
-// 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-// 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
-// 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-#endregion
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using System.Collections.Generic;
 using Duplicati.Library.Common.IO;
@@ -35,11 +37,19 @@ namespace Duplicati.Library.Utility
 
         private string m_path;
         private bool m_protect;
+        private bool m_disposed = false;
 
 #if DEBUG
         //In debug mode, we track the creation of temporary files, and encode the generating method into the name
         private static readonly object m_lock = new object();
         private static readonly Dictionary<string, System.Diagnostics.StackTrace> m_fileTrace = new Dictionary<string, System.Diagnostics.StackTrace>();
+
+        // Process-wide monotonic counter appended to each generated name to guarantee
+        // uniqueness. The timestamp is only second-precision and the Guid is truncated to
+        // 8 characters, so under load (many temp files created in the same second by the
+        // same caller) those alone can collide, which would produce duplicate file paths
+        // and throw from the m_fileTrace.Add below.
+        private static long m_uniqueCounter;
 
         public static System.Diagnostics.StackTrace GetStackTraceForTempFile(string filename)
         {
@@ -50,15 +60,20 @@ namespace Duplicati.Library.Utility
                     return null;
         }
 
-        private static string GenerateUniqueName()
+        internal static string GenerateUniqueName()
         {
+            // The trailing sequence number guarantees a unique name even when the caller,
+            // second-precision timestamp, and truncated Guid all coincide.
+            var seq = System.Threading.Interlocked.Increment(ref m_uniqueCounter);
             var st = new System.Diagnostics.StackTrace();
             foreach (var f in st.GetFrames())
-                if (f.GetMethod().DeclaringType.Assembly != typeof(TempFile).Assembly)
+            {
+                var asm = f.GetMethod()?.DeclaringType?.Assembly;
+                if (asm != null && asm != typeof(TempFile).Assembly)
                 {
-                    var n = string.Format("{0}_{1}_{2}_{3}", f.GetMethod().DeclaringType.FullName, f.GetMethod().Name, Library.Utility.Utility.SerializeDateTime(DateTime.UtcNow), Guid.NewGuid().ToString().Substring(0, 8));
+                    var n = string.Format("{0}_{1}_{2}_{3}_{4}", f.GetMethod().DeclaringType.FullName, f.GetMethod().Name, Library.Utility.Utility.SerializeDateTime(DateTime.UtcNow), Guid.NewGuid().ToString().Substring(0, 8), seq);
                     if (n.IndexOfAny(System.IO.Path.GetInvalidFileNameChars()) >= 0)
-                        n = string.Format("{0}_{1}_{2}_{3}", f.GetMethod().DeclaringType.Name, f.GetMethod().Name, Library.Utility.Utility.SerializeDateTime(DateTime.UtcNow), Guid.NewGuid().ToString().Substring(0, 8));
+                        n = string.Format("{0}_{1}_{2}_{3}_{4}", f.GetMethod().DeclaringType.Name, f.GetMethod().Name, Library.Utility.Utility.SerializeDateTime(DateTime.UtcNow), Guid.NewGuid().ToString().Substring(0, 8), seq);
                     if (n.IndexOfAny(System.IO.Path.GetInvalidFileNameChars()) < 0)
                     {
                         lock (m_lock)
@@ -66,14 +81,15 @@ namespace Duplicati.Library.Utility
                         return n;
                     }
                 }
+            }
 
-            var s = Guid.NewGuid().ToString();
+            var s = string.Format("{0}_{1}", Guid.NewGuid(), seq);
             lock (m_lock)
                 m_fileTrace.Add(s, st);
             return s;
         }
 #else
-        private static string GenerateUniqueName()
+        internal static string GenerateUniqueName()
         {
             return APPLICATION_PREFIX + Guid.NewGuid().ToString();
         }
@@ -177,6 +193,8 @@ namespace Duplicati.Library.Utility
 
         protected void Dispose(bool disposing)
         {
+            m_disposed = true;
+
             if (disposing)
                 GC.SuppressFinalize(this);
 
@@ -202,6 +220,9 @@ namespace Duplicati.Library.Utility
 
         ~TempFile()
         {
+            if (!m_disposed)
+                Logging.Log.WriteWarningMessage("TempFile", "Finalizer", null, "TempFile was not disposed, cleaning up");
+
             Dispose(false);
         }
 

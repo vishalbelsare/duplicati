@@ -1,31 +1,47 @@
-﻿// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
-// 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-// 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
-// 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+#nullable enable
+
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.CompilerServices;
+using System.Runtime.Versioning;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using Duplicati.Library.Common.IO;
-using Duplicati.Library.Common;
-using System.Globalization;
-using Duplicati.Library.Interface;
+using Duplicati.StreamUtil;
+
+[assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
 namespace Duplicati.Library.Utility
 {
@@ -35,16 +51,11 @@ namespace Duplicati.Library.Utility
         /// Size of buffers for copying stream
         /// </summary>
         public static long DEFAULT_BUFFER_SIZE => SystemContextSettings.Buffersize;
-        
+
         /// <summary>
         /// A cache of the FileSystemCaseSensitive property, which is computed upon the first access.
         /// </summary>
         private static bool? CachedIsFSCaseSensitive;
-
-        /// <summary>
-        /// Gets the hash algorithm used for calculating a hash
-        /// </summary>
-        public static string HashAlgorithm => "SHA256";
 
         /// <summary>
         /// The EPOCH offset (unix style)
@@ -55,6 +66,11 @@ namespace Duplicati.Library.Utility
         /// The attribute value used to indicate error
         /// </summary>
         public const FileAttributes ATTRIBUTE_ERROR = (FileAttributes)(1 << 30);
+
+        /// <summary>
+        /// The multiplier used to determine if there is enough free space on the temporary volume
+        /// </summary>
+        public const long VOLUME_SIZE_FREE_SPACE_MULTIPLIER = 10;
 
         /// <summary>
         /// The callback delegate type used to collecting file information
@@ -82,7 +98,7 @@ namespace Duplicati.Library.Utility
         /// <param name="target">The stream to write to</param>
         /// <param name="tryRewindSource">True if an attempt should be made to rewind the source stream, false otherwise</param>
         /// <param name="buf">Temporary buffer to use (optional)</param>
-        public static long CopyStream(Stream source, Stream target, bool tryRewindSource, byte[] buf = null)
+        public static long CopyStream(Stream source, Stream target, bool tryRewindSource, byte[]? buf = null)
         {
             if (tryRewindSource && source.CanSeek)
                 try { source.Position = 0; }
@@ -92,15 +108,15 @@ namespace Duplicati.Library.Utility
                 }
 
             buf = buf ?? new byte[DEFAULT_BUFFER_SIZE];
-            
+
             int read;
-			long total = 0;
-			while ((read = source.Read(buf, 0, buf.Length)) != 0)
-			{
-				target.Write(buf, 0, read);
-				total += read;
+            long total = 0;
+            while ((read = source.Read(buf, 0, buf.Length)) != 0)
+            {
+                target.Write(buf, 0, read);
+                total += read;
             }
-            
+
             return total;
         }
 
@@ -123,11 +139,11 @@ namespace Duplicati.Library.Utility
         /// <param name="tryRewindSource">True if an attempt should be made to rewind the source stream, false otherwise</param>
         /// <param name="cancelToken">Token to cancel the operation.</param>
         /// <param name="buf">Temporary buffer to use (optional)</param>
-        public static async Task<long> CopyStreamAsync(Stream source, Stream target, bool tryRewindSource, CancellationToken cancelToken, byte[] buf = null)
+        public static async Task<long> CopyStreamAsync(Stream source, Stream target, bool tryRewindSource, CancellationToken cancelToken, byte[]? buf = null)
         {
             if (tryRewindSource && source.CanSeek)
                 try { source.Position = 0; }
-                catch {}
+                catch { }
 
             buf = buf ?? new byte[DEFAULT_BUFFER_SIZE];
 
@@ -177,10 +193,37 @@ namespace Duplicati.Library.Utility
                     streamLength = stream.Position;
                     isStreamPosition = true;
                 }
-                catch { } // 
+                catch { } //
             }
 
             return streamLength;
+        }
+
+        /// <summary>
+        /// Reads a byte array and returns a string, removing any BOM if present
+        /// </summary>
+        /// <param name="s">The byte array to read from.</param>
+        /// <returns>The resulting string.</returns>
+        public static string GetStringWithoutBOM(byte[] s)
+        {
+            using var ms = new MemoryStream(s);
+            return GetStringWithoutBOM(ms, leaveOpen: false);
+        }
+
+        /// <summary>
+        /// Reads a stream and returns a string, removing any BOM if present
+        /// </summary>
+        /// <param name="stream">The stream to read from.</param>
+        /// <param name="leaveOpen">If true, the stream is not closed after reading.</param>
+        /// <returns>The resulting string.</returns>
+        public static string GetStringWithoutBOM(Stream stream, bool leaveOpen)
+        {
+            if (stream.CanSeek)
+                try { stream.Position = 0; }
+                catch { }
+
+            using var sr = new StreamReader(stream, Encoding.UTF8, true, leaveOpen: leaveOpen);
+            return sr.ReadToEnd();
         }
 
         /// <summary>
@@ -201,7 +244,7 @@ namespace Duplicati.Library.Utility
 
             //Replace the globbing expressions with the corresponding regular expressions
             globexp = globexp.Replace('?', '.').Replace("*", ".*");
-            return globexp;
+            return "^" + globexp + "$";
         }
 
         /// <summary>
@@ -243,7 +286,7 @@ namespace Duplicati.Library.Utility
         /// <returns>A list of the full filenames and foldernames. Foldernames ends with the directoryseparator char</returns>
         public static IEnumerable<string> EnumerateFileSystemEntries(string basepath)
         {
-            return EnumerateFileSystemEntries(basepath, (rootpath, path, attributes) => true, SystemIO.IO_OS.GetDirectories, Directory.GetFiles, null);
+            return EnumerateFileSystemEntries(basepath, SystemIO.IO_OS.GetDirectories, Directory.GetFiles, null);
         }
 
         /// <summary>
@@ -273,13 +316,12 @@ namespace Duplicati.Library.Utility
         /// The search is recursive.
         /// </summary>
         /// <param name="rootpath">The folder to look in</param>
-        /// <param name="callback">The function to call with the filenames</param>
         /// <param name="folderList">A function to call that lists all folders in the supplied folder</param>
         /// <param name="fileList">A function to call that lists all files in the supplied folder</param>
         /// <param name="attributeReader">A function to call that obtains the attributes for an element, set to null to avoid reading attributes</param>
         /// <param name="errorCallback">An optional function to call with error messages.</param>
         /// <returns>A list of the full filenames</returns>
-        public static IEnumerable<string> EnumerateFileSystemEntries(string rootpath, EnumerationFilterDelegate callback, FileSystemInteraction folderList, FileSystemInteraction fileList, ExtractFileAttributes attributeReader, ReportAccessError errorCallback = null)
+        public static IEnumerable<string> EnumerateFileSystemEntries(string rootpath, FileSystemInteraction folderList, FileSystemInteraction fileList, ExtractFileAttributes? attributeReader, ReportAccessError? errorCallback = null)
         {
             var lst = new Stack<string>();
 
@@ -289,17 +331,11 @@ namespace Duplicati.Library.Utility
                 try
                 {
                     var attr = attributeReader?.Invoke(rootpath) ?? FileAttributes.Directory;
-                    if (callback(rootpath, rootpath, attr))
-                        lst.Push(rootpath);
+                    lst.Push(rootpath);
                 }
-                catch (System.Threading.ThreadAbortException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
+                catch (Exception ex) when (!ex.IsAbortException())
                 {
                     errorCallback?.Invoke(rootpath, rootpath, ex);
-                    callback(rootpath, rootpath, FileAttributes.Directory | ATTRIBUTE_ERROR);
                 }
 
                 while (lst.Count > 0)
@@ -316,92 +352,41 @@ namespace Duplicati.Library.Utility
                             try
                             {
                                 var attr = attributeReader?.Invoke(sf) ?? FileAttributes.Directory;
-                                if (callback(rootpath, sf, attr))
-                                    lst.Push(sf);
+                                lst.Push(sf);
                             }
-                            catch (System.Threading.ThreadAbortException)
-                            {
-                                throw;
-                            }
-                            catch (Exception ex)
+                            catch (Exception ex) when (!ex.IsAbortException())
                             {
                                 errorCallback?.Invoke(rootpath, sf, ex);
-                                callback(rootpath, sf, FileAttributes.Directory | ATTRIBUTE_ERROR);
                             }
                         }
                     }
-                    catch (System.Threading.ThreadAbortException)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
+                    catch (Exception ex) when (!ex.IsAbortException())
                     {
                         errorCallback?.Invoke(rootpath, f, ex);
-                        callback(rootpath, f, FileAttributes.Directory | ATTRIBUTE_ERROR);
                     }
 
-                    string[] files = null;
+                    string[]? files = null;
                     if (fileList != null)
                     {
                         try
                         {
                             files = fileList(f);
                         }
-                        catch (System.Threading.ThreadAbortException)
-                        {
-                            throw;
-                        }
-                        catch (Exception ex)
+                        catch (Exception ex) when (!ex.IsAbortException())
                         {
                             errorCallback?.Invoke(rootpath, f, ex);
-                            callback(rootpath, f, FileAttributes.Directory | ATTRIBUTE_ERROR);
                         }
                     }
 
                     if (files != null)
                     {
                         foreach (var s in files)
-                        {
-                            try
-                            {
-                                var attr = attributeReader?.Invoke(s) ?? FileAttributes.Normal;
-                                if (!callback(rootpath, s, attr))
-                                    continue;
-                            }
-                            catch (System.Threading.ThreadAbortException)
-                            {
-                                throw;
-                            }
-                            catch (Exception ex)
-                            {
-                                errorCallback?.Invoke(rootpath, s, ex);
-                                callback(rootpath, s, ATTRIBUTE_ERROR);
-                                continue;
-                            }
                             yield return s;
-                        }
                     }
                 }
             }
             else
             {
-                try
-                {
-                    var attr = attributeReader?.Invoke(rootpath) ?? FileAttributes.Normal;
-                    if (!callback(rootpath, rootpath, attr))
-                        yield break;
-                }
-                catch (System.Threading.ThreadAbortException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    errorCallback?.Invoke(rootpath, rootpath, ex);
-                    callback(rootpath, rootpath, ATTRIBUTE_ERROR);
-                    yield break;
-                }
-
                 yield return rootpath;
             }
         }
@@ -412,7 +397,7 @@ namespace Duplicati.Library.Utility
         /// <param name="path">Path to test</param>
         /// <param name="attributeReader">Function to use for testing path</param>
         /// <returns>True if path is refers to a folder</returns>
-        public static bool IsFolder(string path, ExtractFileAttributes attributeReader)
+        public static bool IsFolder(string path, ExtractFileAttributes? attributeReader)
         {
             if (attributeReader == null)
                 return true;
@@ -437,7 +422,7 @@ namespace Duplicati.Library.Utility
         public static bool IsPathBelowFolder(string fileOrFolderPath, string parentFolder)
         {
             var sanitizedParentFolder = Util.AppendDirSeparator(parentFolder);
-            return fileOrFolderPath.StartsWith(sanitizedParentFolder, ClientFilenameStringComparison) && 
+            return fileOrFolderPath.StartsWith(sanitizedParentFolder, ClientFilenameStringComparison) &&
                    !fileOrFolderPath.Equals(sanitizedParentFolder, ClientFilenameStringComparison);
         }
 
@@ -447,7 +432,7 @@ namespace Duplicati.Library.Utility
         /// <param name="path">Full file or folder path</param>
         /// <param name="forceTrailingDirectorySeparator">If true, return value always has trailing separator</param>
         /// <returns>Parent folder of path (containing folder for file paths, parent folder for folder paths)</returns>
-        public static string GetParent(string path, bool forceTrailingDirectorySeparator)
+        public static string? GetParent(string path, bool forceTrailingDirectorySeparator)
         {
             var len = path.Length - 1;
             if (len > 1 && path[len] == Path.DirectorySeparatorChar)
@@ -458,14 +443,14 @@ namespace Duplicati.Library.Utility
             var last = path.LastIndexOf(Path.DirectorySeparatorChar, len);
             if (last == -1 || last == 0 && len == 0)
                 return null;
-            
-            if (last == 0 && !Platform.IsClientWindows)
+
+            if (last == 0 && !OperatingSystem.IsWindows())
                 return Util.DirectorySeparatorString;
 
             var parent = path.Substring(0, last);
 
             if (forceTrailingDirectorySeparator ||
-                Platform.IsClientWindows && parent.Length == 2 && parent[1] == ':' && char.IsLetter(parent[0]))
+                OperatingSystem.IsWindows() && parent.Length == 2 && parent[1] == ':' && char.IsLetter(parent[0]))
             {
                 parent += Path.DirectorySeparatorChar;
             }
@@ -473,7 +458,17 @@ namespace Duplicati.Library.Utility
             return parent;
         }
 
-        
+        /// <summary>
+        /// Generates a new GUID and returns it as a hex string (without hyphens).
+        /// </summary>
+        /// <remarks>The string is preformed using invariant culture.</remarks>
+        /// <returns>A hex string representation of a new GUID</returns>
+        public static string GetHexGuid()
+        {
+            return ByteArrayAsHexString(
+                Guid.NewGuid().ToByteArray()
+            );
+        }
 
         /// <summary>
         /// Given a collection of unique folders, returns only parent-most folders
@@ -491,7 +486,7 @@ namespace Duplicati.Library.Utility
             foreach (var folder1 in folders)
             {
                 bool addFolder = true;
-                LinkedListNode<string> next;
+                LinkedListNode<string>? next;
                 for (var node = result.First; node != null; node = next)
                 {
                     next = node.Next;
@@ -519,7 +514,7 @@ namespace Duplicati.Library.Utility
 
             return result.Distinct();
         }
-        
+
         /// <summary>
         /// Given a collection of file paths, return those NOT contained within specified collection of folders
         /// </summary>
@@ -573,13 +568,13 @@ namespace Duplicati.Library.Utility
         /// <param name="buf">The buffer to read into.</param>
         /// <param name="count">The amount of bytes to read.</param>
         /// <returns>The number of bytes read</returns>
-        public static async Task<int> ForceStreamReadAsync(this System.IO.Stream stream, byte[] buf, int count)
+        public static async Task<int> ForceStreamReadAsync(this System.IO.Stream stream, byte[] buf, int count, CancellationToken cancellationToken)
         {
             int a;
             int index = 0;
             do
             {
-                a = await stream.ReadAsync(buf, index, count).ConfigureAwait(false);
+                a = await stream.ReadAsync(buf, index, count, cancellationToken).ConfigureAwait(false);
                 index += a;
                 count -= a;
             } while (a != 0 && count > 0);
@@ -637,16 +632,6 @@ namespace Duplicati.Library.Utility
         }
 
         /// <summary>
-        /// Calculates the hash of a given stream, and returns the results as an base64 encoded string
-        /// </summary>
-        /// <param name="stream">The stream to calculate the hash for</param>
-        /// <returns>The base64 encoded hash</returns>
-        public static string CalculateHash(Stream stream)
-        {
-            return Convert.ToBase64String(HashAlgorithmHelper.Create(HashAlgorithm).ComputeHash(stream));
-        }
-
-        /// <summary>
         /// Reads a file, attempts to detect encoding
         /// </summary>
         /// <param name="filename">The path to the file to read</param>
@@ -655,7 +640,7 @@ namespace Duplicati.Library.Utility
         {
             // Since StreamReader defaults to UTF8 and most text files will NOT be UTF8 without BOM,
             // we need to detect the encoding (at least that it's not UTF8).
-            // So we read the first 4096 bytes and try to decode them as UTF8. 
+            // So we read the first 4096 bytes and try to decode them as UTF8.
             var buffer = new byte[4096];
             using (var file = new FileStream(filename, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
@@ -683,7 +668,7 @@ namespace Duplicati.Library.Utility
         }
 
         /// <summary>
-        /// Formats a size into a human readable format, eg. 2048 becomes &quot;2 KB&quot; or -2283 becomes &quot;-2.23 KB%quot.
+        /// Formats a size into a human readable format, e.g. 2048 becomes &quot;2 KB&quot; or -2283 becomes &quot;-2.23 KB%quot.
         /// </summary>
         /// <param name="size">The size to format</param>
         /// <returns>A human readable string representing the size</returns>
@@ -699,38 +684,7 @@ namespace Duplicati.Library.Utility
             else if (sizeAbs >= 1024)
                 return Strings.Utility.FormatStringKB(size / 1024);
             else
-                return Strings.Utility.FormatStringB((long) size); // safe to cast because lower than 1024 and thus well within range of long
-        }
-
-        public static System.Threading.ThreadPriority ParsePriority(string value)
-        {
-            if (string.IsNullOrEmpty(value) || value.Trim().Length == 0)
-                return System.Threading.ThreadPriority.Normal;
-
-            switch (value.ToLower(CultureInfo.InvariantCulture).Trim())
-            {
-                case "+2":
-                case "high":
-                case "highest":
-                    return System.Threading.ThreadPriority.Highest;
-                case "+1":
-                case "abovenormal":
-                case "above normal":
-                    return System.Threading.ThreadPriority.AboveNormal;
-
-                case "-1":
-                case "belownormal":
-                case "below normal":
-                    return System.Threading.ThreadPriority.BelowNormal;
-                case "-2":
-                case "low":
-                case "lowest":
-                case "idle":
-                    return System.Threading.ThreadPriority.Lowest;
-
-                default:
-                    return System.Threading.ThreadPriority.Normal;
-            }
+                return Strings.Utility.FormatStringB((long)size); // safe to cast because lower than 1024 and thus well within range of long
         }
 
         /// <summary>
@@ -739,7 +693,7 @@ namespace Duplicati.Library.Utility
         /// <param name="value">The value to parse.</param>
         /// <param name="defaultFunc">A delegate that returns the default value if <paramref name="value"/> is not a valid boolean value.</param>
         /// <returns>The parsed value, or the value returned by <paramref name="defaultFunc"/>.</returns>
-        public static bool ParseBool(string value, Func<bool> defaultFunc)
+        public static bool ParseBool(string? value, Func<bool> defaultFunc)
         {
             if (String.IsNullOrWhiteSpace(value))
             {
@@ -769,7 +723,7 @@ namespace Duplicati.Library.Utility
         /// <param name="value">The value to parse.</param>
         /// <param name="default">The default value, in case <paramref name="value"/> is not a valid boolean value.</param>
         /// <returns>The parsed value, or the default value.</returns>
-        public static bool ParseBool(string value, bool @default)
+        public static bool ParseBool(string? value, bool @default)
         {
             return ParseBool(value, () => @default);
         }
@@ -779,14 +733,44 @@ namespace Duplicati.Library.Utility
         /// </summary>
         /// <param name="options">The set of options to look for the setting in</param>
         /// <param name="value">The value to look for in the settings</param>
-        /// <returns></returns>
-        public static bool ParseBoolOption(IDictionary<string, string> options, string value)
+        /// <returns>The parsed value, or the default value (<c>false</c>).</returns>
+        public static bool ParseBoolOption(IReadOnlyDictionary<string, string?> options, string value)
         {
-            string opt;
-            if (options.TryGetValue(value, out opt))
+            if (options.TryGetValue(value, out var opt))
                 return ParseBool(opt, true);
             else
                 return false;
+        }
+
+        /// <summary>
+        /// Parses an integer option from the option set, returning the default value if the option is not found or cannot be parsed
+        /// </summary>
+        /// <param name="options">The set of options to look for the setting in</param>
+        /// <param name="value">The value to look for in the settings</param>
+        /// <param name="default">The default value to return if there are no matches.</param>
+        /// <returns>The parsed or default integer value.</returns>
+        public static TimeSpan ParseTimespanOption(IReadOnlyDictionary<string, string?> options, string value, string @default)
+        {
+            var opt = options.GetValueOrDefault(value);
+            if (string.IsNullOrWhiteSpace(opt))
+                opt = @default;
+
+            return Timeparser.ParseTimeSpan(opt);
+        }
+
+        /// <summary>
+        /// Parses a GUID option from the option set, returning the default value if the option is not found or cannot be parsed
+        /// </summary>
+        /// <param name="options">The set of options to look for the setting in</param>
+        /// <param name="value">The value to look for in the settings</param>
+        /// <param name="default">The default value to return if there are no matches.</param>
+        /// <returns>The parsed or default GUID value.</returns>
+        public static Guid ParseGuidOption(IReadOnlyDictionary<string, string?> options, string value, Guid @default)
+        {
+            if (!options.TryGetValue(value, out var opt) || string.IsNullOrWhiteSpace(opt))
+                return @default;
+
+            return Guid.TryParse(opt, out var result) ? result : @default;
         }
 
         /// <summary>
@@ -797,9 +781,60 @@ namespace Duplicati.Library.Utility
         /// <param name="value">The value to look for in the settings</param>
         /// <param name="default">The default value to return if there are no matches.</param>
         /// <typeparam name="T">The enum type parameter.</typeparam>
-        public static T ParseEnumOption<T>(IDictionary<string, string> options, string value, T @default)
+        public static T ParseEnumOption<T>(IReadOnlyDictionary<string, string?> options, string value, T @default) where T : struct, Enum
         {
             return options.TryGetValue(value, out var opt) ? ParseEnum(opt, @default) : @default;
+        }
+
+        /// <summary>
+        /// Parses a flags-type enum found in the options dictionary
+        /// </summary>
+        /// <returns>The parsed or default enum value.</returns>
+        /// <param name="options">The set of options to look for the setting in</param>
+        /// <param name="value">The value to look for in the settings</param>
+        /// <param name="default">The default value to return if there are no matches.</param>
+        /// <typeparam name="T">The enum type parameter.</typeparam>
+        public static T ParseFlagsOption<T>(IReadOnlyDictionary<string, string?> options, string value, T @default) where T : struct, Enum
+        {
+            return options.TryGetValue(value, out var opt) ? ParseFlags(opt, @default) : @default;
+        }
+
+        /// <summary>
+        /// Parses a list of enums found in the options dictionary
+        /// </summary>
+        /// <returns>The distinct parsed enum values, or the default values.</returns>
+        /// <param name="options">The set of options to look for the setting in</param>
+        /// <param name="value">The value to look for in the settings</param>
+        /// <param name="default">The default values to return if there are no matches.</param>
+        /// <typeparam name="T">The enum type parameter.</typeparam>
+        public static T[] ParseEnumsOption<T>(IReadOnlyDictionary<string, string?> options, string value, IEnumerable<T> @default) where T : struct, Enum
+        {
+            return options.TryGetValue(value, out var opt) ? ParseEnums(opt, @default) : @default.ToArray();
+        }
+
+        /// <summary>
+        /// Attempts to parse an enum by its name with case-insensitive lookup.
+        /// Only the names of the enum are matched, numeric values are not accepted.
+        /// </summary>
+        /// <returns><c>true</c> if the value is the name of an enum member, <c>false</c> otherwise.</returns>
+        /// <param name="value">The string to parse.</param>
+        /// <param name="result">The parsed enum value.</param>
+        /// <typeparam name="T">The enum type parameter.</typeparam>
+        public static bool TryParseEnum<T>(string? value, out T result) where T : struct, Enum
+        {
+            result = default;
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            value = value.Trim();
+            foreach (var s in Enum.GetNames(typeof(T)))
+                if (s.Equals(value, StringComparison.OrdinalIgnoreCase))
+                {
+                    result = (T)Enum.Parse(typeof(T), s);
+                    return true;
+                }
+
+            return false;
         }
 
         /// <summary>
@@ -809,13 +844,81 @@ namespace Duplicati.Library.Utility
         /// <param name="value">The string to parse.</param>
         /// <param name="default">The default value to return if there are no matches.</param>
         /// <typeparam name="T">The enum type parameter.</typeparam>
-        public static T ParseEnum<T>(string value, T @default)
-        {
-            foreach (var s in Enum.GetNames(typeof(T)))
-                if (s.Equals(value, StringComparison.OrdinalIgnoreCase))
-                    return (T)Enum.Parse(typeof(T), s);
+        public static T ParseEnum<T>(string? value, T @default) where T : struct, Enum
+            => TryParseEnum<T>(value, out var result) ? result : @default;
 
-            return @default;
+        /// <summary>
+        /// Parses a comma-separated list of enum names with case-insensitive lookup.
+        /// Names that do not match an enum member are ignored.
+        /// </summary>
+        /// <returns>The distinct parsed enum values, in the order they are listed, or the default values.</returns>
+        /// <param name="value">The string to parse.</param>
+        /// <param name="default">The default values to return if there are no matches.</param>
+        /// <typeparam name="T">The enum type parameter.</typeparam>
+        public static T[] ParseEnums<T>(string? value, IEnumerable<T> @default) where T : struct, Enum
+        {
+            var result = new List<T>();
+            foreach (var s in (value ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                if (TryParseEnum<T>(s, out var item) && !result.Contains(item))
+                    result.Add(item);
+
+            return result.Count == 0 ? @default.ToArray() : result.ToArray();
+        }
+
+        /// <summary>
+        /// Parses a string into a flags enum value.
+        /// </summary>
+        /// <typeparam name="T">The enum type to parse.</typeparam>
+        /// <param name="value">The value to parse.</param>
+        /// <param name="default">The default value to return if the value is empty.</param>
+        /// <returns>The combined flags, or the default value</returns>
+        public static T ParseFlags<T>(string? value, T @default) where T : struct, Enum
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return @default;
+
+            var flags = 0L;
+            foreach (var flag in ParseEnums<T>(value, []))
+                flags |= Convert.ToInt64(flag);
+
+            return (T)Enum.ToObject(typeof(T), flags);
+        }
+
+        /// <summary>
+        /// Parses an option with int value, returning the default value if the option is not found or cannot be parsed
+        /// </summary>
+        /// <param name="options">The set of options to look for the setting in</param>
+        /// <param name="value">The value to look for in the settings</param>
+        /// <param name="default">default value</param>
+        /// <returns></returns>
+        public static int ParseIntOption(IReadOnlyDictionary<string, string?> options, string value, int @default)
+            => options.TryGetValue(value, out var opt) && int.TryParse(opt ?? string.Empty, out var result) ? result : @default;
+
+        /// <summary>
+        /// Parses an option with long value, returning the default value if the option is not found or cannot be parsed
+        /// </summary>
+        /// <param name="options">The set of options to look for the setting in</param>
+        /// <param name="value">The value to look for in the settings</param>
+        /// <param name="default">default value</param>
+        /// <returns></returns>
+        public static long ParseLongOption(IReadOnlyDictionary<string, string?> options, string value, long @default)
+            => options.TryGetValue(value, out var opt) && long.TryParse(opt ?? string.Empty, out var result) ? result : @default;
+
+        /// <summary>
+        /// Parses a size option from the option set, returning the default value if the option is not found or cannot be parsed
+        /// </summary>
+        /// <param name="options">The set of options to look for the setting in</param>
+        /// <param name="value">The value to look for in the settings</param>
+        /// <param name="defaultMultiplier">Multiplier to use if the value does not have a multiplier</param>
+        /// <param name="default">The default value to return if there are no matches.</param>
+        /// <returns>The parsed or default size value.</returns>
+        public static long ParseSizeOption(IReadOnlyDictionary<string, string?> options, string value, string defaultMultiplier, string @default)
+        {
+            var opt = options.GetValueOrDefault(value);
+            if (string.IsNullOrWhiteSpace(opt))
+                opt = @default;
+
+            return Sizeparser.ParseSize(opt, defaultMultiplier);
         }
 
         /// <summary>
@@ -840,9 +943,27 @@ namespace Duplicati.Library.Utility
                 data[i / 2] = Convert.ToByte(hex.Substring(i, 2), 16);
         }
 
+        /// <summary>
+        /// Converts a hex string to a byte array, as a function so no variable declaration on caller's side is needed
+        /// </summary>
+        /// <returns>The string as byte array.</returns>
+        /// <param name="hex">The hex string</param>
+        public static byte[] HexStringAsByteArray(string hex)
+        {
+            var data = new byte[hex.Length / 2];
+            HexStringAsByteArray(hex, data);
+            return data;
+        }
+
+        [SupportedOSPlatform("linux")]
+        [SupportedOSPlatform("macos")]
+        /// <summary>
+        /// Invokes the &quot;which&quot; command to determine if a given application is available in the path
+        /// </summary>
+        /// <param name="appname">The name of the application to look for</param>
         public static bool Which(string appname)
         {
-            if (!Platform.IsClientPosix)
+            if (!(OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()))
                 return false;
 
             try
@@ -855,7 +976,8 @@ namespace Duplicati.Library.Utility
                     UseShellExecute = false
                 };
 
-                var pi = System.Diagnostics.Process.Start(psi);
+                var pi = System.Diagnostics.Process.Start(psi)
+                    ?? throw new Exception("Unexpected failure to start process");
                 pi.WaitForExit(5000);
                 if (pi.HasExited)
                     return pi.ExitCode == 0;
@@ -871,7 +993,7 @@ namespace Duplicati.Library.Utility
 
 
         /// <value>
-        /// Returns a value indicating if the filesystem, is case sensitive 
+        /// Returns a value indicating if the filesystem, is case sensitive
         /// </value>
         public static bool IsFSCaseSensitive
         {
@@ -883,68 +1005,10 @@ namespace Duplicati.Library.Utility
 
                     // TODO: This should probably be determined by filesystem rather than OS,
                     // OSX can actually have the disks formatted as Case Sensitive, but insensitive is default
-                    CachedIsFSCaseSensitive = ParseBool(str, () => Platform.IsClientPosix && !Platform.IsClientOSX);
+                    CachedIsFSCaseSensitive = ParseBool(str, () => OperatingSystem.IsLinux());
                 }
 
                 return CachedIsFSCaseSensitive.Value;
-            }
-        }
-
-        /// <summary>
-        /// Returns a value indicating if the app is running under Mono
-        /// </summary>
-        public static bool IsMono => Type.GetType("Mono.Runtime") != null;
-
-        /// <summary>
-        /// Gets the current Mono runtime version, will return 0.0 if not running Mono
-        /// </summary>
-        public static Version MonoVersion
-        {
-            get
-            {
-                try
-                {
-                    var v = MonoDisplayVersion;
-                    if (v != null)
-                    {
-                        var regex = new Regex(@"\d+\.\d+(\.\d+)?(\.\d+)?");
-                        var match = regex.Match(v);
-                        if (match.Success)
-                            return new Version(match.Value);
-                    }
-                }
-                catch
-                {
-                    // ignored
-                }
-
-                return new Version();
-            }
-        }
-
-        /// <summary>
-        /// Gets the Mono display version, or null if not running Mono
-        /// </summary>
-        public static string MonoDisplayVersion
-        {
-            get
-            {
-                try
-                {
-                    var t = Type.GetType("Mono.Runtime");
-                    if (t != null)
-                    {
-                        var mi = t.GetMethod("GetDisplayName", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
-                        if (mi != null)
-                            return (string)mi.Invoke(null, null);
-                    }
-                }
-                catch
-                {
-                    // ignored
-                }
-
-                return null;
             }
         }
 
@@ -961,32 +1025,99 @@ namespace Duplicati.Library.Utility
         /// <summary>
         /// The path to the users home directory
         /// </summary>
-        public static readonly string HOME_PATH = Environment.GetFolderPath(Platform.IsClientPosix ? Environment.SpecialFolder.Personal : Environment.SpecialFolder.UserProfile);
+        public static readonly string HOME_PATH = Environment.GetFolderPath(!OperatingSystem.IsWindows() ? Environment.SpecialFolder.Personal : Environment.SpecialFolder.UserProfile);
 
         /// <summary>
         /// Regexp for matching environment variables on Windows (%VAR%)
         /// </summary>
-        private static readonly Regex ENVIRONMENT_VARIABLE_MATCHER_WINDOWS = new Regex(@"\%(?<name>\w+)\%");
+        private static readonly Regex ENVIRONMENT_VARIABLE_MATCHER_WINDOWS = new Regex(@"\%(?<win>\w+)\%");
 
         /// <summary>
-        /// Expands environment variables in a RegExp safe format
+        /// Regexp for matching Windows (%VAR%) and native ($VAR or ${VAR}) environment variables in a single pass
+        /// </summary>
+        private static readonly Regex ENVIRONMENT_VARIABLE_MATCHER_COMBINED = new Regex(@"\%(?<win>\w+)\%|\$\{(?<braced>[^}]+)\}|\$(?<bare>\w+)");
+
+        /// <summary>
+        /// Regexp for matching native ($VAR or ${VAR}) environment variables only
+        /// </summary>
+        private static readonly Regex ENVIRONMENT_VARIABLE_MATCHER_NATIVE_ONLY = new Regex(@"\$\{(?<braced>[^}]+)\}|\$(?<bare>\w+)");
+
+        /// <summary>
+        /// Expands environment variables in a RegExp safe format.
+        /// Windows-style %VAR% is expanded on all platforms; native $VAR and ${VAR} are
+        /// additionally expanded on non-Windows platforms.
         /// </summary>
         /// <returns>The expanded string.</returns>
         /// <param name="str">The string to expand.</param>
         /// <param name="lookup">A lookup method that converts an environment key to an expanded string</param>
-        public static string ExpandEnvironmentVariablesRegexp(string str, Func<string, string> lookup = null)
+        public static string? ExpandEnvironmentVariablesRegexp(string? str, Func<string?, string?>? lookup = null)
+            => ExpandEnvironmentVariablesRegexp(str, lookup, !OperatingSystem.IsWindows());
+
+        /// <summary>
+        /// Expands environment variables in a RegExp safe format, with explicit control over native syntax.
+        /// </summary>
+        /// <returns>The expanded string.</returns>
+        /// <param name="str">The string to expand.</param>
+        /// <param name="lookup">A lookup method that converts an environment key to an expanded string</param>
+        /// <param name="expandNativeSyntax">True to also expand native $VAR and ${VAR} syntax (in addition to %VAR%)</param>
+        internal static string? ExpandEnvironmentVariablesRegexp(string? str, Func<string?, string?>? lookup, bool expandNativeSyntax)
         {
-            if (lookup == null)
-                lookup = Environment.GetEnvironmentVariable;
+            if (string.IsNullOrWhiteSpace(str))
+                return str;
 
-            return
+            lookup ??= x => Environment.GetEnvironmentVariable(x ?? string.Empty);
 
-                // TODO: Should we switch to using the native format ($VAR or ${VAR}), instead of following the Windows scheme?
-                // IsClientLinux ? new Regex(@"\$(?<name>\w+)|(\{(?<name>[^\}]+)\})") : ENVIRONMENT_VARIABLE_MATCHER_WINDOWS
+            var matcher = expandNativeSyntax ? ENVIRONMENT_VARIABLE_MATCHER_COMBINED : ENVIRONMENT_VARIABLE_MATCHER_WINDOWS;
 
-                ENVIRONMENT_VARIABLE_MATCHER_WINDOWS.Replace(str, m => Regex.Escape(lookup(m.Groups["name"].Value)));
+            // Single pass, so a value that itself contains the other syntax is not re-expanded
+            return matcher.Replace(str, m =>
+            {
+                if (m.Groups["win"].Success)
+                    // Windows %VAR%: preserve legacy behavior - an undefined variable expands to an empty string
+                    return Regex.Escape(lookup(m.Groups["win"].Value) ?? string.Empty);
+
+                // Native $VAR / ${VAR}
+                var name = m.Groups["braced"].Success ? m.Groups["braced"].Value : m.Groups["bare"].Value;
+                var value = lookup(name);
+
+                // An undefined native variable is left untouched, so a literal '$'-containing
+                // string is never blanked or mangled
+                return value == null ? m.Value : Regex.Escape(value);
+            });
         }
-        
+
+        /// <summary>
+        /// Expands native ($VAR or ${VAR}) environment variables in a literal (non-RegExp) string.
+        /// Windows %VAR% is not touched by this method; native syntax is only expanded on non-Windows platforms.
+        /// </summary>
+        /// <returns>The expanded string.</returns>
+        /// <param name="str">The string to expand.</param>
+        /// <param name="lookup">A lookup method that converts an environment key to an expanded string</param>
+        public static string ExpandEnvironmentVariablesNative(string str, Func<string?, string?>? lookup = null)
+            => ExpandEnvironmentVariablesNative(str, lookup, !OperatingSystem.IsWindows());
+
+        /// <summary>
+        /// Expands native ($VAR or ${VAR}) environment variables in a literal string, with explicit control over native syntax.
+        /// </summary>
+        /// <returns>The expanded string.</returns>
+        /// <param name="str">The string to expand.</param>
+        /// <param name="lookup">A lookup method that converts an environment key to an expanded string</param>
+        /// <param name="expandNativeSyntax">True to expand native $VAR and ${VAR} syntax</param>
+        internal static string ExpandEnvironmentVariablesNative(string str, Func<string?, string?>? lookup, bool expandNativeSyntax)
+        {
+            if (!expandNativeSyntax || string.IsNullOrEmpty(str))
+                return str;
+
+            lookup ??= x => Environment.GetEnvironmentVariable(x ?? string.Empty);
+
+            return ENVIRONMENT_VARIABLE_MATCHER_NATIVE_ONLY.Replace(str, m =>
+            {
+                var name = m.Groups["braced"].Success ? m.Groups["braced"].Value : m.Groups["bare"].Value;
+                // An undefined native variable is left untouched (no regex escaping - this is a literal path/glob)
+                return lookup(name) ?? m.Value;
+            });
+        }
+
         /// <summary>
         /// Normalizes a DateTime instance by converting to UTC and flooring to seconds.
         /// </summary>
@@ -998,22 +1129,22 @@ namespace Duplicati.Library.Utility
             ticks -= ticks % TimeSpan.TicksPerSecond;
             return new DateTime(ticks, DateTimeKind.Utc);
         }
-        
-	/// <summary>
-	/// Given a DateTime instance, return the number of elapsed seconds since the Unix epoch
-	/// </summary>
-	/// <returns>The number of elapsed seconds since the Unix epoch</returns>
-	/// <param name="input">The input time</param>
+
+        /// <summary>
+        /// Given a DateTime instance, return the number of elapsed seconds since the Unix epoch
+        /// </summary>
+        /// <returns>The number of elapsed seconds since the Unix epoch</returns>
+        /// <param name="input">The input time</param>
         public static long NormalizeDateTimeToEpochSeconds(DateTime input)
         {
             // Note that we cannot return (new DateTimeOffset(input)).ToUnixTimeSeconds() here.
             // The DateTimeOffset constructor will convert the provided DateTime to the UTC
-            // equivalent.  However, if DateTime.MinValue is provided (for example, when creating
+            // equivalent. However, if DateTime.MinValue is provided (for example, when creating
             // a new backup), this can result in values that fall outside the DateTimeOffset.MinValue
             // and DateTimeOffset.MaxValue bounds.
-            return (long) Math.Floor((NormalizeDateTime(input) - EPOCH).TotalSeconds);
+            return (long)Math.Floor((NormalizeDateTime(input) - EPOCH).TotalSeconds);
         }
-        
+
         /// <summary>
         /// The format string for a DateTime
         /// </summary>
@@ -1060,7 +1191,7 @@ namespace Duplicati.Library.Utility
         /// <param name="collection">The collection to remove duplicate items from.</param>
         /// <param name="duplicateItems">The duplicate items in <paramref name="collection"/>.</param>
         /// <returns>The unique items from <paramref name="collection"/>.</returns>
-        public static ISet<T> GetUniqueItems<T>(IEnumerable<T> collection, out ISet<T> duplicateItems)
+        public static IList<T> GetUniqueItems<T>(IEnumerable<T> collection, out ISet<T> duplicateItems)
         {
             return GetUniqueItems(collection, EqualityComparer<T>.Default, out duplicateItems);
         }
@@ -1073,23 +1204,26 @@ namespace Duplicati.Library.Utility
         /// <param name="comparer">The <see cref="System.Collections.Generic.IEqualityComparer{T}"/> implementation to use when comparing values in the collection.</param>
         /// <param name="duplicateItems">The duplicate items in <paramref name="collection"/>.</param>
         /// <returns>The unique items from <paramref name="collection"/>.</returns>
-        public static ISet<T> GetUniqueItems<T>(IEnumerable<T> collection, IEqualityComparer<T> comparer, out ISet<T> duplicateItems)
+        public static IList<T> GetUniqueItems<T>(IEnumerable<T> collection, IEqualityComparer<T> comparer, out ISet<T> duplicateItems)
         {
             var uniqueItems = new HashSet<T>(comparer);
+            var results = new List<T>();
             duplicateItems = new HashSet<T>(comparer);
 
             foreach (var item in collection)
             {
-                if (!uniqueItems.Add(item))
+                if (uniqueItems.Add(item))
+                    results.Add(item);
+                else
                     duplicateItems.Add(item);
             }
 
-            return uniqueItems;
+            return results;
         }
 
         // <summary>
         // Returns the entry assembly or reasonable approximation if no entry assembly is available.
-        // This is the case in NUnit tests.  The following approach does not work w/ Mono due to unimplemented members:
+        // This is the case in NUnit tests. The following approach does not work w/ Mono due to unimplemented members:
         // http://social.msdn.microsoft.com/Forums/nb-NO/clr/thread/db44fe1a-3bb4-41d4-a0e0-f3021f30e56f
         // so this layer of indirection is necessary
         // </summary>
@@ -1162,7 +1296,7 @@ namespace Duplicati.Library.Utility
         /// <returns><c>true</c>, the item was printed, <c>false</c> otherwise.</returns>
         /// <param name="item">The item to write.</param>
         /// <param name="writer">The target writer.</param>
-        private static bool PrintSerializeIfPrimitive(object item, TextWriter writer)
+        private static bool PrintSerializeIfPrimitive(object? item, TextWriter writer)
         {
             if (item == null)
             {
@@ -1198,13 +1332,12 @@ namespace Duplicati.Library.Utility
         /// <param name="indentation">The string indentation</param>
         /// <param name="visited">A lookup table with visited objects, used to avoid infinite recursion</param>
         /// <param name="collectionlimit">The maximum number of items to report from an IEnumerable instance</param>
-        public static void PrintSerializeObject(object item, TextWriter writer, Func<System.Reflection.PropertyInfo, object, bool> filter = null, bool recurseobjects = false, int indentation = 0, int collectionlimit = 0, Dictionary<object, object> visited = null)
+        public static void PrintSerializeObject(object? item, TextWriter writer, Func<System.Reflection.PropertyInfo, object, bool>? filter = null, bool recurseobjects = false, int indentation = 0, int collectionlimit = 0, Dictionary<object, object?>? visited = null)
         {
-            visited = visited ?? new Dictionary<object, object>();
+            visited = visited ?? new Dictionary<object, object?>();
             var indentstring = new string(' ', indentation);
 
             var first = true;
-
 
             if (item == null || IsPrimitiveTypeForSerialization(item.GetType()))
             {
@@ -1212,6 +1345,9 @@ namespace Duplicati.Library.Utility
                 if (PrintSerializeIfPrimitive(item, writer))
                     return;
             }
+
+            if (item == null)
+                return;
 
             foreach (var p in item.GetType().GetProperties())
             {
@@ -1235,7 +1371,7 @@ namespace Duplicati.Library.Utility
                 }
                 else if (typeof(System.Collections.IEnumerable).IsAssignableFrom(p.PropertyType))
                 {
-                    var enumerable = (System.Collections.IEnumerable)p.GetValue(item, null);
+                    var enumerable = p.GetValue(item, null) as System.Collections.IEnumerable;
                     var any = false;
                     if (enumerable != null)
                     {
@@ -1319,7 +1455,7 @@ namespace Duplicati.Library.Utility
         /// <param name="recurseobjects">A value indicating if non-primitive values are recursed</param>
         /// <param name="indentation">The string indentation</param>
         /// <param name="collectionlimit">The maximum number of items to report from an IEnumerable instance, set to zero or less for reporting all</param>
-        public static StringBuilder PrintSerializeObject(object item, StringBuilder sb = null, Func<System.Reflection.PropertyInfo, object, bool> filter = null, bool recurseobjects = false, int indentation = 0, int collectionlimit = 10)
+        public static StringBuilder PrintSerializeObject(object? item, StringBuilder? sb = null, Func<System.Reflection.PropertyInfo, object, bool>? filter = null, bool recurseobjects = false, int indentation = 0, int collectionlimit = 10)
         {
             sb = sb ?? new StringBuilder();
             using (var sw = new StringWriter(sb))
@@ -1354,14 +1490,14 @@ namespace Duplicati.Library.Utility
         /// <returns>The salted hash</returns>
         public static byte[] RepeatedHashWithSalt(byte[] data, byte[] salt, int repeats = 1200)
         {
-            // We avoid storing the passphrase directly, 
+            // We avoid storing the passphrase directly,
             // instead we salt and rehash repeatedly
             using (var h = System.Security.Cryptography.SHA256.Create())
             {
                 h.Initialize();
                 h.TransformBlock(salt, 0, salt.Length, salt, 0);
                 h.TransformFinalBlock(data, 0, data.Length);
-                var buf = h.Hash;
+                var buf = h.Hash ?? throw new CryptographicUnexpectedOperationException("Computed hash was null?");
 
                 for (var i = 0; i < repeats; i++)
                 {
@@ -1376,65 +1512,108 @@ namespace Duplicati.Library.Utility
         }
 
         /// <summary>
-        /// Gets the drive letter from the given volume guid.
-        /// This method cannot be inlined since the System.Management types are not implemented in Mono
+        /// The salt used for calculating a backup Id from the remote URL.
+        /// Shared between the reporting modules so the same id is computed everywhere.
+        /// </summary>
+        public const string BACKUP_ID_SALT = "DUPL";
+
+        /// <summary>
+        /// Calculates a stable, opaque backup id from the backup's remote URL. The id is
+        /// a hex string produced by repeatedly hashing the URL with a fixed salt, so the
+        /// same remote URL always yields the same id without exposing the URL itself.
+        /// </summary>
+        /// <param name="remoteUrl">The remote backend url to compute the id for.</param>
+        /// <returns>The backup id as a hex string, or an empty string if the url is null/empty.</returns>
+        public static string CalculateBackupId(string? remoteUrl)
+        {
+            if (string.IsNullOrWhiteSpace(remoteUrl))
+                return string.Empty;
+
+            return ByteArrayAsHexString(RepeatedHashWithSalt(remoteUrl, BACKUP_ID_SALT));
+        }
+
+        /// <summary>
+        /// Gets the path the given volume is mounted on: its drive letter, or the folder
+        /// it is mounted on when it has no drive letter.
+        /// This method cannot be inlined since the Microsoft.Management.Infrastructure types are not implemented in Mono
         /// </summary>
         /// <param name="volumeGuid">Volume guid</param>
-        /// <returns>Drive letter, as a single character, or null if the volume wasn't found</returns>
+        /// <returns>The drive letter (as <c>C:</c>) or the mount folder (as <c>C:\mnt\disk\</c>), or null if the volume wasn't found or is not mounted</returns>
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-        public static string GetDriveLetterFromVolumeGuid(Guid volumeGuid)
+        [SupportedOSPlatform("windows")]
+        public static string? GetMountPathFromVolumeGuid(Guid volumeGuid)
         {
             // Based on this answer:
             // https://stackoverflow.com/questions/10186277/how-to-get-drive-information-by-volume-id
-            using (System.Management.ManagementObjectSearcher searcher = new System.Management.ManagementObjectSearcher("Select * from Win32_Volume"))
+            using var session = Microsoft.Management.Infrastructure.CimSession.Create(null);
+            string targetId = string.Format(@"\\?\Volume{{{0}}}\", volumeGuid);
+            foreach (var obj in session.QueryInstances(@"root\cimv2", "WQL", "Select DeviceID, DriveLetter, Name from Win32_Volume"))
             {
-                string targetId = string.Format(@"\\?\Volume{{{0}}}\", volumeGuid);
-                foreach (System.Management.ManagementObject obj in searcher.Get())
-                {
-                    if (string.Equals(obj["DeviceID"].ToString(), targetId, StringComparison.OrdinalIgnoreCase))
-                    {
-                        object driveLetter = obj["DriveLetter"];
-                        if (driveLetter != null)
-                        {
-                            return obj["DriveLetter"].ToString();
-                        }
-                        else
-                        {
-                            // The volume was found, but doesn't have a drive letter associated with it.
-                            break;
-                        }
-                    }
-                }
-
-                return null;
+                var deviceId = obj.CimInstanceProperties["DeviceID"]?.Value?.ToString();
+                if (string.Equals(deviceId, targetId, StringComparison.OrdinalIgnoreCase))
+                    return SelectVolumeMountPath(
+                        obj.CimInstanceProperties["DriveLetter"]?.Value?.ToString(),
+                        obj.CimInstanceProperties["Name"]?.Value?.ToString());
             }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Picks the path a volume is mounted on from its Win32_Volume properties.
+        /// The drive letter wins; otherwise the name is used when it is a folder the volume
+        /// is mounted on. A volume that is not mounted anywhere has its own volume guid path
+        /// as name, which is not used.
+        /// </summary>
+        /// <param name="driveLetter">The DriveLetter property, as <c>C:</c>, or null</param>
+        /// <param name="name">The Name property, as <c>C:\</c>, <c>C:\mnt\disk\</c> or <c>\\?\Volume{...}\</c>, or null</param>
+        /// <returns>The mount path, or null if the volume is not mounted</returns>
+        public static string? SelectVolumeMountPath(string? driveLetter, string? name)
+        {
+            if (!string.IsNullOrEmpty(driveLetter))
+                return driveLetter;
+
+            if (string.IsNullOrEmpty(name) || name.StartsWith(@"\\?\", StringComparison.Ordinal))
+                return null;
+
+            return name;
+        }
+
+        /// <summary>
+        /// Builds a regular path from the mount path of a volume and a path inside the volume
+        /// </summary>
+        /// <param name="mountPath">The mount path, as <c>C:</c> or <c>C:\mnt\disk\</c></param>
+        /// <param name="pathInVolume">The rest of the volume guid source, as <c>\data\</c>, or empty</param>
+        /// <returns>The combined path</returns>
+        public static string CombineVolumeMountPath(string mountPath, string pathInVolume)
+        {
+            var root = mountPath.TrimEnd('\\');
+            // A source of only the volume guid points to the root of the volume
+            if (string.IsNullOrEmpty(pathInVolume))
+                return root.EndsWith(':') ? root : root + @"\";
+
+            return root + (pathInVolume.StartsWith('\\') ? pathInVolume : @"\" + pathInVolume);
         }
 
         /// <summary>
         /// Gets all volume guids and their associated drive letters.
-        /// This method cannot be inlined since the System.Management types are not implemented in Mono
+        /// This method cannot be inlined since the Microsoft.Management.Infrastructure types are not implemented in Mono
         /// </summary>
         /// <returns>Pairs of drive letter to volume guids</returns>
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        [SupportedOSPlatform("windows")]
         public static IEnumerable<KeyValuePair<string, string>> GetVolumeGuidsAndDriveLetters()
         {
-            using (var searcher = new System.Management.ManagementObjectSearcher("Select * from Win32_Volume"))
+            using var session = Microsoft.Management.Infrastructure.CimSession.Create(null);
+            var results = new List<KeyValuePair<string, string>>();
+            foreach (var obj in session.QueryInstances(@"root\cimv2", "WQL", "Select DeviceID, DriveLetter from Win32_Volume"))
             {
-                foreach (var obj in searcher.Get())
-                {
-                    var deviceIdObj = obj["DeviceID"];
-                    var driveLetterObj = obj["DriveLetter"];
-                    if (deviceIdObj != null && driveLetterObj != null)
-                    {
-                        var deviceId = deviceIdObj.ToString();
-                        var driveLetter = driveLetterObj.ToString();
-                        if (!string.IsNullOrEmpty(deviceId) && !string.IsNullOrEmpty(driveLetter))
-                        {
-                            yield return new KeyValuePair<string, string>(driveLetter + @"\", deviceId);
-                        }
-                    }
-                }
+                var deviceId = obj.CimInstanceProperties["DeviceID"]?.Value?.ToString();
+                var driveLetter = obj.CimInstanceProperties["DriveLetter"]?.Value?.ToString();
+                if (!string.IsNullOrEmpty(deviceId) && !string.IsNullOrEmpty(driveLetter))
+                    results.Add(new KeyValuePair<string, string>(driveLetter + @"\", deviceId));
             }
+            return results;
         }
 
         /// <summary>
@@ -1452,12 +1631,31 @@ namespace Duplicati.Library.Utility
         /// <returns>The wrapped commandline element.</returns>
         /// <param name="arg">The argument to wrap.</param>
         /// <param name="allowEnvExpansion">A flag indicating if environment variables are allowed to be expanded</param>
-        public static string WrapCommandLineElement(string arg, bool allowEnvExpansion)
-        {
-            if (string.IsNullOrWhiteSpace(arg))
-                return arg;
+        [return: NotNullIfNotNull("arg")]
+        public static string? WrapCommandLineElement(string? arg, bool allowEnvExpansion)
+            => WrapCommandLineElement(arg, allowEnvExpansion, OperatingSystem.IsWindows());
 
-            if (!Platform.IsClientWindows)
+        /// <summary>
+        /// Wraps a single argument in quotes suitable for passing on a commandline.
+        /// </summary>
+        /// <returns>The wrapped commandline element.</returns>
+        /// <param name="arg">The argument to wrap.</param>
+        /// <param name="allowEnvExpansion">A flag indicating if environment variables are allowed to be expanded.</param>
+        /// <param name="isWindows">A flag indicating if Windows commandline escaping should be used.</param>
+        [return: NotNullIfNotNull("arg")]
+        internal static string? WrapCommandLineElement(string? arg, bool allowEnvExpansion, bool isWindows)
+        {
+            if (arg == null)
+                return null;
+
+            // An empty argument adds nothing to the commandline unless it is written as a
+            // pair of quotes. One that is only whitespace needs no special case: whitespace
+            // is outside the safe set, so it is quoted below instead of being read as the
+            // separator between arguments.
+            if (arg.Length == 0)
+                return @"""""";
+
+            if (!isWindows)
             {
                 // We could consider using single quotes that prevents all expansions
                 //if (!allowEnvExpansion)
@@ -1477,21 +1675,14 @@ namespace Duplicati.Library.Utility
             }
             else
             {
-                // Windows needs only needs " replaced with "",
-                // but is prone to %var% expansion when used in 
-                // immediate mode (i.e. from command prompt)
+                // Windows is prone to %var% expansion when used in immediate
+                // mode (i.e. from command prompt)
                 // Fortunately it does not expand when processes
                 // are started from within .Net
+                if (!allowEnvExpansion)
+                    arg = arg.Replace("%", "%%");
 
-                // TODO: I have not found a way to avoid escaping %varname%,
-                // and sadly it expands only if the variable exists
-                // making it even rarer and harder to diagnose when
-                // it happens
-                arg = arg.Replace(@"""", @"""""");
-
-                // Also fix the case where the argument ends with a slash
-                if (arg[arg.Length - 1] == '\\')
-                    arg += @"\";
+                arg = EscapeWindowsCommandLineElement(arg);
             }
 
             // Check that all characters are in the safe set
@@ -1499,6 +1690,52 @@ namespace Duplicati.Library.Utility
                 return @"""" + arg + @"""";
             else
                 return arg;
+        }
+
+        /// <summary>
+        /// Escapes an argument the way Windows reads it back: a quote is written
+        /// as \", and a run of backslashes that meets a quote is doubled. A
+        /// backslash that does not meet a quote is an ordinary character.
+        /// The run at the end meets the closing quote, so it is doubled as well;
+        /// that is correct because an argument that needed escaping is always
+        /// quoted, a backslash and a quote both being outside
+        /// <see cref="COMMANDLINE_SAFE" />.
+        /// </summary>
+        /// <returns>The escaped argument, without the surrounding quotes.</returns>
+        /// <param name="arg">The argument to escape.</param>
+        private static string EscapeWindowsCommandLineElement(string arg)
+        {
+            var sb = new StringBuilder(arg.Length);
+            var backslashes = 0;
+
+            foreach (var c in arg)
+            {
+                if (c == '\\')
+                {
+                    backslashes++;
+                }
+                else if (c == '"')
+                {
+                    // Two backslashes for each one that is to survive, and one
+                    // more to make the quote itself a literal one
+                    sb.Append('\\', backslashes * 2 + 1);
+                    sb.Append('"');
+                    backslashes = 0;
+                }
+                else
+                {
+                    sb.Append('\\', backslashes);
+                    sb.Append(c);
+                    backslashes = 0;
+                }
+            }
+
+            // An odd number in front of the closing quote would make that quote
+            // a literal one, and the argument would then swallow the rest of the
+            // commandline
+            sb.Append('\\', backslashes * 2);
+
+            return sb.ToString();
         }
 
         /// <summary>
@@ -1521,7 +1758,7 @@ namespace Duplicati.Library.Utility
         /// <param name="task">Task to await</param>
         public static void Await(this Task task)
         {
-            task.GetAwaiter().GetResult();
+            task.ConfigureAwait(false).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -1535,7 +1772,21 @@ namespace Duplicati.Library.Utility
         /// <returns>Task result</returns>
         public static T Await<T>(this Task<T> task)
         {
-            return task.GetAwaiter().GetResult();
+            return task.ConfigureAwait(false).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Utility method that emulates C#'s built in await keyword without requiring the calling method to be async.
+        /// This method should be preferred over using Task.Result, as it doesn't wrap singular exceptions in AggregateExceptions.
+        /// (It uses Task.GetAwaiter().GetResult(), which is the same thing that await uses under the covers.)
+        /// https://stackoverflow.com/questions/17284517/is-task-result-the-same-as-getawaiter-getresult
+        /// </summary>
+        /// <typeparam name="T">Result type</typeparam>
+        /// <param name="task">Task to await</param>
+        /// <returns>Task result</returns>
+        public static T Await<T>(this ValueTask<T> task)
+        {
+            return task.ConfigureAwait(false).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -1566,5 +1817,829 @@ namespace Duplicati.Library.Utility
 
             return delay;
         }
+
+        /// <summary>
+        /// Computes the delay before the next retry of an operation, as <see cref="GetRetryDelay(TimeSpan, int, bool)"/>,
+        /// but waits at least as long as the server asked for if the attempt failed because of a rate limit
+        /// that carried a Retry-After value
+        /// </summary>
+        /// <param name="retryDelay">Value of one delay unit</param>
+        /// <param name="retryAttempt">The attempt number (e.g. 1 for the first retry, 2 for the second retry, etc.)</param>
+        /// <param name="useExponentialBackoff">Whether to use exponential backoff</param>
+        /// <param name="failure">The exception the attempt failed with</param>
+        /// <param name="now">The current time, used for a Retry-After date</param>
+        /// <returns>The computed delay</returns>
+        public static TimeSpan GetRetryDelay(TimeSpan retryDelay, int retryAttempt, bool useExponentialBackoff, Exception failure, DateTimeOffset now)
+        {
+            var delay = GetRetryDelay(retryDelay, retryAttempt, useExponentialBackoff);
+            var retryAfter = GetRetryAfterDelay(ExceptionExtensions.FindRateLimit(failure)?.RetryAfter, now);
+            return retryAfter > delay ? retryAfter.Value : delay;
+        }
+
+        /// <summary>
+        /// Gets the time left until a request may be sent again, as given by a Retry-After value
+        /// </summary>
+        /// <param name="retryAfter">The Retry-After value, if any</param>
+        /// <param name="now">The current time, used for a Retry-After date</param>
+        /// <returns>The delay, never negative, or <c>null</c> if no usable value was given</returns>
+        public static TimeSpan? GetRetryAfterDelay(System.Net.Http.Headers.RetryConditionHeaderValue? retryAfter, DateTimeOffset now)
+        {
+            var delay = retryAfter?.Delta
+                ?? (retryAfter?.Date is DateTimeOffset date ? date - now : null);
+
+            if (delay == null)
+                return null;
+
+            return delay < TimeSpan.Zero ? TimeSpan.Zero : delay;
+        }
+
+        /// <summary>
+        /// Loads the pfxcertificate from bytes into an exportable format.
+        /// </summary>
+        /// <remarks>This method masks a problem with loading certificates with EC based keys by using a temporary file</remarks>
+        /// <param name="pfxcertificate">The certificate as a byte array</param>
+        /// <param name="password">The password used to protect the PFX file</param>
+        /// <param name="allowUnsafeCertificateLoad">A flag indicating if unsafe certificate loading is allowed</param>
+        /// <returns>The loaded certificate</returns>
+        public static X509Certificate2Collection LoadPfxCertificate(ReadOnlySpan<byte> pfxcertificate, string? password, bool allowUnsafeCertificateLoad = false)
+        {
+            if (string.IsNullOrWhiteSpace(password) && !allowUnsafeCertificateLoad)
+                throw new ArgumentException("Refusing to write unencryped certificate to disk");
+
+            using var tempfile = new TempFile();
+            File.WriteAllBytes(tempfile, pfxcertificate.ToArray());
+            return LoadPfxCertificate(tempfile, password);
+        }
+
+        /// <summary>
+        /// Loads a PFX certificate from a file into an exportable format.
+        /// </summary>
+        /// <param name="pfxPath">The path to the file</param>
+        /// <param name="password">The password used to protect the PFX file</param>
+        /// <returns>The loaded certificate</returns>
+        public static X509Certificate2Collection LoadPfxCertificate(string pfxPath, string? password)
+        {
+            if (string.IsNullOrEmpty(pfxPath))
+                throw new ArgumentNullException(nameof(pfxPath));
+
+            if (!File.Exists(pfxPath))
+                throw new FileNotFoundException("The specified PFX file does not exist.", pfxPath);
+
+            return X509CertificateLoader.LoadPkcs12CollectionFromFile(
+                pfxPath,
+                password,
+                X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+        }
+
+        /// <summary>
+        /// Probes the system for the presence of a loopback address on IPv4
+        /// </summary>
+        public static bool HasIPv4Loopback =>
+            NetworkInterface.GetAllNetworkInterfaces()
+                .Where(ni => ni.OperationalStatus == OperationalStatus.Up)
+                .SelectMany(ni => ni.GetIPProperties().UnicastAddresses)
+                .Any(addr => addr.Address.AddressFamily == AddressFamily.InterNetwork
+                             && addr.Address.Equals(IPAddress.Loopback));
+
+        /// <summary>
+        /// On systems that have IPV4 and IPV6, the method will return the default loopback ( 127, 0, 0, 1)
+        /// On systems with IPV6 only, the method will return the IPV6 loopback (::1)
+        /// </summary>
+        /// <returns></returns>
+        public static string IpVersionCompatibleLoopback =>
+            HasIPv4Loopback ? IPAddress.Loopback.ToString() : $"[{IPAddress.IPv6Loopback.ToString()}]";
+
+
+
+        /// <summary>
+        /// Guesses the URL scheme and returns it
+        /// </summary>
+        /// <param name="url">The URL to guess the scheme for</param>
+        /// <returns>The guessed scheme, or null if no scheme was found</returns>
+        public static string? GuessScheme(string? url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+                return null;
+
+            var idx = url.IndexOf("://");
+            if (idx < 0 || idx > 15)
+                return null;
+
+            return url[..idx];
+        }
+
+        /// <summary>
+        /// The S3 backend option holding the server hostname (or a URL with it).
+        /// </summary>
+        private const string S3_SERVER_NAME_OPTION = "s3-server-name";
+
+        /// <summary>
+        /// The server the S3 backend uses when no server name is given.
+        /// </summary>
+        private const string DEFAULT_S3_HOST = "s3.amazonaws.com";
+
+        /// <summary>
+        /// Regex used to extract the host from a URL.
+        /// </summary>
+        private static readonly Regex hostSuffixRegex = new Regex(@"^(?:[a-zA-Z][a-zA-Z0-9+\-.]*://)?([^/:]+)", RegexOptions.Compiled);
+
+        /// <summary>
+        /// List of host suffixes that are considered public cloud and safe to report.
+        /// </summary>
+        private static readonly IReadOnlySet<string> safeHostSuffixes = new HashSet<string>([
+            ".amazonaws.com",
+            ".impossibleapi.net",
+            ".scw.cloud",
+            ".hosteurope.de",
+            ".dunkel.de",
+            ".dreamhost.com",
+            ".dincloud.com",
+            ".polisystems.ch",
+            ".softlayer.net",
+            ".storadera.com",
+            ".wasabisys.com",
+            ".infomaniak.com",
+            ".infomaniak.cloud",
+            ".sakurastorage.jp",
+            ".lyvecloud.seagate.com",
+            ".digitaloceanspaces.com",
+            ".backblazeb2.com",
+            ".cloudian.com",
+            ".min.io",
+            ".linodeobjects.com",
+            ".bunnycdn.com",
+            ".azure.com",
+            ".googleapis.com",
+            ".ibm.com",
+            ".oracle.com",
+            ".cloudflare.com",
+            ".alibaba.com",
+            ".huawei.com",
+            ".tencent.com",
+            ".baidu.com",
+            ".jd.com",
+            ".ucloud.cn",
+            ".qiniu.com",
+            ".aliyuncs.com",
+            ".tcloud.com",
+            ".tencentcloudapi.com",
+            ".rabata.io",
+            ".internxt.com",
+            ".cloudflarestorage.com",
+            ".storage.selcloud.ru",
+            ".srvstorage.uz",
+            ".srvstorage.kz",
+            ".relaix.net",
+            ".neon.tech",
+            ".oraclecloud.com",
+            ".customer-oci.com",
+            ".cloud-object-storage.appdomain.cloud",
+            ".your-objectstorage.com",
+            ".cloud.ovh.net",
+            ".ionoscloud.com",
+            ".exo.io",
+            ".synologyc2.net",
+            ".myhuaweicloud.com",
+            ".myhuaweicloud.eu",
+            ".myqcloud.com",
+            ".dosya.dev",
+        ], StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Attempts to guess a safe host suffix from a URL.
+        /// This attempts to avoid reporting private or sensitive hostnames, and only returns
+        /// known public cloud suffixes.
+        /// </summary>
+        /// <param name="url">The URL to analyze.</param>
+        /// <returns>The host suffix, or null if not found or not safe to report.</returns>
+        public static string? GuessHostSuffixSafe(string? url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+                return null;
+
+            var scheme = GuessScheme(url);
+
+            // For now, only report S3 host suffixes
+            if (!string.Equals(scheme, "s3", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            try
+            {
+                // The host part of an S3 url is the bucket; the server is in the s3-server-name option
+                var queryIndex = url.IndexOf('?');
+                var query = queryIndex < 0 ? "" : url[(queryIndex + 1)..];
+                var serverName = UrlEncoding.ParseQueryString(query, true)[S3_SERVER_NAME_OPTION]?.Trim();
+
+                // Without a server name, the S3 backend connects to Amazon
+                var hostname = string.IsNullOrEmpty(serverName)
+                    ? DEFAULT_S3_HOST
+                    : hostSuffixRegex.Match(serverName).Groups[1].Value;
+                if (string.IsNullOrEmpty(hostname))
+                    return null;
+
+                // Return the first matching safe suffix
+                return safeHostSuffixes.FirstOrDefault(suffix => hostname.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Matches a leading userinfo segment (user:password@, up to the last @ before
+        /// the first path separator), optionally preceded by a scheme. The scheme needs
+        /// at least two characters so a drive letter is not mistaken for one.
+        /// </summary>
+        private static readonly Regex URL_USERINFO_MATCHER = new Regex(@"^(?<scheme>[a-zA-Z][a-zA-Z0-9+._\-]+:/{0,2})??[^/\\]*@", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Removes a leading userinfo (user:password@) segment from a url-like string,
+        /// keeping any scheme prefix
+        /// </summary>
+        /// <param name="url">The url-like string to strip</param>
+        /// <returns>The string without the userinfo segment</returns>
+        internal static string StripUrlUserInfo(string url)
+            => URL_USERINFO_MATCHER.Replace(url, "${scheme}", 1);
+
+        /// <summary>
+        /// Returns a url that is safe to display, by removing any credentials
+        /// </summary>
+        /// <param name="url">The url to sanitize</param>
+        /// <returns>The sanitized url</returns>
+        public static string GetUrlWithoutCredentials(string url)
+        {
+            // Assumed safe part of the url to show
+            const int maxShown = 25;
+            if (string.IsNullOrWhiteSpace(url))
+                return url;
+
+            // Remove any userinfo before parsing, so a url the parser misreads
+            // (or rejects) cannot carry credentials into the displayed result
+            var target = StripUrlUserInfo(url[(url.IndexOf('|') + 1)..]);
+
+            // If we can parse it, this result is better
+            try
+            {
+                var uri = new RelaxedUri(target);
+                return new RelaxedUri($"{uri.Scheme}://{uri.Host}").SetPath(uri.Path).ToString();
+            }
+            catch
+            {
+            }
+
+            // Not parseable even as a path; show a truncated prefix, without any query
+            var queryIndex = target.IndexOf('?');
+            if (queryIndex >= 0)
+                target = target[..queryIndex];
+            var shown = Math.Min(target.Length, maxShown);
+            return $"{target[..shown]}{new string('*', target.Length - shown)}";
+        }
+
+        /// <summary>
+        /// Formats the string using the invariant culture
+        /// </summary>
+        /// <param name="formattable">The formattable string</param>
+        /// <returns>The formatted string</returns>
+        public static string FormatInvariantFormattable(FormattableString formattable)
+            => formattable.ToString(CultureInfo.InvariantCulture);
+
+        /// <summary>
+        /// Formats the value using the invariant culture.
+        /// </summary>
+        /// <remarks>This is a shortcut for FormatInvariant("{0}", value).</remarks>
+        /// <typeparam name="T">The type of the value.</typeparam>
+        /// <param name="value">The value to format.</param>
+        /// <returns>The formatted string.</returns>
+        public static string FormatInvariantValue<T>(T value)
+            => value is IFormattable f
+                ? f.ToString(null, CultureInfo.InvariantCulture)
+                : string.Format(CultureInfo.InvariantCulture, "{0}", value);
+
+        /// <summary>
+        /// Performs the function with an additional timeout
+        /// </summary>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="token">The cancellation token</param>
+        /// <param name="func">The function to invoke</param>
+        /// <returns>The task</returns>
+        public static async Task WithTimeout(TimeSpan timeout, CancellationToken token, Action<CancellationToken> func)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            cts.CancelAfter(timeout);
+            try
+            {
+                // A blocking call that ignores the token cannot be interrupted,
+                // so the wait for it is given up instead and it is left to finish on its own
+                await Task.Run(() => func(cts.Token), cts.Token).WaitAsync(timeout, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested && !token.IsCancellationRequested)
+            {
+                // Only our own timeout is a timeout; a cancellation by the caller stays a cancellation,
+                // and a call may report either as an OperationCanceledException of any kind
+                throw new TimeoutException();
+            }
+        }
+
+        /// <summary>
+        /// Performs the function with an additional timeout
+        /// </summary>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="token">The cancellation token</param>
+        /// <param name="func">The function to invoke</param>
+        /// <returns>The task</returns>
+        public static async Task<T> WithTimeout<T>(TimeSpan timeout, CancellationToken token, Func<CancellationToken, T> func)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            cts.CancelAfter(timeout);
+            try
+            {
+                // A blocking call that ignores the token cannot be interrupted,
+                // so the wait for it is given up instead and it is left to finish on its own
+                return await Task.Run(() => func(cts.Token), cts.Token).WaitAsync(timeout, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested && !token.IsCancellationRequested)
+            {
+                // Only our own timeout is a timeout; a cancellation by the caller stays a cancellation,
+                // and a call may report either as an OperationCanceledException of any kind
+                throw new TimeoutException();
+            }
+        }
+
+        /// <summary>
+        /// Performs the function with an additional timeout
+        /// </summary>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="token">The cancellation token</param>
+        /// <param name="func">The function to invoke</param>
+        /// <returns>The task</returns>
+        public static async Task WithTimeout(TimeSpan timeout, CancellationToken token, Func<CancellationToken, Task> func)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            cts.CancelAfter(timeout);
+            try
+            {
+                // Stop waiting when the timeout passes, also for a call that ignores the token;
+                // such a call keeps running, and the caller must not reuse what it is using
+                await func(cts.Token).WaitAsync(cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested && !token.IsCancellationRequested)
+            {
+                // Only our own timeout is a timeout; a cancellation by the caller stays a cancellation,
+                // and a call may report either as an OperationCanceledException of any kind
+                throw new TimeoutException();
+            }
+        }
+
+        /// <summary>
+        /// Performs the function with an additional timeout
+        /// </summary>
+        /// <typeparam name="T">The return type</typeparam>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="token">The cancellation token</param>
+        /// <param name="func">The function to invoke</param>
+        /// <returns>The task</returns>
+        public static async Task<T> WithTimeout<T>(TimeSpan timeout, CancellationToken token, Func<CancellationToken, Task<T>> func)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            cts.CancelAfter(timeout);
+            try
+            {
+                // Stop waiting when the timeout passes, also for a call that ignores the token;
+                // such a call keeps running, and the caller must not reuse what it is using
+                return await func(cts.Token).WaitAsync(cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested && !token.IsCancellationRequested)
+            {
+                // Only our own timeout is a timeout; a cancellation by the caller stays a cancellation,
+                // and a call may report either as an OperationCanceledException of any kind
+                throw new TimeoutException();
+            }
+        }
+
+        /// <summary>
+        /// Wraps an async enumerable in a timeout observing enumerable
+        /// </summary>
+        /// <typeparam name="T">The type of the items in the enumerable</typeparam>
+        /// <param name="source">The source enumerable</param>
+        /// <param name="timeoutPerItem">The timeout to observe for each item</param>
+        /// <param name="outerToken">The cancellation token for the outer operation</param>
+        /// <returns>The wrapped enumerable</returns>
+        public static async IAsyncEnumerable<T> WithPerItemTimeout<T>(
+            IAsyncEnumerable<T> source,
+            TimeSpan timeoutPerItem,
+            [EnumeratorCancellation] CancellationToken outerToken)
+        {
+            // Cancelled on a timeout, so the source stops working on the item nobody waits for
+            using var stop = CancellationTokenSource.CreateLinkedTokenSource(outerToken);
+
+            var enumerator = source.GetAsyncEnumerator(stop.Token);
+            Task<bool>? pending = null;
+            try
+            {
+                while (true)
+                {
+                    // Only the wait for the source is timed; the time the caller spends on an item does not count
+                    bool hasItem;
+                    using (var wait = CancellationTokenSource.CreateLinkedTokenSource(outerToken))
+                    {
+                        wait.CancelAfter(timeoutPerItem);
+                        pending = enumerator.MoveNextAsync().AsTask();
+                        try
+                        {
+                            hasItem = await pending.WaitAsync(wait.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (wait.IsCancellationRequested && !outerToken.IsCancellationRequested)
+                        {
+                            throw new TimeoutException($"Timeout while waiting for next item ({timeoutPerItem.TotalSeconds}s)");
+                        }
+                        pending = null;
+                    }
+
+                    if (!hasItem)
+                        break;
+
+                    yield return enumerator.Current;
+                }
+            }
+            finally
+            {
+                // The source cannot be disposed while it is still working on an item, so stop it
+                // and give it one more item's time to finish; a source that ignores the token is left as is
+                if (pending != null)
+                {
+                    stop.Cancel();
+                    try { await pending.WaitAsync(timeoutPerItem).ConfigureAwait(false); }
+                    catch { }
+                }
+
+                if (pending == null || pending.IsCompleted)
+                    await enumerator.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Wraps the stream in a timeout observing stream that counts both the time inside each read and the time between reads
+        /// </summary>
+        /// <param name="stream">The stream to wrap</param>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="disposeBaseStream">A flag indicating if the base stream should be disposed</param>
+        /// <returns>The wrapped stream</returns>
+        public static Stream ObserveReadTimeout(this Stream stream, TimeSpan timeout, bool disposeBaseStream = true)
+            => ObserveReadTimeout(stream, timeout, disposeBaseStream, TimeoutMode.CallAndGap);
+
+        /// <summary>
+        /// Wraps the stream in a timeout observing stream.
+        /// Use <see cref="TimeoutMode.Call"/> when the wrapped stream is the remote side, such as a network response stream that this code reads,
+        /// and <see cref="TimeoutMode.Gap"/> when the stream is handed to a library that does the transfer,
+        /// so that time spent waiting on this side of the transfer does not count against the timeout.
+        /// </summary>
+        /// <param name="stream">The stream to wrap</param>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="disposeBaseStream">A flag indicating if the base stream should be disposed</param>
+        /// <param name="mode">The time that counts against the timeout</param>
+        /// <returns>The wrapped stream</returns>
+        public static Stream ObserveReadTimeout(this Stream stream, TimeSpan timeout, bool disposeBaseStream, TimeoutMode mode)
+        {
+            if (stream == null)
+                throw new ArgumentNullException(nameof(stream));
+
+            return new TimeoutObservingStream(stream, disposeBaseStream)
+            {
+                Mode = mode,
+                ReadTimeout = ToTimeoutMilliseconds(timeout)
+            };
+        }
+
+        /// <summary>
+        /// Wraps the stream in a timeout observing stream that counts both the time inside each write and the time between writes
+        /// </summary>
+        /// <param name="stream">The stream to wrap</param>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="disposeBaseStream">A flag indicating if the base stream should be disposed</param>
+        /// <returns>The wrapped stream</returns>
+        public static Stream ObserveWriteTimeout(this Stream stream, TimeSpan timeout, bool disposeBaseStream = true)
+            => ObserveWriteTimeout(stream, timeout, disposeBaseStream, TimeoutMode.CallAndGap);
+
+        /// <summary>
+        /// Wraps the stream in a timeout observing stream.
+        /// Use <see cref="TimeoutMode.Call"/> when the wrapped stream is the remote side, such as a network stream that this code writes to,
+        /// and <see cref="TimeoutMode.Gap"/> when the stream is handed to a library that does the transfer, or is a destination that may block
+        /// while the rest of the pipeline catches up, so that time spent waiting on this side of the transfer does not count against the timeout.
+        /// </summary>
+        /// <param name="stream">The stream to wrap</param>
+        /// <param name="timeout">The timeout to observe</param>
+        /// <param name="disposeBaseStream">A flag indicating if the base stream should be disposed</param>
+        /// <param name="mode">The time that counts against the timeout</param>
+        /// <returns>The wrapped stream</returns>
+        public static Stream ObserveWriteTimeout(this Stream stream, TimeSpan timeout, bool disposeBaseStream, TimeoutMode mode)
+        {
+            if (stream == null)
+                throw new ArgumentNullException(nameof(stream));
+
+            return new TimeoutObservingStream(stream, disposeBaseStream)
+            {
+                Mode = mode,
+                WriteTimeout = ToTimeoutMilliseconds(timeout)
+            };
+        }
+
+        /// <summary>
+        /// Converts a timeout to the milliseconds used by a stream timeout, where zero or less and infinite both mean no timeout
+        /// </summary>
+        /// <param name="timeout">The timeout to convert</param>
+        /// <returns>The timeout in milliseconds, or <see cref="Timeout.Infinite"/></returns>
+        private static int ToTimeoutMilliseconds(TimeSpan timeout)
+            => timeout.Ticks > 0 && timeout != Timeout.InfiniteTimeSpan
+                ? (int)timeout.TotalMilliseconds
+                : Timeout.Infinite;
+
+        /// <summary>
+        /// The types of streams that are considered basic (i.e. not wrapped)
+        /// </summary>
+        private static readonly IReadOnlySet<Type> _basicStreamTypes = new HashSet<Type>
+        {
+            typeof(FileStream),
+            typeof(MemoryStream),
+            typeof(NetworkStream),
+            typeof(BufferedStream),
+            typeof(System.IO.Compression.DeflateStream),
+            typeof(System.IO.Compression.GZipStream),
+            typeof(System.IO.Compression.ZLibStream)
+        };
+
+        /// <summary>
+        /// Unwraps a stream from layers of wrapping streams
+        /// </summary>
+        /// <param name="stream">The stream to unwrap</param>
+        /// <returns>The unwrapped stream</returns>
+        public static Stream UnwrapThrottledStream(this Stream stream)
+        {
+            if (stream == null)
+                throw new ArgumentNullException(nameof(stream));
+
+            var previousStream = stream;
+
+            do
+            {
+                previousStream = stream;
+
+                while (stream is WrappingStream wrappingStream)
+                    stream = wrappingStream.BaseStream;
+                while (stream is OverrideableStream overrideableStream)
+                    stream = overrideableStream.BaseStream;
+
+            } while (stream != previousStream);
+
+#if DEBUG
+            if (!_basicStreamTypes.Contains(stream.GetType()))
+                throw new InvalidOperationException($"The unwrapped stream is not a basic stream, but a {stream.GetType()}");
+#endif
+
+            return stream;
+        }
+
+        /// <summary>
+        /// Calculates the hash of a throttled stream and returns the stream to read
+        /// </summary>
+        /// <param name="stream">The source stream
+        /// <param name="hashalgorithm">The hash algorithm to use</param>
+        /// <param name="cancelToken">The cancellation token to observe</param>
+        /// <returns>A tuple with the stream, the hash and a temporary file if used</returns>
+        public static async Task<(Stream content, string hash, TempFile? tmpfile)> CalculateThrottledStreamHash(Stream stream, string hashalgorithm, CancellationToken cancelToken)
+        {
+            var res = await CalculateThrottledStreamHash(stream, new[] { hashalgorithm }, cancelToken).ConfigureAwait(false);
+            return (res.content, res.hashes.First(), res.tmpfile);
+        }
+
+        /// <summary>
+        /// Calculates the hash of a throttled stream and returns the stream to read
+        /// </summary>
+        /// <param name="stream">The source stream
+        /// <param name="hashalgorithms">The hash algorithms to use</param>
+        /// <param name="cancelToken">The cancellation token to observe</param>
+        /// <returns>A tuple with the stream, the hash and a temporary file if used</returns>
+        public static async Task<(Stream content, string[] hashes, TempFile? tmpfile)> CalculateThrottledStreamHash(Stream stream, IEnumerable<string> hashalgorithms, CancellationToken cancelToken)
+        {
+            TempFile? tmp = null;
+            List<HashAlgorithm>? hashalgs = null;
+
+            try
+            {
+                string[] contentHashes;
+                var measure = stream.UnwrapThrottledStream();
+                if (!measure.CanSeek)
+                    tmp = new TempFile();
+
+                var p = measure.Position;
+                hashalgs = hashalgorithms.Select(ha => HashFactory.CreateHasher(ha)).ToList();
+
+                await using (var sr = tmp == null ? null : File.OpenWrite(tmp))
+                {
+                    int read;
+                    var buffer = new byte[1024 * 8];
+                    while ((read = await measure.ReadAsync(buffer, 0, buffer.Length, cancelToken).ConfigureAwait(false)) > 0)
+                    {
+                        // Feed the data to all hashers
+                        foreach (var hasher in hashalgs)
+                            hasher.TransformBlock(buffer, 0, read, null, 0);
+
+                        if (sr != null)
+                            await sr.WriteAsync(buffer, 0, read, cancelToken).ConfigureAwait(false);
+                    }
+                }
+
+                // Finalize the hashes
+                foreach (var hasher in hashalgs)
+                    hasher.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+
+                // Get the final hash strings
+                contentHashes = hashalgs.Select(hashalg => ByteArrayAsHexString(hashalg.Hash!)).ToArray();
+                foreach (var hasher in hashalgs)
+                    hasher.Dispose();
+
+                // Reset the position of the stream if it was seekable
+                if (measure.CanSeek)
+                    measure.Position = p;
+
+                return (tmp == null ? stream : File.OpenRead(tmp), contentHashes, tmp);
+            }
+            catch
+            {
+                tmp?.Dispose();
+                throw;
+            }
+            finally
+            {
+                if (hashalgs != null)
+                    foreach (var hasher in hashalgs)
+                        hasher.Dispose();
+            }
+        }
+        /// <summary>
+        /// Reads a secret value from the console, masking the input.
+        /// </summary>
+        /// <param name="prompt">The prompt to display.</param>
+        /// <returns>The value entered by the user.</returns>
+        /// <remarks>
+        /// Behavior:
+        /// - Input is masked with '*'.
+        /// - Backspace removes the last character and erases the mask.
+        /// - Pressing Escape cancels input and throws <see cref="Interface.CancelException"/>.
+        /// - Control characters (other than Enter/Escape/Backspace) are ignored and not added to the value.
+        /// </remarks>
+        public static string ReadSecretFromConsole(string prompt)
+        {
+            Console.Write(prompt);
+            var value = string.Empty;
+            while (true)
+            {
+                var keyInfo = Console.ReadKey(true);
+
+                // Allow cancellation with ESC
+                if (keyInfo.Key == ConsoleKey.Escape)
+                {
+                    throw new Interface.CancelException("Console secret input canceled by user.");
+                }
+
+                if (keyInfo.Key == ConsoleKey.Enter)
+                {
+                    break;
+                }
+
+                if (keyInfo.Key == ConsoleKey.Backspace)
+                {
+                    if (value.Length > 0)
+                    {
+                        value = value.Substring(0, value.Length - 1);
+                        Console.Write("\b \b");
+                    }
+                }
+                else if (keyInfo.KeyChar != '\u0000' && !char.IsControl(keyInfo.KeyChar))
+                {
+                    // Only accept printable characters; ignore other control characters
+                    value += keyInfo.KeyChar;
+                    Console.Write("*");
+                }
+            }
+
+            Console.WriteLine();
+            return value;
+        }
+
+        /// <summary>
+        /// Windows-only helper to attach the console to the parent process.
+        /// This is required if the start application is a Windows Executable (WinExe),
+        /// as this has not console attached and cannot write to the console, if launched from a command prompt.
+        /// By attaching the console, Console.Write/Read calls work as expected.
+        /// </summary>
+        [SupportedOSPlatform("windows")]
+        public static void AttachWindowsConsole()
+        {
+            // The parent process ID
+            const int ATTACH_PARENT_PROCESS = -1;
+
+            // WinExe has no console attached; when launched from a command
+            // prompt (e.g. for reset-password or help) attach to the parent
+            // console so Console.Write/Read calls work as expected.
+            if (Win32.AttachConsole(ATTACH_PARENT_PROCESS))
+            {
+                var stdout = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+                Console.SetOut(stdout);
+                var stderr = new StreamWriter(Console.OpenStandardError()) { AutoFlush = true };
+                Console.SetError(stderr);
+                var standardInput = new StreamReader(Console.OpenStandardInput());
+                Console.SetIn(standardInput);
+            }
+        }
+
+
+
+        /// <summary>
+        /// Gets the free and total space available for the specified path.
+        /// Uses the same approach as FileBackend.GetQuotaInfoAsync.
+        /// </summary>
+        /// <param name="path">The path to check</param>
+        /// <returns>A tuple with (freeSpace, totalSpace) in bytes, or null if it could not be determined</returns>
+        public static (long FreeSpace, long TotalSpace)? GetFreeSpaceForPath(string path)
+        {
+            try
+            {
+                // Get the drive info for the path
+                var root = Path.GetPathRoot(path);
+                if (string.IsNullOrEmpty(root))
+                    return null;
+
+                // On Windows, DriveInfo is only valid for lettered drives
+                if (OperatingSystem.IsWindows() && root.Length > 0 && char.IsLetter(root[0]))
+                {
+                    try
+                    {
+                        var driveInfo = new DriveInfo(root);
+                        if (driveInfo.TotalSize > 0)
+                            return (driveInfo.AvailableFreeSpace, driveInfo.TotalSize);
+                    }
+                    catch (ArgumentException)
+                    {
+                        // Fall through to Win32 API fallback
+                    }
+
+                    // Fallback to Win32 API for UNC paths and other cases
+                    return GetDiskFreeSpaceWin32(path);
+                }
+                else if (!OperatingSystem.IsWindows())
+                {
+                    var driveInfo = new DriveInfo(path);
+                    if (driveInfo.TotalSize > 0)
+                        return (driveInfo.AvailableFreeSpace, driveInfo.TotalSize);
+                }
+                else
+                {
+                    // Windows but not a lettered drive (e.g., UNC path)
+                    return GetDiskFreeSpaceWin32(path);
+                }
+            }
+            catch
+            {
+                // Ignore errors and return null
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Gets the free and total disk space using the Win32 API's GetDiskFreeSpaceEx function.
+        /// </summary>
+        /// <param name="directory">Directory</param>
+        /// <returns>A tuple with (freeSpace, totalSpace) in bytes, or null if it could not be determined</returns>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        [SupportedOSPlatform("windows")]
+        private static (long FreeSpace, long TotalSpace)? GetDiskFreeSpaceWin32(string directory)
+        {
+            if (!OperatingSystem.IsWindows())
+                return null;
+
+            try
+            {
+                if (GetDiskFreeSpaceEx(directory, out var available, out var total, out _))
+                    return ((long)available, (long)total);
+            }
+            catch
+            {
+                // Ignore errors
+            }
+
+            return null;
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        [SupportedOSPlatform("windows")]
+        private static extern bool GetDiskFreeSpaceEx(
+            string lpDirectoryName,
+            out ulong lpFreeBytesAvailable,
+            out ulong lpTotalNumberOfBytes,
+            out ulong lpTotalNumberOfFreeBytes);
+
     }
 }

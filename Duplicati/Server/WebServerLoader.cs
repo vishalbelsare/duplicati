@@ -1,0 +1,412 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading.Tasks;
+using Duplicati.Server.Database;
+using Microsoft.AspNetCore.Connections;
+using Duplicati.Library.Utility;
+
+#nullable enable
+
+namespace Duplicati.Server;
+
+/// <summary>
+/// Helper class for starting the webserver
+/// </summary>
+public static class WebServerLoader
+{
+    /// <summary>
+    /// The tag used for logging
+    /// </summary>
+    private static readonly string LOGTAG = Duplicati.Library.Logging.Log.LogTagFromType(typeof(WebServerLoader));
+
+    /// <summary>
+    /// Option for changing the webroot folder
+    /// </summary>
+    public const string OPTION_WEBROOT = "webservice-webroot";
+
+    /// <summary>
+    /// Option for changing the webservice listen port
+    /// </summary>
+    public const string OPTION_PORT = "webservice-port";
+
+    /// <summary>
+    /// Option for changing the webservice listen interface
+    /// </summary>
+    public const string OPTION_INTERFACE = "webservice-interface";
+
+    /// <summary>
+    /// Option for setting the webservice password
+    /// </summary>
+    public const string OPTION_WEBSERVICE_PASSWORD = "webservice-password";
+
+    /// <summary>
+    /// Option for initializing the webservice password on first run
+    /// </summary>
+    public const string OPTION_WEBSERVICE_PASSWORD_INIT = "webservice-password-init";
+
+    /// <summary>
+    /// Option for resetting the JWT configuration
+    /// </summary>
+    public const string OPTION_WEBSERVICE_RESET_JWT_CONFIG = "webservice-reset-jwt-config";
+
+    /// <summary>
+    /// Option for enabling the forever token
+    /// </summary>
+    public const string OPTION_WEBSERVICE_ENABLE_FOREVER_TOKEN = "webservice-enable-forever-token";
+
+    /// <summary>
+    /// Option for setting the webservice allowed hostnames
+    /// </summary>
+    public const string OPTION_WEBSERVICE_ALLOWEDHOSTNAMES = "webservice-allowed-hostnames";
+    /// <summary>
+    /// Option for setting the webservice allowed hostnames, alternative name
+    /// </summary>
+    public const string OPTION_WEBSERVICE_ALLOWEDHOSTNAMES_ALT = "webservice-allowedhostnames";
+
+    /// <summary>
+    /// Option for removing the hosted static files from the server
+    /// </summary>
+    public const string OPTION_WEBSERVICE_API_ONLY = "webservice-api-only";
+    /// <summary>
+    /// Option for disabling the use of signin tokens
+    /// </summary>
+    public const string OPTION_WEBSERVICE_DISABLE_SIGNIN_TOKENS = "webservice-disable-signin-tokens";
+    /// <summary>
+    /// Option for switching reduced reporting on for this machine, stored as the operator setting
+    /// </summary>
+    public const string OPTION_REDUCED_REPORTING = "reduced-reporting";
+    /// <summary>
+    /// Option for setting the webservice SPA paths
+    /// </summary>
+    public const string OPTION_WEBSERVICE_SPAPATHS = "webservice-spa-paths";
+    /// <summary>
+    /// The CORS origins to allow
+    /// </summary>
+    public const string OPTION_WEBSERVICE_CORS_ORIGINS = "webservice-cors-origins";
+    /// <summary>
+    /// Option for setting the webservice timezone
+    /// </summary>
+    public const string OPTION_WEBSERVICE_TIMEZONE = "webservice-timezone";
+    /// <summary>
+    /// Option for setting the pre-auth tokens
+    /// </summary>
+    public const string OPTION_WEBSERVICE_PRE_AUTH_TOKENS = "webservice-pre-auth-tokens";
+
+    /// <summary>
+    /// Option for setting the webservice token duration
+    /// </summary>
+    public const string OPTION_WEBSERVICE_TOKENDURATION = "webservice-token-duration";
+
+    /// <summary>
+    /// Option for suppressing the welcome page
+    /// </summary>
+    public const string OPTION_SUPPRESS_WELCOME_PAGE = "webservice-suppress-welcome-page";
+
+    /// <summary>
+    /// Option for disabling automatic creation of the server database
+    /// </summary>
+    public const string OPTION_WEBSERVICE_DONT_AUTOCREATE_DATABASE = "webservice-dont-autocreate-database";
+
+    /// <summary>
+    /// The default path to the web root
+    /// </summary>
+    public const string DEFAULT_OPTION_WEBROOT = "webroot";
+
+    /// <summary>
+    /// The default paths to serve as SPAs
+    /// </summary>
+    public const string DEFAULT_OPTION_SPAPATHS = "/ngclient";
+
+    /// <summary>
+    /// The default listening port
+    /// </summary>
+    public const int DEFAULT_OPTION_PORT = 8200;
+
+    /// <summary>
+    /// The default token duration for JWT tokens
+    /// </summary>
+    public const string DEFAULT_OPTION_TOKENDURATION = "30D";
+
+    /// <summary>
+    /// Option for setting if to use HTTPS
+    /// </summary>
+    public const string OPTION_WEBSERVICE_DISABLEHTTPS = "webservice-disable-https";
+
+    /// <summary>
+    /// Option for removing the SSL certificate from the datbase
+    /// </summary>
+    public const string OPTION_WEBSERVICE_REMOVESSLCERTIFICATE = "webservice-remove-sslcertificate";
+
+    /// <summary>
+    /// Option for setting the webservice SSL certificate
+    /// </summary>
+    public const string OPTION_WEBSERVICE_SSLCERTIFICATEFILE = "webservice-sslcertificatefile";
+
+    /// <summary>
+    /// Option for setting the webservice SSL certificate key
+    /// </summary>
+    public const string OPTION_WEBSERVICE_SSLCERTIFICATEFILEPASSWORD = "webservice-sslcertificatepassword";
+
+    /// <summary>
+    /// Option for disabling API extensions
+    /// </summary>
+    public const string OPTION_WEBSERVICE_DISABLEAPIEXTENSIONS = "webservice-disable-api-extensions";
+
+    /// <summary>
+    /// Enables the folder status service for the TrayIcon
+    /// </summary>
+    public const string OPTION_WEBSERVICE_ENABLE_FOLDER_STATUS_SERVICE = "webservice-enable-folder-status-service";
+
+    /// <summary>
+    /// Option for enabling the MCP server endpoint
+    /// </summary>
+    public const string OPTION_WEBSERVICE_ENABLE_MCP_SERVER = "webservice-enable-mcp-server";
+
+    /// <summary>
+    /// Option for configuring HTTPS certificates automatically
+    /// </summary>
+    public const string OPTION_CONFIGURE_HTTPS = "configure-https";
+
+    /// <summary>
+    /// Option for specifying hostnames when configuring HTTPS
+    /// </summary>
+    public const string OPTION_CONFIGURE_HTTPS_HOSTNAMES = "configure-https-hostnames";
+
+    /// <summary>
+    /// The default listening interface
+    /// </summary>
+    public const string DEFAULT_OPTION_INTERFACE = "loopback";
+
+    /// <summary>
+    /// The parsed settings for the webserver
+    /// </summary>
+    /// <param name="WebRoot">The root folder with static files</param>
+    /// <param name="Port">The listining port</param>
+    /// <param name="Interface">The listening interface</param>
+    /// <param name="AllowedHostnames">The allowed hostnames</param>
+    /// <param name="DisableStaticFiles">If static files should be disabled</param>
+    /// <param name="TokenLifetimeInMinutes">The lifetime of refresh tokens in minutes</param>
+    /// <param name="SPAPaths">The paths to serve as SPAs</param>
+    /// <param name="CorsOrigins">The origins to allow for CORS</param>
+    public record ParsedWebserverSettings(
+        string WebRoot,
+        int Port,
+        System.Net.IPAddress Interface,
+        IEnumerable<string> AllowedHostnames,
+        bool DisableStaticFiles,
+        int TokenLifetimeInMinutes,
+        IEnumerable<string> SPAPaths,
+        IEnumerable<string> CorsOrigins,
+        IReadOnlySet<string> PreAuthTokens
+    );
+
+    /// <summary>
+    /// Checks that a user supplied webroot is a folder below the given folder
+    /// </summary>
+    /// <param name="webroot">The user supplied webroot</param>
+    /// <param name="folder">The folder the webroot must be below</param>
+    /// <param name="comparison">The comparison to use for file names</param>
+    /// <returns><c>true</c> if the webroot is below the folder, <c>false</c> otherwise</returns>
+    public static bool IsWebrootBelowFolder([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] string? webroot, string folder, StringComparison comparison)
+    {
+        if (string.IsNullOrWhiteSpace(webroot) || string.IsNullOrWhiteSpace(folder))
+            return false;
+
+        string fullWebroot, fullFolder;
+        try
+        {
+            // Resolve "..", "." and relative paths, so they cannot leave the folder
+            fullWebroot = System.IO.Path.GetFullPath(webroot);
+            fullFolder = System.IO.Path.GetFullPath(folder);
+        }
+        catch (Exception ex) when (ex is ArgumentException || ex is NotSupportedException || ex is System.IO.PathTooLongException)
+        {
+            return false;
+        }
+
+        // Compare with a trailing separator, so "/app2" is not taken as below "/app"
+        fullWebroot = Duplicati.Library.Common.IO.Util.AppendDirSeparator(fullWebroot);
+        fullFolder = Duplicati.Library.Common.IO.Util.AppendDirSeparator(fullFolder);
+
+        return fullWebroot.StartsWith(fullFolder, comparison) && !fullWebroot.Equals(fullFolder, comparison);
+    }
+
+    /// <summary>
+    /// Sets up the webserver and starts it
+    /// </summary>
+    /// <param name="options">A set of options</param>
+    /// <param name="createServer">The method to start the server</param>
+    public static async Task<TServer> TryRunServerAsync<TServer>(IReadOnlyDictionary<string, string?> options, Connection connection, Func<ParsedWebserverSettings, Task<TServer>> createServer)
+    {
+        var ports = Enumerable.Empty<int>();
+        options.TryGetValue(OPTION_PORT, out var portstring);
+        if (!string.IsNullOrEmpty(portstring))
+            ports =
+                from n in portstring.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                where int.TryParse(n, out _)
+                select int.Parse(n);
+
+        if (ports == null || !ports.Any())
+            ports = [DEFAULT_OPTION_PORT];
+
+        options.TryGetValue(OPTION_INTERFACE, out var interfacestring);
+
+        if (string.IsNullOrWhiteSpace(interfacestring))
+            interfacestring = connection.ApplicationSettings.ServerListenInterface;
+        if (string.IsNullOrWhiteSpace(interfacestring))
+            interfacestring = DEFAULT_OPTION_INTERFACE;
+
+        var listenInterface = System.Net.IPAddress.Loopback;
+        interfacestring = interfacestring.Trim();
+        if (new[] { "*", "all", "any" }.Any(x => x.Equals(interfacestring, StringComparison.OrdinalIgnoreCase)))
+            listenInterface = System.Net.IPAddress.Any;
+        else if (interfacestring != "loopback")
+            listenInterface = System.Net.IPAddress.Parse(interfacestring);
+
+        var removeCertificate = Library.Utility.Utility.ParseBoolOption(options, OPTION_WEBSERVICE_REMOVESSLCERTIFICATE);
+        connection.ApplicationSettings.DisableHTTPS = removeCertificate || Library.Utility.Utility.ParseBoolOption(options, OPTION_WEBSERVICE_DISABLEHTTPS);
+
+        options.TryGetValue(OPTION_WEBSERVICE_SSLCERTIFICATEFILE, out var certificateFile);
+        options.TryGetValue(OPTION_WEBSERVICE_SSLCERTIFICATEFILEPASSWORD, out var certificateFilePassword);
+        certificateFilePassword = certificateFilePassword?.Trim();
+
+        if (string.IsNullOrEmpty(certificateFile) && !string.IsNullOrEmpty(certificateFilePassword))
+            Library.Logging.Log.WriteInformationMessage(LOGTAG, "ServerCertificate", Strings.Server.SSLCertificateFileMissingOption);
+
+        if (!string.IsNullOrEmpty(certificateFile) && !string.IsNullOrEmpty(certificateFilePassword))
+        {
+            connection.ApplicationSettings.ServerSSLCertificate = Utility.LoadPfxCertificate(certificateFile, certificateFilePassword);
+            connection.ApplicationSettings.ServerSSLCertificateAutogenerated = false;
+        }
+        else if (removeCertificate)
+        {
+            connection.ApplicationSettings.ServerSSLCertificate = null;
+            connection.ApplicationSettings.ServerSSLCertificateAutogenerated = false;
+        }
+
+        var webroot = Library.AutoUpdater.UpdaterManager.INSTALLATIONDIR;
+
+#if DEBUG
+        //For debug we go "../../../../.." to get out of "Executables/Duplicati.GUI.TrayIcon/bin/debug/net10.0"
+        string tmpwebroot = System.IO.Path.GetFullPath(System.IO.Path.Combine(webroot, "..", "..", "..", "..", ".."));
+        tmpwebroot = System.IO.Path.Combine(tmpwebroot, "Duplicati", "Server");
+        if (System.IO.Directory.Exists(System.IO.Path.Combine(tmpwebroot, "webroot")))
+            webroot = tmpwebroot;
+#endif
+
+        webroot = System.IO.Path.Combine(webroot, "webroot");
+
+        if (options.ContainsKey(OPTION_WEBROOT))
+        {
+            var userroot = options[OPTION_WEBROOT];
+#if DEBUG
+            //In debug mode we do not care where the path points
+            if (!string.IsNullOrWhiteSpace(userroot))
+                webroot = userroot;
+#else
+            //In release mode we check that the user supplied path is located
+            // in the same folders as the running application, to avoid users
+            // that inadvertently expose top level folders
+            if (IsWebrootBelowFolder(userroot, Library.AutoUpdater.UpdaterManager.INSTALLATIONDIR, Library.Utility.Utility.ClientFilenameStringComparison))
+                webroot = userroot;
+            else if (!string.IsNullOrWhiteSpace(userroot))
+                Library.Logging.Log.WriteWarningMessage(LOGTAG, "WebrootOutsideInstallation", null, Strings.Server.WebrootOutsideInstallationFolder(userroot, Library.AutoUpdater.UpdaterManager.INSTALLATIONDIR));
+#endif
+        }
+
+        var preAuthTokens = new HashSet<string>(StringComparer.Ordinal);
+        if (options.TryGetValue(OPTION_WEBSERVICE_PRE_AUTH_TOKENS, out var preAuthTokensString) && !string.IsNullOrWhiteSpace(preAuthTokensString))
+            preAuthTokens.UnionWith(preAuthTokensString.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(x => x.Length >= 10 && x.All(y => char.IsAsciiLetterOrDigit(y) || y == '-' || y == '_')));
+
+        options.TryGetValue(OPTION_WEBSERVICE_SPAPATHS, out var spaPathsString);
+        if (string.IsNullOrWhiteSpace(spaPathsString))
+            spaPathsString = DEFAULT_OPTION_SPAPATHS;
+
+        var duration = Utility.ParseTimespanOption(options, OPTION_WEBSERVICE_TOKENDURATION, DEFAULT_OPTION_TOKENDURATION);
+        var tokenLifetimeInMinutes = (int)Math.Ceiling(duration.TotalMinutes);
+
+        var settings = new ParsedWebserverSettings(
+            webroot,
+            -1,
+            listenInterface,
+            (connection.ApplicationSettings.AllowedHostnames ?? string.Empty).Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries),
+            Utility.ParseBoolOption(options, OPTION_WEBSERVICE_API_ONLY),
+            tokenLifetimeInMinutes,
+            spaPathsString.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries),
+            options.GetValueOrDefault(OPTION_WEBSERVICE_CORS_ORIGINS)?.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries) ?? Enumerable.Empty<string>(),
+            preAuthTokens
+        );
+
+        // Materialize the list of ports, and move the last-used port to the front, so we try the last-known port first
+        ports = ports.ToList();
+        if (ports.Contains(connection.ApplicationSettings.LastWebserverPort))
+            ports = ports.Where(x => x != connection.ApplicationSettings.LastWebserverPort).Prepend(connection.ApplicationSettings.LastWebserverPort).ToList();
+
+        // If we are in hosted mode with no specified port, 
+        // then try different ports
+        foreach (var p in ports)
+            try
+            {
+                settings = settings with { Port = p };
+
+                var server = await createServer(settings);
+
+                // If we get here, the server started successfully, so store the new interface setting
+                if (interfacestring != connection.ApplicationSettings.ServerListenInterface)
+                    connection.ApplicationSettings.ServerListenInterface = interfacestring;
+
+                Library.Logging.Log.WriteInformationMessage(LOGTAG, "ServerListening", Strings.Server.StartedServer(listenInterface.ToString(), p));
+
+                return server;
+            }
+            catch (Exception ex) when (IsPortUnavailable(ex))
+            { }
+
+
+        throw new Exception(Strings.Server.ServerStartFailure(ports));
+    }
+
+    /// <summary>
+    /// Tells whether the server failed to start because the port cannot be used, so the next
+    /// port is tried. The port can be in use, or refused, as Windows does for the ranges it
+    /// excludes for Hyper-V, WSL and Docker.
+    /// </summary>
+    /// <param name="ex">The error the server failed to start with.</param>
+    /// <returns><c>true</c> if the port cannot be used; <c>false</c> otherwise.</returns>
+    private static bool IsPortUnavailable(Exception ex)
+        => ex switch
+        {
+            System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.AddressAlreadyInUse or System.Net.Sockets.SocketError.AccessDenied } => true,
+            System.IO.IOException { InnerException: AddressInUseException } => true,
+            // Binding localhost tries both IPv4 and IPv6, and reports the two failures together
+            // when neither can be used
+            System.IO.IOException { InnerException: AggregateException aggregate } =>
+                aggregate.InnerExceptions.Count > 0
+                && aggregate.InnerExceptions.All(x => x is AddressInUseException || IsPortUnavailable(x)),
+            _ => false
+        };
+}

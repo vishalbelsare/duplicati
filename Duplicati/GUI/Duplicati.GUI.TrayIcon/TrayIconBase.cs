@@ -1,23 +1,30 @@
-//  Copyright (C) 2015, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//  
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 // 
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
 // 
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using Duplicati.Server.Serialization;
 using Duplicati.Server.Serialization.Interface;
 using System.Collections.Generic;
+using System.Threading.Tasks;
+using CoCoL;
 
 namespace Duplicati.GUI.TrayIcon
 {
@@ -28,8 +35,10 @@ namespace Duplicati.GUI.TrayIcon
         Quit,
         Pause,
         Resume,
+        Reconnect,
+        ChangePassword
     }
-    
+
     public enum TrayIcons
     {
         Idle,
@@ -38,7 +47,8 @@ namespace Duplicati.GUI.TrayIcon
         IdleWarning,
         IdleError,
         PausedError,
-        RunningError
+        RunningError,
+        Disconnected
     }
 
     public enum WindowIcons
@@ -53,58 +63,70 @@ namespace Duplicati.GUI.TrayIcon
         Warning,
         Error
     }
-    
+
     public interface IMenuItem
     {
         void SetDefault(bool isDefault);
         void SetIcon(MenuIcons icon);
         void SetText(string text);
+        void SetEnabled(bool enabled);
+        void SetHidden(bool hidden);
     }
-    
+
     public abstract class TrayIconBase : IDisposable
-    {           
+    {
+        protected IMenuItem m_reconnectMenu;
+        protected IMenuItem m_changePasswordMenu;
+        protected IMenuItem m_openMenu;
         protected IMenuItem m_pauseMenu;
+        protected IMenuItem m_quitMenu;
         protected bool m_stateIsPaused;
         protected Action m_onSingleClick;
         protected Action m_onDoubleClick;
         protected Action m_onNotificationClick;
-        
+
         public virtual void Init(string[] args)
         {
             SetMenu(BuildMenu());
             RegisterStatusUpdateCallback();
             RegisterNotificationCallback();
-            OnStatusUpdated(Program.Connection.Status);
             m_onDoubleClick = ShowStatusWindow;
             m_onNotificationClick = ShowStatusWindow;
+            OnStatusUpdatedAsync(Program.Connection.Status)
+                .FireAndForget();
             Run(args);
         }
-        
+
         protected abstract void Run(string[] args);
 
         public void InvokeExit()
         {
-            UpdateUIState(() => { this.Exit(); });
+            UpdateUIStateAsync(() =>
+            {
+                Program.Connection?.Close();
+                this.Exit();
+            });
         }
-        
-        protected virtual void UpdateUIState(Action action)
+
+        protected virtual Task UpdateUIStateAsync(Action action)
         {
             action();
+            return Task.CompletedTask;
         }
-        
+
         protected abstract IMenuItem CreateMenuItem(string text, MenuIcons icon, Action callback, IList<IMenuItem> subitems);
-        
+
         protected abstract void Exit();
 
         protected abstract void SetIcon(TrayIcons icon);
-        
+
         protected abstract void SetMenu(IEnumerable<IMenuItem> items);
 
-        protected abstract void NotifyUser(string title, string message, NotificationType type);
+        public abstract void NotifyUser(string title, string message, NotificationType type);
 
         protected virtual void RegisterStatusUpdateCallback()
         {
-            Program.Connection.OnStatusUpdated += OnStatusUpdated;
+            Program.Connection.OnStatusUpdated = OnStatusUpdatedAsync;
         }
 
         protected virtual void RegisterNotificationCallback()
@@ -128,7 +150,8 @@ namespace Duplicati.GUI.TrayIcon
                     break;
             }
 
-            UpdateUIState(() => {
+            UpdateUIStateAsync(() =>
+            {
                 NotifyUser(notification.Title, notification.Message, type);
             });
         }
@@ -141,25 +164,61 @@ namespace Duplicati.GUI.TrayIcon
             return null;
         }
 
-        protected IEnumerable<IMenuItem> BuildMenu() 
+        protected IEnumerable<IMenuItem> BuildMenu()
         {
-            var tmp = CreateMenuItem("Open", MenuIcons.Status, OnStatusClicked, null);
-            tmp.SetDefault(true);
-            return new IMenuItem[] {
-                tmp,
+            m_reconnectMenu = CreateMenuItem("Reconnect", MenuIcons.Reconnect, Reconnect, null);
+            m_reconnectMenu.SetHidden(true);
+            m_changePasswordMenu = CreateMenuItem("Change Password", MenuIcons.ChangePassword, OnChangePasswordClicked, null);
+            m_changePasswordMenu.SetHidden(true);
+            m_openMenu = CreateMenuItem("Open", MenuIcons.Status, OnStatusClicked, null);
+            m_openMenu.SetDefault(true);
+            return [
+                m_reconnectMenu,
+                m_changePasswordMenu,
+                m_openMenu,
                 m_pauseMenu = CreateMenuItem("Pause", MenuIcons.Pause, OnPauseClicked, null ),
-                CreateMenuItem("Quit", MenuIcons.Quit, OnQuitClicked, null),
-            };
+                m_quitMenu = CreateMenuItem("Quit", MenuIcons.Quit, OnQuitClicked, null),
+            ];
         }
-        
-        protected void ShowStatusWindow()
+
+        private async void OnChangePasswordClicked()
         {
-            var window = ShowUrlInWindow(Program.Connection.StatusWindowURL);
-            if (window != null)
+            var res = await PasswordPrompt.ShowPasswordDialogAsync(isChangePassword: true);
+            if (res)
+                await OnStatusUpdatedAsync(Program.Connection.Status);
+        }
+
+        private void Reconnect()
+        {
+            Program.Connection.UpdateStatusAsync().ContinueWith(t =>
             {
-                window.SetIcon(WindowIcons.Regular);
-                window.SetTitle("Duplicati status");
-            }
+                if (t.IsFaulted)
+                {
+                    Console.WriteLine("Failed to reconnect: " + t.Exception.Message);
+                    NotifyUser("Failed to reconnect", t.Exception.Message, NotificationType.Error);
+                }
+
+            });
+        }
+
+        public void ShowStatusWindow()
+        {
+            Program.Connection.GetStatusWindowURLAsync().ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                {
+                    Console.WriteLine("Failed to get status window URL: " + t.Exception.Message);
+                    NotifyUser("Failed to get status window URL", t.Exception.Message, NotificationType.Error);
+                    return;
+                }
+
+                var window = ShowUrlInWindow(t.Result);
+                if (window != null)
+                {
+                    window.SetIcon(WindowIcons.Regular);
+                    window.SetTitle("Duplicati status");
+                }
+            });
         }
 
         protected void OnStatusClicked()
@@ -179,11 +238,22 @@ namespace Duplicati.GUI.TrayIcon
             else
                 Program.Connection.Pause();
         }
-        
-        protected void OnStatusUpdated(IServerStatus status)
+
+        /// <summary>
+        /// A delay to allow the GUI to startup properly on Linux before updating the tray icon.
+        /// </summary>
+        private readonly Task m_startupDelay =
+            OperatingSystem.IsLinux()
+            ? Task.Delay(1000)
+            : Task.CompletedTask;
+
+        protected async Task OnStatusUpdatedAsync(IServerStatus status)
         {
-            this.UpdateUIState(() => {
-                switch(status.SuggestedStatusIcon)
+            await m_startupDelay;
+            await this.UpdateUIStateAsync(()
+            =>
+            {
+                switch (status.SuggestedStatusIcon)
                 {
                     case SuggestedStatusIcon.Active:
                         this.SetIcon(TrayIcons.Running);
@@ -200,13 +270,16 @@ namespace Duplicati.GUI.TrayIcon
                     case SuggestedStatusIcon.Paused:
                         this.SetIcon(TrayIcons.Paused);
                         break;
+                    case SuggestedStatusIcon.Disconnected:
+                        this.SetIcon(TrayIcons.Disconnected);
+                        break;
                     case SuggestedStatusIcon.Ready:
-                    default:    
+                    default:
                         this.SetIcon(TrayIcons.Idle);
                         break;
-                    
+
                 }
-    
+
                 if (status.ProgramState == LiveControlState.Running)
                 {
                     m_pauseMenu.SetIcon(MenuIcons.Pause);
@@ -219,7 +292,12 @@ namespace Duplicati.GUI.TrayIcon
                     m_pauseMenu.SetText("Resume");
                     m_stateIsPaused = true;
                 }
-            });
+
+                m_openMenu.SetHidden(status.SuggestedStatusIcon == SuggestedStatusIcon.Disconnected);
+                m_pauseMenu.SetHidden(status.SuggestedStatusIcon == SuggestedStatusIcon.Disconnected);
+                m_reconnectMenu.SetHidden(status.SuggestedStatusIcon != SuggestedStatusIcon.Disconnected || PasswordPrompt.IsShowingDialog);
+                m_changePasswordMenu.SetHidden(status.SuggestedStatusIcon != SuggestedStatusIcon.Disconnected || Program.Connection?.PasswordSource != Program.PasswordSource.SuppliedPassword || PasswordPrompt.IsShowingDialog);
+            }).ConfigureAwait(false);
         }
 
         #region IDisposable implementation

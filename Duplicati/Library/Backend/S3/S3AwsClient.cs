@@ -1,33 +1,33 @@
-#region Disclaimer / License
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
 
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
-// 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-// 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
-// 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-
-#endregion
 
 using Amazon.S3;
 using Amazon.S3.Model;
+using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
+using Duplicati.Library.Utility;
+using Duplicati.Library.Utility.Options;
+using System.Runtime.CompilerServices;
+using Duplicati.StreamUtil;
 
 namespace Duplicati.Library.Backend
 {
@@ -36,55 +36,220 @@ namespace Duplicati.Library.Backend
     /// </summary>
     public class S3AwsClient : IS3Client
     {
-        private static readonly string LOGTAG = Logging.Log.LogTagFromType<S3AwsClient>();
+        /// <summary>
+        /// The maximum number of items to list in a single request
+        /// </summary>
         private const int ITEM_LIST_LIMIT = 1000;
 
-        private readonly string m_locationConstraint;
-        private readonly string m_storageClass;
-        private AmazonS3Client m_client;
+        /// <summary>
+        /// The prefix for extended options
+        /// </summary>
+        private const string EXT_OPTION_PREFIX = "s3-ext-";
 
-        private readonly string m_dnsHost;
+        /// <summary>
+        /// The location constraint for the bucket
+        /// </summary>
+        private readonly string? m_locationConstraint;
+        /// <summary>
+        /// The storage class for the bucket
+        /// </summary>
+        private readonly string? m_storageClass;
+        /// <summary>
+        /// The S3 client
+        /// </summary>
+        private readonly AmazonS3Client m_client;
+        /// <summary>
+        /// The option to specify if chunk encoding should be used
+        /// </summary>
+        private readonly bool m_useChunkEncoding;
+        /// <summary>
+        /// The option to specify if payload signing should be disabled
+        /// </summary>
+        private readonly bool m_disablePayloadSigning;
 
-        public S3AwsClient(string awsID, string awsKey, string locationConstraint, string servername,
-            string storageClass, bool useSSL, Dictionary<string, string> options)
+        /// <summary>
+        /// The DNS host of the S3 server
+        /// </summary>
+        private readonly string? m_dnsHost;
+        /// <summary>
+        /// The option to specify if the V2 list API should be used
+        /// </summary>
+        private readonly bool m_useV2ListApi;
+        /// <summary>
+        /// The timeouts to use
+        /// </summary>
+        private readonly TimeoutOptionsHelper.Timeouts m_timeouts;
+
+        /// <summary>
+        /// The archive classes that are considered archive classes
+        /// </summary>
+        private readonly IReadOnlySet<S3StorageClass> m_archiveClasses;
+
+        /// <summary>
+        /// The lock mode to use for object locking
+        /// </summary>
+        private readonly string m_lockMode;
+
+        /// <summary>
+        /// The option to specify the archive classes
+        /// </summary>
+        public const string S3_ARCHIVE_CLASSES_OPTION = "s3-archive-classes";
+
+        /// <summary>
+        /// The option to specify the list API version
+        /// </summary>
+        public const string S3_LIST_API_VERSION_OPTION = "s3-list-api-version";
+
+        /// <summary>
+        /// The deprecated name of <see cref="S3_LIST_API_VERSION_OPTION"/>, which was the only key read before it was fixed
+        /// </summary>
+        public const string S3_LEGACY_LIST_API_VERSION_OPTION = "list-api-version";
+
+        /// <summary>
+        /// The option to specify the ARN of a role to assume through STS
+        /// </summary>
+        public const string S3_ASSUME_ROLE_ARN_OPTION = "s3-assume-role-arn";
+
+        /// <summary>
+        /// The option to specify the name of the role session
+        /// </summary>
+        public const string S3_ASSUME_ROLE_SESSION_NAME_OPTION = "s3-assume-role-session-name";
+
+        /// <summary>
+        /// The option to specify the external id the role requires
+        /// </summary>
+        public const string S3_ASSUME_ROLE_EXTERNAL_ID_OPTION = "s3-assume-role-external-id";
+
+        /// <summary>
+        /// The option to specify the URL of the STS endpoint that assumes the role
+        /// </summary>
+        public const string S3_STS_ENDPOINT_OPTION = "s3-sts-endpoint";
+
+        /// <summary>
+        /// The credentials of the assumed role, if a role is assumed
+        /// </summary>
+        private readonly S3AssumeRoleCredentials? m_roleCredentials;
+
+        /// <summary>
+        /// The option to request server-side encryption of the stored objects
+        /// </summary>
+        public const string S3_SERVER_SIDE_ENCRYPTION_OPTION = "s3-server-side-encryption";
+
+        /// <summary>
+        /// The option to choose the key management service key for server-side encryption
+        /// </summary>
+        public const string S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID_OPTION = "s3-server-side-encryption-kms-key-id";
+
+        /// <summary>
+        /// The server-side encryption with keys managed by the server
+        /// </summary>
+        public const string SSE_S3 = "AES256";
+
+        /// <summary>
+        /// The server-side encryption with keys managed by the key management service
+        /// </summary>
+        public const string SSE_KMS = "aws:kms";
+
+        /// <summary>
+        /// The server-side encryption to request, or <c>null</c> for none
+        /// </summary>
+        private readonly string? m_sseMethod;
+
+        /// <summary>
+        /// The key management service key for server-side encryption, or <c>null</c> for the default key
+        /// </summary>
+        private readonly string? m_sseKmsKeyId;
+
+        /// <summary>
+        /// Reads the server-side encryption options
+        /// </summary>
+        /// <param name="options">The backend options</param>
+        /// <returns>The encryption to request, or <c>null</c> for none, and the key management service key, or <c>null</c> for the default</returns>
+        /// <exception cref="UserInformationException">If the encryption is not supported, or a key is given without aws:kms</exception>
+        public static (string? Method, string? KmsKeyId) ParseServerSideEncryption(IReadOnlyDictionary<string, string?> options)
         {
-            var cfg = new AmazonS3Config
-            {
-                UseHttp = !useSSL,
-                ServiceURL = (useSSL ? "https://" : "http://") + servername,
-                BufferSize = (int) Utility.Utility.DEFAULT_BUFFER_SIZE,
-            };
+            var value = options.GetValueOrDefault(S3_SERVER_SIDE_ENCRYPTION_OPTION)?.Trim();
+            string? method;
+            if (string.IsNullOrEmpty(value) || string.Equals(value, "none", StringComparison.OrdinalIgnoreCase))
+                method = null;
+            else if (string.Equals(value, SSE_S3, StringComparison.OrdinalIgnoreCase))
+                method = SSE_S3;
+            else if (string.Equals(value, SSE_KMS, StringComparison.OrdinalIgnoreCase))
+                method = SSE_KMS;
+            else
+                throw new UserInformationException(Strings.S3Backend.UnknownServerSideEncryptionError(value, S3_SERVER_SIDE_ENCRYPTION_OPTION), "S3UnknownServerSideEncryption");
 
-            foreach (var opt in options.Keys.Where(x => x.StartsWith("s3-ext-", StringComparison.OrdinalIgnoreCase)))
-            {
-                var prop = cfg.GetType().GetProperties().FirstOrDefault(x =>
-                    string.Equals(x.Name, opt.Substring("s3-ext-".Length), StringComparison.OrdinalIgnoreCase));
-                if (prop != null && prop.CanWrite)
-                {
-                    if (prop.PropertyType == typeof(bool))
-                        prop.SetValue(cfg, Utility.Utility.ParseBoolOption(options, opt));
-                    else if (prop.PropertyType.IsEnum)
-                        prop.SetValue(cfg, Enum.Parse(prop.PropertyType, options[opt], true));
-                    else if (prop.PropertyType == typeof(int))
-                        prop.SetValue(cfg, int.Parse(options[opt]));
-                    else if (prop.PropertyType == typeof(long))
-                        prop.SetValue(cfg, long.Parse(options[opt]));
-                    else if (prop.PropertyType == typeof(string))
-                        prop.SetValue(cfg, options[opt]);
-                }
+            var keyId = options.GetValueOrDefault(S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID_OPTION)?.Trim();
+            if (string.IsNullOrEmpty(keyId))
+                keyId = null;
+            else if (method != SSE_KMS)
+                throw new UserInformationException(Strings.S3Backend.KmsKeyWithoutKmsEncryptionError(S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID_OPTION, S3_SERVER_SIDE_ENCRYPTION_OPTION), "S3KmsKeyWithoutKmsEncryption");
 
-                if (prop == null)
-                    Logging.Log.WriteWarningMessage(LOGTAG, "UnsupportedOption", null, "Unsupported option: {0}", opt);
-            }
-
-            m_client = new AmazonS3Client(awsID, awsKey, cfg);
-
-            m_locationConstraint = locationConstraint;
-            m_storageClass = storageClass;
-            m_dnsHost = string.IsNullOrWhiteSpace(cfg.ServiceURL) ? null : new Uri(cfg.ServiceURL).Host;
+            return (method, keyId);
         }
 
-        public void AddBucket(string bucketName)
+        /// <summary>
+        /// The default storage classes that are considered archive classes
+        /// </summary>
+        public static readonly IReadOnlySet<S3StorageClass> DEFAULT_ARCHIVE_CLASSES = new HashSet<S3StorageClass>([
+            S3StorageClass.DeepArchive, S3StorageClass.Glacier, S3StorageClass.GlacierInstantRetrieval, S3StorageClass.Snow
+        ]);
+
+        public S3AwsClient(string awsID, string awsKey, string? locationConstraint, string servername,
+            string? storageClass, bool useSSL, bool disableChunkEncoding, bool disablePayloadSigning, TimeoutOptionsHelper.Timeouts timeouts, Dictionary<string, string?> options, string lockMode, string? authenticationRegion)
+        {
+            var cfg = GetDefaultAmazonS3Config();
+            cfg.UseHttp = !useSSL;
+            cfg.ServiceURL = (useSSL ? "https://" : "http://") + servername;
+            var authRegion = !string.IsNullOrWhiteSpace(authenticationRegion)
+                ? authenticationRegion
+                : locationConstraint;
+            if (!string.IsNullOrWhiteSpace(authRegion))
+                cfg.AuthenticationRegion = authRegion;
+
+            CommandLineArgumentMapper.ApplyArguments(cfg, options, EXT_OPTION_PREFIX);
+
+            var roleArn = options.GetValueOrDefault(S3_ASSUME_ROLE_ARN_OPTION);
+            if (string.IsNullOrWhiteSpace(roleArn))
+                m_client = new AmazonS3Client(awsID, awsKey, cfg);
+            else
+            {
+                // The given access key only assumes the role; the requests are signed with the role's credentials
+                m_roleCredentials = new S3AssumeRoleCredentials(awsID, awsKey, roleArn,
+                    options.GetValueOrDefault(S3_ASSUME_ROLE_SESSION_NAME_OPTION),
+                    options.GetValueOrDefault(S3_ASSUME_ROLE_EXTERNAL_ID_OPTION),
+                    options.GetValueOrDefault(S3_STS_ENDPOINT_OPTION),
+                    authRegion);
+                m_client = new AmazonS3Client(m_roleCredentials, cfg);
+            }
+
+            m_timeouts = timeouts;
+            m_useV2ListApi = string.Equals(options.GetValueOrDefault(S3_LIST_API_VERSION_OPTION) ?? options.GetValueOrDefault(S3_LEGACY_LIST_API_VERSION_OPTION) ?? "v1", "v2", StringComparison.OrdinalIgnoreCase);
+            m_locationConstraint = locationConstraint;
+            m_storageClass = storageClass;
+            m_dnsHost = string.IsNullOrWhiteSpace(cfg.ServiceURL) ? null : new System.Uri(cfg.ServiceURL).Host;
+            m_useChunkEncoding = !disableChunkEncoding;
+            m_disablePayloadSigning = disablePayloadSigning;
+            m_archiveClasses = ParseStorageClasses(options.GetValueOrDefault(S3_ARCHIVE_CLASSES_OPTION));
+            m_lockMode = lockMode;
+            (m_sseMethod, m_sseKmsKeyId) = ParseServerSideEncryption(options);
+        }
+
+        /// <summary>
+        /// Parses the storage classes from the string
+        /// </summary>
+        /// <param name="storageClass">The storage class string</param>
+        /// <returns>The storage classes</returns>
+        private static IReadOnlySet<S3StorageClass> ParseStorageClasses(string? storageClass)
+        {
+            if (string.IsNullOrWhiteSpace(storageClass))
+                return DEFAULT_ARCHIVE_CLASSES;
+
+            return new HashSet<S3StorageClass>(storageClass.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(x => new S3StorageClass(x)));
+        }
+
+        /// <inheritdoc/>
+        public async Task AddBucketAsync(string bucketName, CancellationToken cancelToken)
         {
             var request = new PutBucketRequest
             {
@@ -94,66 +259,175 @@ namespace Duplicati.Library.Backend
             if (!string.IsNullOrEmpty(m_locationConstraint))
                 request.BucketRegionName = m_locationConstraint;
 
-            m_client.PutBucket(request);
-        }
-
-        public virtual void GetFileStream(string bucketName, string keyName, System.IO.Stream target)
-        {
-            var objectGetRequest = new GetObjectRequest
+            try
             {
-                BucketName = bucketName,
-                Key = keyName
-            };
-
-            using (GetObjectResponse objectGetResponse = m_client.GetObject(objectGetRequest))
-            using (System.IO.Stream s = objectGetResponse.ResponseStream)
+                await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => m_client.PutBucketAsync(request, ct)).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception s3ex)
             {
-                try
-                {
-                    s.ReadTimeout = (int) TimeSpan.FromMinutes(1).TotalMilliseconds;
-                }
-                catch
-                {
-                    // We don't care about this timeout
-                }
-
-                Utility.Utility.CopyStream(s, target);
+                TranslateException(s3ex, bucketName);
+                throw;
             }
         }
 
-        public string GetDnsHost()
+        /// <summary>
+        /// Gets the default Amazon S3 configuration
+        /// </summary>
+        /// <returns>>The default Amazon S3 configuration</returns>
+        public static AmazonS3Config GetDefaultAmazonS3Config()
+        {
+            return new AmazonS3Config()
+            {
+                BufferSize = (int)Utility.Utility.DEFAULT_BUFFER_SIZE,
+
+                // If this is not set, accessing the property will trigger an expensive operation (~30 seconds)
+                // to get the region endpoint. The use of ARNs (Amazon Resource Names) doesn't appear to be
+                // critical for our usages.
+                // See: https://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html
+                UseArnRegion = false,
+            };
+        }
+
+        /// <summary>
+        /// Extended options that are not included as reported options
+        /// </summary>
+        private static readonly HashSet<string> EXCLUDED_EXTENDED_OPTIONS = new HashSet<string>([
+            nameof(AmazonS3Config.USEast1RegionalEndpointValue)
+        ]);
+
+        /// <summary>
+        /// List of properties that are slow to read the default value from
+        /// </summary>
+        /// <remarks>Changes in this list will likely need to be reflected in AWSSecretProvider.cs</remarks>
+        private static readonly HashSet<string> SLOW_LOADING_PROPERTIES = new[] {
+            nameof(AmazonS3Config.RegionEndpoint),
+            nameof(AmazonS3Config.ServiceURL),
+            nameof(AmazonS3Config.MaxErrorRetry),
+            nameof(AmazonS3Config.DefaultConfigurationMode),
+            nameof(AmazonS3Config.Timeout),
+            nameof(AmazonS3Config.RetryMode),
+        }.ToHashSet();
+
+        public static IEnumerable<ICommandLineArgument> GetAwsExtendedOptions()
+            => CommandLineArgumentMapper.MapArguments(GetDefaultAmazonS3Config(), prefix: EXT_OPTION_PREFIX, exclude: EXCLUDED_EXTENDED_OPTIONS, excludeDefaultValue: SLOW_LOADING_PROPERTIES)
+                .Cast<CommandLineArgument>()
+                .Select(x =>
+                {
+                    x.LongDescription = $"Extended option {x.LongDescription}";
+                    return x;
+                });
+
+        public virtual Task GetFileStreamAsync(string bucketName, string keyName, Stream target, CancellationToken cancelToken)
+            => GetFileStreamCoreAsync(bucketName, keyName, null, target, cancelToken);
+
+        public Task GetFileStreamAsync(string bucketName, string keyName, string versionId, Stream target, CancellationToken cancelToken)
+            => GetFileStreamCoreAsync(bucketName, keyName, versionId, target, cancelToken);
+
+        /// <summary>
+        /// Copies the contents of an object into the target stream
+        /// </summary>
+        /// <param name="bucketName">The name of the bucket</param>
+        /// <param name="keyName">The name of the object</param>
+        /// <param name="versionId">The version to read, or <c>null</c> for the current version</param>
+        /// <param name="target">The stream to write the contents to</param>
+        /// <param name="cancelToken">The cancellation token</param>
+        /// <returns>A task representing the asynchronous operation</returns>
+        private async Task GetFileStreamCoreAsync(string bucketName, string keyName, string? versionId, Stream target, CancellationToken cancelToken)
+        {
+            try
+            {
+                var objectGetRequest = new GetObjectRequest
+                {
+                    BucketName = bucketName,
+                    Key = keyName,
+                    VersionId = versionId
+                };
+
+                using (var objectGetResponse = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => m_client.GetObjectAsync(objectGetRequest, ct)).ConfigureAwait(false))
+                using (var s = objectGetResponse.ResponseStream)
+                using (var t = s.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
+                    await Utility.Utility.CopyStreamAsync(t, target, cancelToken).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception s3Ex)
+            {
+                TranslateException(s3Ex, keyName);
+                throw;
+            }
+
+        }
+
+        public string? GetDnsHost()
         {
             return m_dnsHost;
         }
 
-        public virtual async Task AddFileStreamAsync(string bucketName, string keyName, System.IO.Stream source,
+        public virtual async Task AddFileStreamAsync(string bucketName, string keyName, Stream source,
             CancellationToken cancelToken)
         {
+            (source, var hashes, var tmp) = await Utility.Utility.CalculateThrottledStreamHash(source, ["MD5", "SHA256"], cancelToken).ConfigureAwait(false);
+            using var _ = tmp;
+
+            // Precalculate the hashes to avoid calculating them in the PutObjectAsync call where the stream could be throttled
+            var md5 = Convert.ToBase64String(Utility.Utility.HexStringAsByteArray(hashes[0]));
+            var sha256 = Convert.ToBase64String(Utility.Utility.HexStringAsByteArray(hashes[1]));
+
+            await AddFileStreamAsync(bucketName, keyName, source, md5, sha256, source.Length, cancelToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Adds a file stream to the bucket with the specified hashes and content length
+        /// </summary>
+        /// <param name="bucketName">The name of the bucket</param>
+        /// <param name="keyName">The name of the object to create</param>
+        /// <param name="source">The source stream to upload</param>
+        /// <param name="md5">The MD5 hash of the content as a hex string</param>
+        /// <param name="sha256">The SHA256 hash of the content as a hex string</param>
+        /// <param name="contentLength">The content length of the stream</param>
+        /// <param name="cancelToken">The cancellation token</param>
+        /// <returns>>A task representing the asynchronous operation</returns>
+        public virtual async Task AddFileStreamAsync(string bucketName, string keyName, Stream source, string md5, string sha256, long contentLength, CancellationToken cancelToken)
+        {
+            using var ts = source.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
             var objectAddRequest = new PutObjectRequest
             {
                 BucketName = bucketName,
                 Key = keyName,
-                InputStream = source
+                InputStream = ts,
+                UseChunkEncoding = m_useChunkEncoding,
+                MD5Digest = md5,
+                ChecksumAlgorithm = ChecksumAlgorithm.SHA256,
+                ChecksumSHA256 = sha256,
+                DisablePayloadSigning = m_disablePayloadSigning
             };
+            objectAddRequest.Headers["Content-Length"] = contentLength.ToString();
+
             if (!string.IsNullOrWhiteSpace(m_storageClass))
                 objectAddRequest.StorageClass = new S3StorageClass(m_storageClass);
+
+            if (m_sseMethod != null)
+            {
+                objectAddRequest.ServerSideEncryptionMethod = ServerSideEncryptionMethod.FindValue(m_sseMethod);
+                objectAddRequest.ServerSideEncryptionKeyManagementServiceKeyId = m_sseKmsKeyId;
+            }
+
+            // Provide SigV4 payload hash explicitly (lowercase hex) iff applicable.
+            // - If chunked streaming is ON, the SDK uses the streaming literal.
+            // - If payload signing is disabled, the SDK uses the UNSIGNED-PAYLOAD literal.
+            if (!m_useChunkEncoding && !m_disablePayloadSigning)
+                objectAddRequest.Headers["x-amz-content-sha256"] = sha256.ToLowerInvariant();
 
             try
             {
                 await m_client.PutObjectAsync(objectAddRequest, cancelToken);
             }
-            catch (AmazonS3Exception e)
+            catch (AmazonS3Exception s3Ex)
             {
-                //Catch "non-existing" buckets
-                if (e.StatusCode == System.Net.HttpStatusCode.NotFound ||
-                    "NoSuchBucket".Equals(e.ErrorCode))
-                    throw new FolderMissingException(e);
-
+                TranslateException(s3Ex, keyName);
                 throw;
             }
         }
 
-        public void DeleteObject(string bucketName, string keyName)
+        public async Task DeleteObjectAsync(string bucketName, string keyName, CancellationToken cancellationToken)
         {
             var objectDeleteRequest = new DeleteObjectRequest
             {
@@ -161,63 +435,280 @@ namespace Duplicati.Library.Backend
                 Key = keyName
             };
 
-            m_client.DeleteObject(objectDeleteRequest);
+            try
+            {
+                await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, ct => m_client.DeleteObjectAsync(objectDeleteRequest, ct)).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception s3Ex)
+            {
+                TranslateException(s3Ex, keyName);
+                throw;
+            }
         }
 
-        public virtual IEnumerable<IFileEntry> ListBucket(string bucketName, string prefix)
+        public async Task<DateTime?> GetObjectLockUntilAsync(string bucketName, string keyName, CancellationToken cancelToken)
         {
-            bool isTruncated = true;
-            string filename = null;
+            var request = new GetObjectRetentionRequest
+            {
+                BucketName = bucketName,
+                Key = keyName
+            };
+
+            try
+            {
+                var response = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => m_client.GetObjectRetentionAsync(request, ct)).ConfigureAwait(false);
+                return response.Retention?.RetainUntilDate?.ToUniversalTime();
+            }
+            catch (AmazonS3Exception s3Ex)
+            {
+                if ("NoSuchObjectLockConfiguration".Equals(s3Ex.ErrorCode, StringComparison.OrdinalIgnoreCase))
+                    return null;
+
+                TranslateObjectLockException(s3Ex, bucketName);
+                TranslateException(s3Ex, keyName);
+                throw;
+            }
+        }
+
+        public async Task SetObjectLockUntilAsync(string bucketName, string keyName, DateTime lockUntilUtc, CancellationToken cancelToken)
+        {
+            var lockMode = typeof(ObjectLockRetentionMode)
+                .GetProperties(System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public)
+                .FirstOrDefault(x => x.Name.Equals(m_lockMode, StringComparison.OrdinalIgnoreCase))?
+                .GetValue(null) as ObjectLockRetentionMode
+                    ?? new ObjectLockRetentionMode(m_lockMode);
+
+            var request = new PutObjectRetentionRequest
+            {
+                BucketName = bucketName,
+                Key = keyName,
+                Retention = new ObjectLockRetention
+                {
+                    Mode = lockMode,
+                    RetainUntilDate = lockUntilUtc.ToUniversalTime(),
+                }
+            };
+
+            try
+            {
+                await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct =>
+                    m_client.PutObjectRetentionAsync(request, ct)).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception s3Ex)
+            {
+                TranslateObjectLockException(s3Ex, bucketName);
+                TranslateException(s3Ex, keyName);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Checks if an S3 error reports that the bucket has no object lock configuration,
+        /// and throws <see cref="ObjectLockNotSupportedException"/> if so
+        /// </summary>
+        /// <param name="errorCode">The S3 error code</param>
+        /// <param name="message">The S3 error message</param>
+        /// <returns><c>true</c> if the error means object locking is not enabled for the bucket</returns>
+        internal static bool IsObjectLockNotEnabledError(string? errorCode, string? message)
+        {
+            if ("ObjectLockConfigurationNotFoundError".Equals(errorCode, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // AWS and most compatible servers report "Bucket is missing Object Lock Configuration" as InvalidRequest
+            if ("InvalidRequest".Equals(errorCode, StringComparison.OrdinalIgnoreCase) || "InvalidBucketState".Equals(errorCode, StringComparison.OrdinalIgnoreCase))
+                return (message ?? string.Empty).Replace(" ", string.Empty).Contains("ObjectLock", StringComparison.OrdinalIgnoreCase);
+
+            return false;
+        }
+
+        /// <summary>
+        /// Throws <see cref="ObjectLockNotSupportedException"/> if the exception reports that the bucket has no object lock configuration
+        /// </summary>
+        /// <param name="s3Ex">The exception to inspect</param>
+        /// <param name="bucketName">The bucket name, for the error message</param>
+        private static void TranslateObjectLockException(AmazonS3Exception s3Ex, string bucketName)
+        {
+            if (IsObjectLockNotEnabledError(s3Ex.ErrorCode, s3Ex.Message))
+                throw new ObjectLockNotSupportedException(string.Format("Object locking is not enabled for bucket {0}: {1}", bucketName, s3Ex.Message), s3Ex);
+        }
+
+        /// <summary>
+        /// Lists the contents of a bucket, using a plugable API call
+        /// </summary>
+        /// <param name="bucketName">The bucket to list</param>
+        /// <param name="prefix">The prefix to list</param>
+        /// <param name="recursive">If true, the list is recursive</param>
+        /// <param name="cancellationToken">The cancellation token</param>
+        /// <returns>The list of files</returns>
+        public async IAsyncEnumerable<IFileEntry> ListBucketAsync(string bucketName, string prefix, bool recursive, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            var isTruncated = true;
+            string? filename = null;
+            var delimiter = recursive ? "" : "/";
+            if (!string.IsNullOrWhiteSpace(prefix))
+                prefix = Util.AppendDirSeparator(prefix, "/");
 
             //TODO: Figure out if this is the case with AWSSDK too
             //Unfortunately S3 sometimes reports duplicate values when requesting more than one page of results
             //So, track the files that have already been returned and skip any duplicates.
-            HashSet<string> alreadyReturned = new HashSet<string>();
+            var alreadyReturned = new HashSet<string>();
 
             //We truncate after ITEM_LIST_LIMIT elements, and then repeat
             while (isTruncated)
             {
-                var listRequest = new ListObjectsRequest {BucketName = bucketName};
-
-                if (!string.IsNullOrEmpty(filename))
-                    listRequest.Marker = filename;
-
-                listRequest.MaxKeys = ITEM_LIST_LIMIT;
-                if (!string.IsNullOrEmpty(prefix))
-                    listRequest.Prefix = prefix;
-
-                ListObjectsResponse listResponse;
+                ListObjectsV2Response listResponse;
                 try
                 {
-                    listResponse = m_client.ListObjects(listRequest);
-                }
-                catch (AmazonS3Exception e)
-                {
-                    if (e.StatusCode == System.Net.HttpStatusCode.NotFound ||
-                        "NoSuchBucket".Equals(e.ErrorCode))
+                    if (m_useV2ListApi)
                     {
-                        throw new FolderMissingException(e);
+                        var listRequest = new ListObjectsV2Request
+                        {
+                            BucketName = bucketName,
+                            Prefix = prefix,
+                            ContinuationToken = filename,
+                            MaxKeys = ITEM_LIST_LIMIT,
+                            Delimiter = delimiter
+                        };
+                        listResponse = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancellationToken, ct => m_client.ListObjectsV2Async(listRequest, ct)).ConfigureAwait(false);
                     }
+                    else
+                    {
+                        // Use the V1 API
+                        var listRequest = new ListObjectsRequest
+                        {
+                            BucketName = bucketName,
+                            Prefix = prefix,
+                            Marker = filename,
+                            MaxKeys = ITEM_LIST_LIMIT,
+                            Delimiter = delimiter
+                        };
+                        var listResponsev1 = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancellationToken, ct => m_client.ListObjectsAsync(listRequest, ct)).ConfigureAwait(false);
 
+                        // Map the V1 response to the V2 response
+                        listResponse = new ListObjectsV2Response
+                        {
+                            CommonPrefixes = listResponsev1.CommonPrefixes,
+                            IsTruncated = listResponsev1.IsTruncated,
+                            NextContinuationToken = listResponsev1.NextMarker,
+                            S3Objects = listResponsev1.S3Objects
+                        };
+                    }
+                }
+                catch (AmazonS3Exception s3ex)
+                {
+                    TranslateException(s3ex, prefix ?? "");
                     throw;
                 }
 
-                isTruncated = listResponse.IsTruncated;
-                filename = listResponse.NextMarker;
+                isTruncated = listResponse.IsTruncated ?? false;
+                filename = listResponse.NextContinuationToken;
 
-                foreach (var obj in listResponse.S3Objects.Where(obj => alreadyReturned.Add(obj.Key)))
+                foreach (var obj in listResponse.CommonPrefixes ?? [])
                 {
-                    yield return new Common.IO.FileEntry(
-                        obj.Key,
-                        obj.Size,
-                        obj.LastModified,
-                        obj.LastModified
-                    );
+                    if (obj == prefix || !obj.StartsWith(prefix))
+                        continue;
+
+                    // Because the prefixes are returned, and not the folder objects
+                    // we do not get the folder modification date
+                    yield return new FileEntry(
+                        obj.Substring(prefix.Length),
+                        -1,
+                        new DateTime(0),
+                        new DateTime(0)
+                    )
+                    { IsFolder = true };
+                }
+
+                foreach (var obj in (listResponse.S3Objects ?? []).Where(obj => alreadyReturned.Add(obj.Key)))
+                {
+                    // Skip self-prefix, this discards the folder modification date :/
+                    if (obj.Key == prefix || !obj.Key.StartsWith(prefix))
+                        continue;
+
+                    yield return new FileEntry(
+                        obj.Key.Substring(prefix.Length),
+                        obj.Size ?? -1,
+                        obj.LastModified ?? default,
+                        obj.LastModified ?? default
+                    )
+                    {
+                        IsFolder = obj.Key.EndsWith("/"),
+                        IsArchived = m_archiveClasses.Contains(obj.StorageClass)
+                    };
                 }
             }
         }
 
-        public void RenameFile(string bucketName, string source, string target)
+        /// <inheritdoc />
+        /// <remarks>
+        /// Unlike <see cref="ListBucketAsync"/>, the prefix is used as given, so a caller can
+        /// resolve a single key by passing the key itself; the names returned are relative to the prefix.
+        /// </remarks>
+        public IAsyncEnumerable<(IFileEntry Entry, string VersionId)> ListBucketVersionsAtAsync(string bucketName, string prefix, bool recursive, DateTime atUtc, CancellationToken cancellationToken)
+            => PointInTimeVersionSelector.SelectEntriesAt(
+                ListVersionsAsync(bucketName, prefix, cancellationToken),
+                prefix,
+                recursive,
+                atUtc,
+                storageClass => storageClass != null && m_archiveClasses.Contains(new S3StorageClass(storageClass)),
+                cancellationToken);
+
+        /// <summary>
+        /// Pages through the version listing of a prefix, in the order S3 returns it:
+        /// by key, newest version first within a key
+        /// </summary>
+        /// <remarks>
+        /// No delimiter is used, as a common prefix cannot tell whether any object under it
+        /// existed at a point in time; folders are derived from the selected versions instead.
+        /// </remarks>
+        /// <param name="bucketName">The bucket name</param>
+        /// <param name="prefix">The prefix to list</param>
+        /// <param name="cancellationToken">The cancellation token</param>
+        /// <returns>The versions and delete markers under the prefix</returns>
+        private async IAsyncEnumerable<ObjectVersion> ListVersionsAsync(string bucketName, string prefix, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            string? keyMarker = null;
+            string? versionIdMarker = null;
+            var isTruncated = true;
+
+            while (isTruncated)
+            {
+                ListVersionsResponse response;
+                try
+                {
+                    var request = new ListVersionsRequest
+                    {
+                        BucketName = bucketName,
+                        Prefix = prefix,
+                        KeyMarker = keyMarker,
+                        VersionIdMarker = versionIdMarker,
+                        MaxKeys = ITEM_LIST_LIMIT
+                    };
+                    response = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancellationToken, ct => m_client.ListVersionsAsync(request, ct)).ConfigureAwait(false);
+                }
+                catch (AmazonS3Exception s3ex)
+                {
+                    TranslateException(s3ex, prefix);
+                    throw;
+                }
+
+                isTruncated = response.IsTruncated ?? false;
+                keyMarker = response.NextKeyMarker;
+                versionIdMarker = response.NextVersionIdMarker;
+
+                foreach (var version in response.Versions ?? [])
+                    yield return new ObjectVersion(
+                        version.Key,
+                        version.VersionId,
+                        (version.LastModified ?? default).ToUniversalTime(),
+                        version.IsDeleteMarker ?? false,
+                        version.Size ?? -1,
+                        version.StorageClass?.Value
+                    );
+            }
+        }
+
+        public async Task RenameFileAsync(string bucketName, string source, string target, CancellationToken cancelToken)
         {
             var copyObjectRequest = new CopyObjectRequest
             {
@@ -227,9 +718,57 @@ namespace Duplicati.Library.Backend
                 DestinationKey = target
             };
 
-            m_client.CopyObject(copyObjectRequest);
+            // A copy is encrypted as the request says, not as its source is
+            if (m_sseMethod != null)
+            {
+                copyObjectRequest.ServerSideEncryptionMethod = ServerSideEncryptionMethod.FindValue(m_sseMethod);
+                copyObjectRequest.ServerSideEncryptionKeyManagementServiceKeyId = m_sseKmsKeyId;
+            }
 
-            DeleteObject(bucketName, source);
+            try
+            {
+                await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken, ct => m_client.CopyObjectAsync(copyObjectRequest, ct)).ConfigureAwait(false);
+                await DeleteObjectAsync(bucketName, source, cancelToken).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception s3Ex)
+            {
+                TranslateException(s3Ex, source);
+                throw;
+            }
+        }
+
+        private static void TranslateException(AmazonS3Exception s3Ex, string keyName)
+        {
+            if ("NoSuchKey".Equals(s3Ex.ErrorCode, StringComparison.OrdinalIgnoreCase)
+                || "NoSuchVersion".Equals(s3Ex.ErrorCode, StringComparison.OrdinalIgnoreCase))
+                throw new FileMissingException(string.Format("File {0} not found", keyName), s3Ex);
+
+            if ("NoSuchBucket".Equals(s3Ex.ErrorCode, StringComparison.OrdinalIgnoreCase))
+                throw new FolderMissingException(s3Ex);
+
+            // Fallback for non-AWS servers
+            if (s3Ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                throw new FileMissingException(string.Format("File {0} not found", keyName), s3Ex);
+        }
+
+        public async Task<IFileEntry?> GetFileEntryAsync(string bucketName, string keyName, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var request = new GetObjectMetadataRequest { BucketName = bucketName, Key = keyName };
+                var response = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, ct => m_client.GetObjectMetadataAsync(request, ct)).ConfigureAwait(false);
+
+                return new FileEntry(keyName, response.ContentLength, response.LastModified ?? default, response.LastModified ?? default)
+                {
+                    IsFolder = keyName.EndsWith("/")
+                };
+            }
+            catch (AmazonS3Exception ex)
+            {
+                if (ex.StatusCode == System.Net.HttpStatusCode.NotFound || "NoSuchKey".Equals(ex.ErrorCode, StringComparison.OrdinalIgnoreCase))
+                    return null;
+                throw;
+            }
         }
 
         #region IDisposable Members
@@ -238,7 +777,7 @@ namespace Duplicati.Library.Backend
         {
             if (m_client != null)
                 m_client.Dispose();
-            m_client = null;
+            m_roleCredentials?.Dispose();
         }
 
         #endregion

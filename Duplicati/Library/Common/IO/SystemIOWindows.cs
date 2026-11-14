@@ -1,32 +1,41 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
 
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 using System;
 using System.Collections.Generic;
 using System.Security.AccessControl;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 
-using AlphaFS = Alphaleonis.Win32.Filesystem;
 using Duplicati.Library.Interface;
 using Newtonsoft.Json;
+using System.Runtime.Versioning;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+using System.ComponentModel;
 
 namespace Duplicati.Library.Common.IO
 {
+    [SupportedOSPlatform("windows")]
     public struct SystemIOWindows : ISystemIO
     {
         // Based on the constant names used in
@@ -37,6 +46,228 @@ namespace Duplicati.Library.Common.IO
         private const string UncExtendedPathPrefix = @"\\?\UNC\";
 
         private static readonly string DIRSEP = Util.DirectorySeparatorString;
+
+        /// <summary>
+        /// Encapsulation of Win32 calls
+        /// </summary>
+        private static class Win32API
+        {
+            /// <summary>
+            /// The stream info levels for FindFirstStreamW
+            /// </summary>
+            public enum STREAM_INFO_LEVELS
+            {
+                FindStreamInfoStandard = 0,
+                FindStreamInfoMaxInfoLevel = 1
+            }
+
+            /// <summary>
+            /// The access mode for CreateFile to only read attributes
+            /// </summary>
+            public const uint FILE_READ_ATTRIBUTES = 0x0080;
+            /// <summary>
+            /// Open only an existing file
+            /// </summary>
+            public const uint OPEN_EXISTING = 3;
+            /// <summary>
+            /// The share mode for CreateFile to allow read access
+            /// </summary>
+            public const uint FILE_SHARE_READ = 0x00000001;
+            /// <summary>
+            /// The share mode for CreateFile to allow write access
+            /// </summary>
+            public const uint FILE_SHARE_WRITE = 0x00000002;
+            /// <summary>
+            /// The share mode for CreateFile to allow delete access
+            /// </summary>
+            public const uint FILE_SHARE_DELETE = 0x00000004;
+            /// <summary>
+            /// The control code that reads the reparse data of a file
+            /// </summary>
+            public const uint FSCTL_GET_REPARSE_POINT = 0x000900A8;
+            /// <summary>
+            /// The largest reparse data buffer that can be returned
+            /// </summary>
+            public const int MAXIMUM_REPARSE_DATA_BUFFER_SIZE = 16 * 1024;
+            /// <summary>
+            /// The reparse tag of a symlink made by WSL that is not a Windows symlink
+            /// </summary>
+            public const uint IO_REPARSE_TAG_LX_SYMLINK = 0xA000001D;
+
+            /// <summary>
+            /// Sends a control code to a device or file
+            /// </summary>
+            /// <param name="hDevice">The file handle</param>
+            /// <param name="dwIoControlCode">The control code</param>
+            /// <param name="lpInBuffer">The input buffer</param>
+            /// <param name="nInBufferSize">The size of the input buffer</param>
+            /// <param name="lpOutBuffer">The output buffer</param>
+            /// <param name="nOutBufferSize">The size of the output buffer</param>
+            /// <param name="lpBytesReturned">The number of bytes written to the output buffer</param>
+            /// <param name="lpOverlapped">Pointer to an overlapped structure</param>
+            /// <returns><c>true</c> if the call succeeds, <c>false</c> otherwise</returns>
+            [DllImport("kernel32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool DeviceIoControl(
+                SafeFileHandle hDevice,
+                uint dwIoControlCode,
+                IntPtr lpInBuffer,
+                uint nInBufferSize,
+                byte[] lpOutBuffer,
+                uint nOutBufferSize,
+                out uint lpBytesReturned,
+                IntPtr lpOverlapped);
+
+            /// <summary>
+            /// Creates a file handle
+            /// </summary>
+            /// <param name="lpFileName">The filename</param>
+            /// <param name="dwDesiredAccess">The access mode</param>
+            /// <param name="dwShareMode">The share mode</param>
+            /// <param name="lpSecurityAttributes">Pointer to security attributes</param>
+            /// <param name="dwCreationDisposition">Create mode flags</param>
+            /// <param name="dwFlagsAndAttributes">Flags and attributes</param>
+            /// <param name="hTemplateFile">Handle to a template file</param>
+            /// <returns>A filehandle for the entry</returns>
+            [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+            public static extern SafeFileHandle CreateFileW(
+                string lpFileName,
+                uint dwDesiredAccess,
+                uint dwShareMode,
+                IntPtr lpSecurityAttributes,
+                uint dwCreationDisposition,
+                uint dwFlagsAndAttributes,
+                IntPtr hTemplateFile);
+
+            /// <summary>
+            /// Gets the file size
+            /// </summary>
+            /// <param name="hFile">The file handle</param>
+            /// <param name="lpFileSize">The size of the file</param>
+            /// <returns><c>true</c> if the call succeeds, <c>false</c> otherwise
+            [DllImport("kernel32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool GetFileSizeEx(SafeFileHandle hFile, out long lpFileSize);
+
+            /// <summary>
+            /// The WIN32_FIND_STREAM_DATA structure
+            /// </summary>
+            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+            public struct WIN32_FIND_STREAM_DATA
+            {
+                public long StreamSize;
+                [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 296)]
+                public string cStreamName;
+            }
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern IntPtr FindFirstStreamW(string lpFileName, STREAM_INFO_LEVELS InfoLevel, out WIN32_FIND_STREAM_DATA lpFindStreamData, uint dwFlags);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern bool FindNextStreamW(IntPtr hFindStream, out WIN32_FIND_STREAM_DATA lpFindStreamData);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern bool FindClose(IntPtr hFindFile);
+
+            /// <summary>
+            /// Creates a hard link to an existing file
+            /// </summary>
+            /// <param name="lpFileName">The name of the new link</param>
+            /// <param name="lpExistingFileName">The name of the existing file</param>
+            /// <param name="lpSecurityAttributes">Reserved, must be <c>IntPtr.Zero</c></param>
+            /// <returns><c>true</c> if the call succeeds, <c>false</c> otherwise</returns>
+            [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+
+            /// <summary>
+            /// The request is not supported (for example a FAT volume)
+            /// </summary>
+            public const int ERROR_NOT_SUPPORTED = 50;
+
+            /// <summary>
+            /// The function is not valid on this volume
+            /// </summary>
+            public const int ERROR_INVALID_FUNCTION = 1;
+
+            /// <summary>
+            /// The source and target are on different volumes
+            /// </summary>
+            public const int ERROR_NOT_SAME_DEVICE = 17;
+
+            /// <summary>
+            /// The file has reached the maximum number of hard links
+            /// </summary>
+            public const int ERROR_TOO_MANY_LINKS = 1142;
+
+            /// <summary>
+            /// The file was not found
+            /// </summary>
+            public const int ERROR_FILE_NOT_FOUND = 2;
+
+            /// <summary>
+            /// The access mode for CreateFile to write
+            /// </summary>
+            public const uint GENERIC_WRITE = 0x40000000;
+            /// <summary>
+            /// Needed by CreateFile to open a folder
+            /// </summary>
+            public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+            /// <summary>
+            /// Makes CreateFile open a reparse point itself, not what it points to
+            /// </summary>
+            public const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+            /// <summary>
+            /// The control code that sets the reparse data of a file or folder
+            /// </summary>
+            public const uint FSCTL_SET_REPARSE_POINT = 0x000900A4;
+            /// <summary>
+            /// The reparse tag of a junction, which is also that of a mounted volume
+            /// </summary>
+            public const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;
+
+            /// <summary>
+            /// The WIN32_FIND_DATA structure, which carries the reparse tag in dwReserved0
+            /// </summary>
+            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+            public struct WIN32_FIND_DATA
+            {
+                public uint dwFileAttributes;
+                public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+                public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+                public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+                public uint nFileSizeHigh;
+                public uint nFileSizeLow;
+                public uint dwReserved0;
+                public uint dwReserved1;
+                [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+                public string cFileName;
+                [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+                public string cAlternateFileName;
+            }
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern IntPtr FindFirstFileW(string lpFileName, out WIN32_FIND_DATA lpFindFileData);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool DeviceIoControl(SafeFileHandle hDevice, uint dwIoControlCode, byte[] lpInBuffer, int nInBufferSize, IntPtr lpOutBuffer, int nOutBufferSize, out int lpBytesReturned, IntPtr lpOverlapped);
+        }
+
+        /// <summary>
+        /// The current user SID
+        /// </summary>
+        private static readonly SecurityIdentifier CURRENT_USER_SID = WindowsIdentity.GetCurrent().User;
+
+        /// <summary>
+        /// The LocalSystem user SID
+        /// </summary>
+        private static readonly SecurityIdentifier LOCAL_SYSTEM_SID = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+
+        /// <summary>
+        /// The Administrator user SID
+        /// </summary>
+        private static readonly SecurityIdentifier ADMINISTRATORS_SID = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
 
         /// <summary>
         /// Prefix path with one of the extended device path prefixes
@@ -75,7 +306,7 @@ namespace Duplicati.Library.Common.IO
                 }
             }
         }
-        
+
         /// <summary>
         /// Returns true if prefixed with @"\\" or @"//".
         /// </summary>
@@ -121,6 +352,31 @@ namespace Duplicati.Library.Common.IO
         }
 
         /// <summary>
+        /// Removes the artifacts the Windows WebDAV redirector leaves in a directory listing.
+        /// It reports entry names with a trailing null character, which makes .NET return
+        /// unusable paths and the "." and ".." entries (https://github.com/dotnet/runtime/issues/49803).
+        /// </summary>
+        /// <param name="paths">The paths returned by a directory enumeration</param>
+        /// <returns>The paths without trailing null characters, and without "." and ".."</returns>
+        public static IEnumerable<string> RemoveTrailingNullEntries(IEnumerable<string> paths)
+        {
+            foreach (var path in paths)
+            {
+                if (!path.EndsWith('\0'))
+                {
+                    yield return path;
+                    continue;
+                }
+
+                var trimmed = path.TrimEnd('\0');
+                if (relativePathComponents.Contains(Path.GetFileName(trimmed)))
+                    continue;
+
+                yield return trimmed;
+            }
+        }
+
+        /// <summary>
         /// Removes either of the extended device path prefixes
         /// (@"\\?\" or @"\\?\UNC\") if <paramref name="path"/> is prefixed
         /// with one of them.
@@ -152,6 +408,8 @@ namespace Duplicati.Library.Common.IO
             return path.Replace("/", Util.DirectorySeparatorString);
         }
 
+
+        [SupportedOSPlatform("windows")]
         private class FileSystemAccess
         {
             // Use JsonProperty Attribute to allow readonly fields to be set by deserializer
@@ -183,7 +441,7 @@ namespace Duplicati.Library.Common.IO
                 Propagation = rule.PropagationFlags;
             }
 
-            public FileSystemAccessRule Create(System.Security.AccessControl.FileSystemSecurity owner)
+            public FileSystemAccessRule Create(FileSystemSecurity owner)
             {
                 return (FileSystemAccessRule)owner.AccessRuleFactory(
                     new System.Security.Principal.SecurityIdentifier(SID),
@@ -195,9 +453,9 @@ namespace Duplicati.Library.Common.IO
             }
         }
 
-        private static Newtonsoft.Json.JsonSerializer _cachedSerializer;
+        private static JsonSerializer _cachedSerializer;
 
-        private Newtonsoft.Json.JsonSerializer Serializer
+        private JsonSerializer Serializer
         {
             get
             {
@@ -206,8 +464,8 @@ namespace Duplicati.Library.Common.IO
                     return _cachedSerializer;
                 }
 
-                _cachedSerializer = Newtonsoft.Json.JsonSerializer.Create(
-                    new Newtonsoft.Json.JsonSerializerSettings { Culture = System.Globalization.CultureInfo.InvariantCulture });
+                _cachedSerializer = JsonSerializer.Create(
+                    new JsonSerializerSettings { Culture = System.Globalization.CultureInfo.InvariantCulture });
 
                 return _cachedSerializer;
             }
@@ -215,7 +473,7 @@ namespace Duplicati.Library.Common.IO
 
         private string SerializeObject<T>(T o)
         {
-            using (var tw = new System.IO.StringWriter())
+            using (var tw = new StringWriter())
             {
                 Serializer.Serialize(tw, o);
                 tw.Flush();
@@ -225,108 +483,96 @@ namespace Duplicati.Library.Common.IO
 
         private T DeserializeObject<T>(string data)
         {
-            using (var tr = new System.IO.StringReader(data))
-            {
+            using (var tr = new StringReader(data))
                 return (T)Serializer.Deserialize(tr, typeof(T));
-            }
         }
 
-        private System.Security.AccessControl.FileSystemSecurity GetAccessControlDir(string path)
-        {
-            return System.IO.Directory.GetAccessControl(AddExtendedDevicePathPrefix(path));
-        }
 
-        private System.Security.AccessControl.FileSystemSecurity GetAccessControlFile(string path)
-        {
-            return System.IO.File.GetAccessControl(AddExtendedDevicePathPrefix(path));
-        }
+        [SupportedOSPlatform("windows")]
+        private FileSystemSecurity GetAccessControlDir(string path)
+            => new DirectoryInfo(AddExtendedDevicePathPrefix(path)).GetAccessControl();
 
+
+        [SupportedOSPlatform("windows")]
+        private FileSystemSecurity GetAccessControlFile(string path)
+            => new FileInfo(AddExtendedDevicePathPrefix(path)).GetAccessControl();
+
+
+        [SupportedOSPlatform("windows")]
         private void SetAccessControlFile(string path, FileSecurity rules)
-        {
-            System.IO.File.SetAccessControl(AddExtendedDevicePathPrefix(path), rules);
-        }
+            => new FileInfo(AddExtendedDevicePathPrefix(path)).SetAccessControl(rules);
 
+        [SupportedOSPlatform("windows")]
         private void SetAccessControlDir(string path, DirectorySecurity rules)
-        {
-            System.IO.Directory.SetAccessControl(AddExtendedDevicePathPrefix(path), rules);
-        }
+            => new DirectoryInfo(AddExtendedDevicePathPrefix(path)).SetAccessControl(rules);
 
         #region ISystemIO implementation
         public void DirectoryCreate(string path)
-        {
-            System.IO.Directory.CreateDirectory(AddExtendedDevicePathPrefix(path));
-        }
+            => Directory.CreateDirectory(AddExtendedDevicePathPrefix(path));
 
         public void DirectoryDelete(string path, bool recursive)
-        {
-            System.IO.Directory.Delete(AddExtendedDevicePathPrefix(path), recursive);
-        }
+            => Directory.Delete(AddExtendedDevicePathPrefix(path), recursive);
 
         public bool DirectoryExists(string path)
-        {
-            return System.IO.Directory.Exists(AddExtendedDevicePathPrefix(path));
-        }
+            => Directory.Exists(AddExtendedDevicePathPrefix(path));
 
         public void DirectoryMove(string sourceDirName, string destDirName)
-        {
-            System.IO.Directory.Move(AddExtendedDevicePathPrefix(sourceDirName), AddExtendedDevicePathPrefix(destDirName));
-        }
+            => Directory.Move(AddExtendedDevicePathPrefix(sourceDirName), AddExtendedDevicePathPrefix(destDirName));
 
         public void FileDelete(string path)
+            => File.Delete(AddExtendedDevicePathPrefix(path));
+
+        public void FileCreateHardLink(string existingPath, string newPath)
         {
-            System.IO.File.Delete(AddExtendedDevicePathPrefix(path));
+            if (Win32API.CreateHardLinkW(AddExtendedDevicePathPrefix(newPath), AddExtendedDevicePathPrefix(existingPath), IntPtr.Zero))
+                return;
+
+            var error = Marshal.GetLastWin32Error();
+            var message = $"Unable to create hard link from \"{newPath}\" to \"{existingPath}\": {new Win32Exception(error).Message} ({error})";
+            if (error is Win32API.ERROR_NOT_SUPPORTED or Win32API.ERROR_INVALID_FUNCTION or Win32API.ERROR_NOT_SAME_DEVICE or Win32API.ERROR_TOO_MANY_LINKS)
+                throw new HardLinkNotSupportedException(message);
+            if (error == Win32API.ERROR_FILE_NOT_FOUND)
+                throw new FileNotFoundException(message, existingPath);
+            throw new IOException(message, new Win32Exception(error));
         }
 
         public void FileSetLastWriteTimeUtc(string path, DateTime time)
-        {
-            System.IO.File.SetLastWriteTimeUtc(AddExtendedDevicePathPrefix(path), time);
-        }
+            => File.SetLastWriteTimeUtc(AddExtendedDevicePathPrefix(path), time);
 
         public void FileSetCreationTimeUtc(string path, DateTime time)
-        {
-            System.IO.File.SetCreationTimeUtc(AddExtendedDevicePathPrefix(path), time);
-        }
+            => File.SetCreationTimeUtc(AddExtendedDevicePathPrefix(path), time);
 
         public DateTime FileGetLastWriteTimeUtc(string path)
-        {
-            return System.IO.File.GetLastWriteTimeUtc(AddExtendedDevicePathPrefix(path));
-        }
+            => File.GetLastWriteTimeUtc(AddExtendedDevicePathPrefix(path));
 
         public DateTime FileGetCreationTimeUtc(string path)
-        {
-            return System.IO.File.GetCreationTimeUtc(AddExtendedDevicePathPrefix(path));
-        }
+            => File.GetCreationTimeUtc(AddExtendedDevicePathPrefix(path));
 
         public bool FileExists(string path)
-        {
-            return System.IO.File.Exists(AddExtendedDevicePathPrefix(path));
-        }
+            => File.Exists(AddExtendedDevicePathPrefix(path));
 
-        public System.IO.FileStream FileOpenRead(string path)
-        {
-            return System.IO.File.Open(AddExtendedDevicePathPrefix(path), System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite);
-        }
+        public FileStream FileOpenRead(string path)
+            => File.Open(AddExtendedDevicePathPrefix(path), FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
 
-        public System.IO.FileStream FileOpenWrite(string path)
-        {
-            return !FileExists(path)
+        public FileStream FileOpenReadWrite(string path)
+            => !FileExists(path)
                 ? FileCreate(path)
-                : System.IO.File.OpenWrite(AddExtendedDevicePathPrefix(path));
-        }
+                : File.Open(AddExtendedDevicePathPrefix(path), FileMode.Open, FileAccess.ReadWrite);
 
-        public System.IO.FileStream FileCreate(string path)
-        {
-            return System.IO.File.Create(AddExtendedDevicePathPrefix(path));
-        }
+        public FileStream FileOpenWrite(string path)
+            => !FileExists(path)
+                ? FileCreate(path)
+                : File.OpenWrite(AddExtendedDevicePathPrefix(path));
 
-        public System.IO.FileAttributes GetFileAttributes(string path)
-        {
-            return System.IO.File.GetAttributes(AddExtendedDevicePathPrefix(path));
-        }
+        public FileStream FileCreate(string path)
+            => File.Create(AddExtendedDevicePathPrefix(path));
 
-        public void SetFileAttributes(string path, System.IO.FileAttributes attributes)
+        public FileAttributes GetFileAttributes(string path)
+            => File.GetAttributes(AddExtendedDevicePathPrefix(path));
+
+        public void SetFileAttributes(string path, FileAttributes attributes)
         {
-            System.IO.File.SetAttributes(AddExtendedDevicePathPrefix(path), attributes);
+            File.SetAttributes(AddExtendedDevicePathPrefix(path), attributes);
         }
 
         /// <summary>
@@ -336,148 +582,128 @@ namespace Duplicati.Library.Common.IO
         /// <returns>The symlink target</returns>
         public string GetSymlinkTarget(string file)
         {
-            try
-            {
-                return AlphaFS.File.GetLinkTargetInfo(AddExtendedDevicePathPrefix(file)).PrintName;
-            }
-            catch (AlphaFS.NotAReparsePointException) { }
-            catch (AlphaFS.UnrecognizedReparsePointException) { }
+            var path = AddExtendedDevicePathPrefix(file);
+            return new FileInfo(path).LinkTarget ?? GetWslSymlinkTarget(path);
+        }
 
-            // This path looks like it isn't actually a symlink
-            // (Note that some reparse points aren't actually symlinks -
-            // things like the OneDrive folder in the Windows 10 Fall Creator's Update for example)
-            return null;
+        /// <summary>
+        /// Returns the target of a symlink made by WSL, which .NET does not read, or null if
+        /// the entry is not one. WSL makes such a symlink when it cannot make a Windows
+        /// symlink, for example when the target is an absolute path or does not exist.
+        /// </summary>
+        /// <param name="path">The file to examine</param>
+        /// <returns>The symlink target</returns>
+        private static string GetWslSymlinkTarget(string path)
+        {
+            using var handle = Win32API.CreateFileW(
+                path,
+                0,
+                Win32API.FILE_SHARE_READ | Win32API.FILE_SHARE_WRITE | Win32API.FILE_SHARE_DELETE,
+                IntPtr.Zero,
+                Win32API.OPEN_EXISTING,
+                Win32API.FILE_FLAG_OPEN_REPARSE_POINT | Win32API.FILE_FLAG_BACKUP_SEMANTICS,
+                IntPtr.Zero);
+            if (handle.IsInvalid)
+                return null;
+
+            var buffer = new byte[Win32API.MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+            if (!Win32API.DeviceIoControl(handle, Win32API.FSCTL_GET_REPARSE_POINT, IntPtr.Zero, 0, buffer, (uint)buffer.Length, out var returned, IntPtr.Zero))
+                return null;
+
+            // The data is the reparse tag, the length of what follows the 8-byte header,
+            // a version of 4 bytes and then the target as UTF-8
+            if (returned < 12 || BitConverter.ToUInt32(buffer, 0) != Win32API.IO_REPARSE_TAG_LX_SYMLINK)
+                return null;
+
+            var length = BitConverter.ToUInt16(buffer, 4);
+            if (length < 4 || 8 + length > returned)
+                return null;
+
+            return System.Text.Encoding.UTF8.GetString(buffer, 12, length - 4);
         }
 
         public IEnumerable<string> EnumerateFileSystemEntries(string path)
-        {
-            return System.IO.Directory.EnumerateFileSystemEntries(AddExtendedDevicePathPrefix(path)).Select(RemoveExtendedDevicePathPrefix);
-        }
+            => RemoveTrailingNullEntries(Directory.EnumerateFileSystemEntries(AddExtendedDevicePathPrefix(path))).Select(RemoveExtendedDevicePathPrefix);
 
         public IEnumerable<string> EnumerateFiles(string path)
-        {
-            return System.IO.Directory.EnumerateFiles(AddExtendedDevicePathPrefix(path)).Select(RemoveExtendedDevicePathPrefix);
-        }
+            => RemoveTrailingNullEntries(Directory.EnumerateFiles(AddExtendedDevicePathPrefix(path))).Select(RemoveExtendedDevicePathPrefix);
 
         public IEnumerable<string> EnumerateFiles(string path, string searchPattern, SearchOption searchOption)
-        {
-            return System.IO.Directory.EnumerateFiles(AddExtendedDevicePathPrefix(path), searchPattern,  searchOption).Select(RemoveExtendedDevicePathPrefix);
-        }
+            => RemoveTrailingNullEntries(Directory.EnumerateFiles(AddExtendedDevicePathPrefix(path), searchPattern, searchOption)).Select(RemoveExtendedDevicePathPrefix);
 
         public string PathGetFileName(string path)
-        {
-            return RemoveExtendedDevicePathPrefix(System.IO.Path.GetFileName(AddExtendedDevicePathPrefix(path)));
-        }
+            => RemoveExtendedDevicePathPrefix(Path.GetFileName(AddExtendedDevicePathPrefix(path)));
 
         public string PathGetDirectoryName(string path)
-        {
-            return RemoveExtendedDevicePathPrefix(System.IO.Path.GetDirectoryName(AddExtendedDevicePathPrefix(path)));
-        }
+            => RemoveExtendedDevicePathPrefix(Path.GetDirectoryName(AddExtendedDevicePathPrefix(path)));
 
         public string PathGetExtension(string path)
-        {
-            return RemoveExtendedDevicePathPrefix(System.IO.Path.GetExtension(AddExtendedDevicePathPrefix(path)));
-        }
+            => RemoveExtendedDevicePathPrefix(Path.GetExtension(AddExtendedDevicePathPrefix(path)));
 
         public string PathChangeExtension(string path, string extension)
-        {
-            return RemoveExtendedDevicePathPrefix(System.IO.Path.ChangeExtension(AddExtendedDevicePathPrefix(path), extension));
-        }
+            => RemoveExtendedDevicePathPrefix(Path.ChangeExtension(AddExtendedDevicePathPrefix(path), extension));
 
         public void DirectorySetLastWriteTimeUtc(string path, DateTime time)
         {
-            System.IO.Directory.SetLastWriteTimeUtc(AddExtendedDevicePathPrefix(path), time);
+            Directory.SetLastWriteTimeUtc(AddExtendedDevicePathPrefix(path), time);
         }
 
         public void DirectorySetCreationTimeUtc(string path, DateTime time)
         {
-            System.IO.Directory.SetCreationTimeUtc(AddExtendedDevicePathPrefix(path), time);
+            Directory.SetCreationTimeUtc(AddExtendedDevicePathPrefix(path), time);
         }
 
         public void FileMove(string source, string target)
         {
-            System.IO.File.Move(AddExtendedDevicePathPrefix(source), AddExtendedDevicePathPrefix(target));
-        }
-
-        public long FileLength(string path)
-        {
-            return new System.IO.FileInfo(AddExtendedDevicePathPrefix(path)).Length;
+            File.Move(AddExtendedDevicePathPrefix(source), AddExtendedDevicePathPrefix(target));
         }
 
         public string GetPathRoot(string path)
-        {
-            if (IsPrefixedWithExtendedDevicePathPrefix(path))
-            {
-                return Path.GetPathRoot(path);
-            }
-            else
-            {
-                return RemoveExtendedDevicePathPrefix(Path.GetPathRoot(AddExtendedDevicePathPrefix(path)));
-            }
-        }
-
+            => IsPrefixedWithExtendedDevicePathPrefix(path)
+                ? Path.GetPathRoot(path)
+                : RemoveExtendedDevicePathPrefix(Path.GetPathRoot(AddExtendedDevicePathPrefix(path)));
         public string[] GetDirectories(string path)
-        {
-            if (IsPrefixedWithExtendedDevicePathPrefix(path))
-            {
-                return Directory.GetDirectories(path);
-            }
-            else
-            {
-                return Directory.GetDirectories(AddExtendedDevicePathPrefix(path)).Select(RemoveExtendedDevicePathPrefix).ToArray();
-            }
-        }
+            => IsPrefixedWithExtendedDevicePathPrefix(path)
+                ? RemoveTrailingNullEntries(Directory.GetDirectories(path)).ToArray()
+                : RemoveTrailingNullEntries(Directory.GetDirectories(AddExtendedDevicePathPrefix(path))).Select(RemoveExtendedDevicePathPrefix).ToArray();
 
         public string[] GetFiles(string path)
-        {
-            if (IsPrefixedWithExtendedDevicePathPrefix(path))
-            {
-                return Directory.GetFiles(path);
-            }
-            else
-            {
-                return Directory.GetFiles(AddExtendedDevicePathPrefix(path)).Select(RemoveExtendedDevicePathPrefix).ToArray();
-            }
-        }
+            => IsPrefixedWithExtendedDevicePathPrefix(path)
+                ? RemoveTrailingNullEntries(Directory.GetFiles(path)).ToArray()
+                : RemoveTrailingNullEntries(Directory.GetFiles(AddExtendedDevicePathPrefix(path))).Select(RemoveExtendedDevicePathPrefix).ToArray();
 
         public string[] GetFiles(string path, string searchPattern)
-        {
-            if (IsPrefixedWithExtendedDevicePathPrefix(path))
-            {
-                return Directory.GetFiles(path, searchPattern);
-            }
-            else
-            {
-                return Directory.GetFiles(AddExtendedDevicePathPrefix(path), searchPattern).Select(RemoveExtendedDevicePathPrefix).ToArray();
-            }
-        }
+            => IsPrefixedWithExtendedDevicePathPrefix(path)
+                ? RemoveTrailingNullEntries(Directory.GetFiles(path, searchPattern)).ToArray()
+                : RemoveTrailingNullEntries(Directory.GetFiles(AddExtendedDevicePathPrefix(path), searchPattern)).Select(RemoveExtendedDevicePathPrefix).ToArray();
 
         public DateTime GetCreationTimeUtc(string path)
-        {
-            return Directory.GetCreationTimeUtc(AddExtendedDevicePathPrefix(path));
-        }
+            => Directory.GetCreationTimeUtc(AddExtendedDevicePathPrefix(path));
 
         public DateTime GetLastWriteTimeUtc(string path)
-        {
-            return Directory.GetLastWriteTimeUtc(AddExtendedDevicePathPrefix(path));
-        }
+            => Directory.GetLastWriteTimeUtc(AddExtendedDevicePathPrefix(path));
 
         public IEnumerable<string> EnumerateDirectories(string path)
+            => IsPrefixedWithExtendedDevicePathPrefix(path)
+                ? RemoveTrailingNullEntries(Directory.EnumerateDirectories(path))
+                : RemoveTrailingNullEntries(Directory.EnumerateDirectories(AddExtendedDevicePathPrefix(path))).Select(RemoveExtendedDevicePathPrefix);
+
+        public IEnumerable<IFileEntry> EnumerateFileEntries(string path)
         {
-            if (IsPrefixedWithExtendedDevicePathPrefix(path))
-            {
-                return Directory.EnumerateDirectories(path);
-            }
-            else
-            {
-                return Directory.EnumerateDirectories(AddExtendedDevicePathPrefix(path)).Select(RemoveExtendedDevicePathPrefix);
-            }
+            // For consistency with previous implementation, enumerate files first and directories after
+            var dir = IsPrefixedWithExtendedDevicePathPrefix(path)
+                ? new DirectoryInfo(path)
+                : new DirectoryInfo(AddExtendedDevicePathPrefix(path));
+
+            foreach (FileInfo file in dir.EnumerateFiles())
+                yield return FileEntry(file);
+
+            foreach (DirectoryInfo d in dir.EnumerateDirectories())
+                yield return DirectoryEntry(d);
         }
 
         public void FileCopy(string source, string target, bool overwrite)
-        {
-            File.Copy(AddExtendedDevicePathPrefix(source), AddExtendedDevicePathPrefix(target), overwrite);
-        }
+            => File.Copy(AddExtendedDevicePathPrefix(source), AddExtendedDevicePathPrefix(target), overwrite);
 
         public string PathGetFullPath(string path)
         {
@@ -486,28 +712,25 @@ namespace Duplicati.Library.Common.IO
             // 2. If path is not already prefixed with \\?\, the return value should also not be prefixed
             // 3. If path is relative or has relative components, that should be resolved by calling Path.GetFullPath()
             // 4. If path is not relative and has no relative components, prefix with \\?\ to prevent normalization from munging "problematic Windows paths"
-            if (IsPrefixedWithExtendedDevicePathPrefix(path))
-            {
-                return path;
-            }
-            else
-            {
-                return RemoveExtendedDevicePathPrefix(Path.GetFullPath(AddExtendedDevicePathPrefix(path)));
-            }
+            return IsPrefixedWithExtendedDevicePathPrefix(path)
+                ? path
+                : RemoveExtendedDevicePathPrefix(Path.GetFullPath(AddExtendedDevicePathPrefix(path)));
         }
 
         public IFileEntry DirectoryEntry(string path)
-        {
-            var dInfo = new DirectoryInfo(AddExtendedDevicePathPrefix(path));
-            return new FileEntry(dInfo.Name, 0, dInfo.LastAccessTime, dInfo.LastWriteTime)
+            => DirectoryEntry(new DirectoryInfo(AddExtendedDevicePathPrefix(path)));
+
+        public IFileEntry DirectoryEntry(DirectoryInfo dInfo)
+            => new FileEntry(dInfo.Name, 0, dInfo.LastAccessTime, dInfo.LastWriteTime)
             {
                 IsFolder = true
             };
-        }
 
         public IFileEntry FileEntry(string path)
+            => FileEntry(new FileInfo(AddExtendedDevicePathPrefix(path)));
+
+        public IFileEntry FileEntry(FileInfo fileInfo)
         {
-            var fileInfo = new FileInfo(AddExtendedDevicePathPrefix(path));
             var lastAccess = new DateTime();
             try
             {
@@ -523,6 +746,7 @@ namespace Duplicati.Library.Common.IO
             return new FileEntry(fileInfo.Name, fileInfo.Length, lastAccess, fileInfo.LastWriteTime);
         }
 
+        [SupportedOSPlatform("windows")]
         public Dictionary<string, string> GetMetadata(string path, bool isSymlink, bool followSymlink)
         {
             var isDirTarget = path.EndsWith(DIRSEP, StringComparison.Ordinal);
@@ -548,22 +772,21 @@ namespace Duplicati.Library.Common.IO
             return dict;
         }
 
+        [SupportedOSPlatform("windows")]
         public void SetMetadata(string path, Dictionary<string, string> data, bool restorePermissions)
         {
-            var isDirTarget = path.EndsWith(DIRSEP, StringComparison.Ordinal);
-            var targetpath = isDirTarget ? path.Substring(0, path.Length - 1) : path;
-
             if (restorePermissions)
             {
+                var isDirTarget = path.EndsWith(DIRSEP, StringComparison.Ordinal);
+                var targetpath = isDirTarget ? path.Substring(0, path.Length - 1) : path;
+
                 FileSystemSecurity rules = isDirTarget ? GetAccessControlDir(targetpath) : GetAccessControlFile(targetpath);
 
                 if (data.ContainsKey("win-ext:accessrulesprotected"))
                 {
                     bool isProtected = bool.Parse(data["win-ext:accessrulesprotected"]);
                     if (rules.AreAccessRulesProtected != isProtected)
-                    {
                         rules.SetAccessRuleProtection(isProtected, false);
-                    }
                 }
 
                 if (data.ContainsKey("win-ext:accessrules"))
@@ -571,7 +794,7 @@ namespace Duplicati.Library.Common.IO
                     var content = DeserializeObject<FileSystemAccess[]>(data["win-ext:accessrules"]);
                     var c = rules.GetAccessRules(true, false, typeof(System.Security.Principal.SecurityIdentifier));
                     for (var i = c.Count - 1; i >= 0; i--)
-                        rules.RemoveAccessRule((System.Security.AccessControl.FileSystemAccessRule)c[i]);
+                        rules.RemoveAccessRule((FileSystemAccessRule)c[i]);
 
                     Exception ex = null;
 
@@ -600,32 +823,388 @@ namespace Duplicati.Library.Common.IO
         }
 
         public string PathCombine(params string[] paths)
+            => Path.Combine(paths);
+
+        /// <inheritdoc />
+        public bool SupportsAlternateDataStreams => true;
+
+        /// <inheritdoc />
+        public bool IsAlternateDataStream(string path)
         {
-            return Path.Combine(paths);
+            if (string.IsNullOrWhiteSpace(path)) return false;
+
+            // Extracts the root component (e.g., "C:\", "C:", "\\server\share\", or "\\?\C:\")
+            var root = Path.GetPathRoot(path) ?? string.Empty;
+
+            // If a colon exists outside of the root structure, it's an alternate data stream
+            return path.AsSpan(root.Length).Contains(':');
+        }
+
+        /// <inheritdoc />
+        public string GetAlternateDataStreamParent(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return path;
+
+            // Extracts the root component (e.g., "C:\", "C:", "\\server\share\", or "\\?\C:\")
+            var root = Path.GetPathRoot(path) ?? string.Empty;
+            var relativePath = path.AsSpan(root.Length);
+
+            var idx = relativePath.IndexOf(':');
+            if (idx < 0)
+                return path;
+
+            return root + relativePath.Slice(0, idx).ToString();
+        }
+
+        /// <inheritdoc />
+        [SupportedOSPlatform("windows")]
+        public IEnumerable<string> EnumerateAlternateDataStreams(string path)
+        {
+            var prefixed = AddExtendedDevicePathPrefix(path);
+            var data = new Win32API.WIN32_FIND_STREAM_DATA();
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                handle = Win32API.FindFirstStreamW(prefixed, Win32API.STREAM_INFO_LEVELS.FindStreamInfoStandard, out data, 0);
+                if (handle == new IntPtr(-1))
+                    yield break;
+
+                do
+                {
+                    // Skip the main stream (::$DATA)
+                    if (data.cStreamName == "::$DATA")
+                        continue;
+
+                    // Clean the stream name by removing the :$DATA suffix
+                    var streamName = data.cStreamName;
+                    if (streamName.EndsWith(":$DATA", StringComparison.OrdinalIgnoreCase))
+                        streamName = streamName.Substring(0, streamName.Length - ":$DATA".Length);
+
+                    yield return streamName;
+                }
+                while (Win32API.FindNextStreamW(handle, out data));
+            }
+            finally
+            {
+                if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+                    Win32API.FindClose(handle);
+            }
+        }
+
+        /// <summary>
+        /// Returns the length of a file or alternate data stream.
+        /// </summary>
+        public long FileLength(string path)
+        {
+            if (!IsAlternateDataStream(path))
+                return new FileInfo(AddExtendedDevicePathPrefix(path)).Length;
+
+            using SafeFileHandle handle = Win32API.CreateFileW(
+                        AddExtendedDevicePathPrefix(path),
+                        Win32API.FILE_READ_ATTRIBUTES,
+                        Win32API.FILE_SHARE_READ | Win32API.FILE_SHARE_WRITE | Win32API.FILE_SHARE_DELETE, // Broad sharing flags avoid collisions
+                        IntPtr.Zero,
+                        Win32API.OPEN_EXISTING,
+                        0,
+                        IntPtr.Zero);
+
+            if (handle.IsInvalid)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to open handle to alternative data stream ");
+
+            // Retrieve the size directly from the stream handle
+            if (!Win32API.GetFileSizeEx(handle, out long streamSize))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to retrieve alternate data stream size.");
+
+            return streamSize;
+        }
+
+        /// <summary>
+        /// Reports whether the path is a directory junction, as opposed to a symbolic link.
+        /// Both are reparse points with a target, but of different kinds.
+        /// </summary>
+        /// <param name="path">The path to check, with or without a trailing separator</param>
+        /// <returns><c>true</c> if the path is a junction; <c>false</c> if it is not, or cannot be read.</returns>
+        public bool IsJunction(string path)
+        {
+            var handle = Win32API.FindFirstFileW(AddExtendedDevicePathPrefix(path.TrimEnd(Path.DirectorySeparatorChar)), out var data);
+            if (handle == new IntPtr(-1))
+                return false;
+            Win32API.FindClose(handle);
+
+            return (data.dwFileAttributes & (uint)FileAttributes.ReparsePoint) != 0
+                && data.dwReserved0 == Win32API.IO_REPARSE_TAG_MOUNT_POINT;
+        }
+
+        /// <summary>
+        /// Makes a directory junction. Unlike a symbolic link, a junction needs no privilege
+        /// to make. .NET has no call for it, so the reparse data is set directly.
+        /// </summary>
+        /// <param name="junction">The path of the junction to make</param>
+        /// <param name="target">The folder it points to; a relative path is taken from the folder that holds the junction</param>
+        public void CreateJunction(string junction, string target)
+        {
+            if (FileExists(junction) || DirectoryExists(junction))
+                throw new IOException(string.Format("File already exists: {0}", junction));
+
+            // The name the file system follows is in the NT form, and must be absolute
+            var fullTarget = target.StartsWith(ExtendedDevicePathPrefix, StringComparison.Ordinal)
+                ? target.Substring(ExtendedDevicePathPrefix.Length)
+                : Path.GetFullPath(target, Path.GetDirectoryName(junction.TrimEnd(Path.DirectorySeparatorChar)) ?? "");
+            var substituteName = System.Text.Encoding.Unicode.GetBytes(@"\??\" + fullTarget);
+            var printName = System.Text.Encoding.Unicode.GetBytes(fullTarget);
+
+            // REPARSE_DATA_BUFFER with a MountPointReparseBuffer: the two names follow each
+            // other in the path buffer, each ending with a null character
+            using var ms = new MemoryStream();
+            using (var w = new BinaryWriter(ms, System.Text.Encoding.Unicode, true))
+            {
+                w.Write(Win32API.IO_REPARSE_TAG_MOUNT_POINT);
+                w.Write((ushort)(8 + substituteName.Length + 2 + printName.Length + 2));
+                w.Write((ushort)0);
+                w.Write((ushort)0);
+                w.Write((ushort)substituteName.Length);
+                w.Write((ushort)(substituteName.Length + 2));
+                w.Write((ushort)printName.Length);
+                w.Write(substituteName);
+                w.Write((ushort)0);
+                w.Write(printName);
+                w.Write((ushort)0);
+            }
+            var buffer = ms.ToArray();
+
+            var path = AddExtendedDevicePathPrefix(junction.TrimEnd(Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(path);
+            try
+            {
+                using var handle = Win32API.CreateFileW(path, Win32API.GENERIC_WRITE, 0, IntPtr.Zero, Win32API.OPEN_EXISTING,
+                    Win32API.FILE_FLAG_BACKUP_SEMANTICS | Win32API.FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                if (handle.IsInvalid)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), $"Unable to open the folder for the junction: {junction}");
+
+                if (!Win32API.DeviceIoControl(handle, Win32API.FSCTL_SET_REPARSE_POINT, buffer, buffer.Length, IntPtr.Zero, 0, out _, IntPtr.Zero))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), $"Unable to create junction: {junction}");
+            }
+            catch
+            {
+                // Do not leave the empty folder behind in place of the junction
+                try { Directory.Delete(path); }
+                catch { }
+                throw;
+            }
         }
 
         public void CreateSymlink(string symlinkfile, string target, bool asDir)
         {
             if (FileExists(symlinkfile) || DirectoryExists(symlinkfile))
-                throw new System.IO.IOException(string.Format("File already exists: {0}", symlinkfile));
+                throw new IOException(string.Format("File already exists: {0}", symlinkfile));
+
 
             if (asDir)
             {
-                Alphaleonis.Win32.Filesystem.Directory.CreateSymbolicLink(AddExtendedDevicePathPrefix(symlinkfile), target, AlphaFS.PathFormat.LongFullPath);
+                Directory.CreateSymbolicLink(AddExtendedDevicePathPrefix(symlinkfile), target);
             }
             else
             {
-                Alphaleonis.Win32.Filesystem.File.CreateSymbolicLink(AddExtendedDevicePathPrefix(symlinkfile), target, AlphaFS.PathFormat.LongFullPath);
+                File.CreateSymbolicLink(AddExtendedDevicePathPrefix(symlinkfile), target);
             }
 
             //Sadly we do not get a notification if the creation fails :(
-            System.IO.FileAttributes attr = 0;
+            FileAttributes attr = 0;
             if ((!asDir && FileExists(symlinkfile)) || (asDir && DirectoryExists(symlinkfile)))
                 try { attr = GetFileAttributes(symlinkfile); }
                 catch { }
 
-            if ((attr & System.IO.FileAttributes.ReparsePoint) == 0)
-                throw new System.IO.IOException(string.Format("Unable to create symlink, check account permissions: {0}", symlinkfile));
+            if ((attr & FileAttributes.ReparsePoint) == 0)
+                throw new IOException(string.Format("Unable to create symlink, check account permissions: {0}", symlinkfile));
+        }
+
+        /// <summary>
+        /// Restricts the file so only the current user, SYSTEM and Administrators have full control, with inheritance disabled.
+        /// </summary>
+        /// <param name="path">The file to set permissions on.</param>
+        public void FileSetPermissionUserRWOnly(string path)
+        {
+            // Create directory security settings
+            var security = new FileSecurity();
+
+            // Remove inherited permissions to ensure only the current user has access
+            security.SetAccessRuleProtection(true, false);
+
+            var users = new[] {
+                CURRENT_USER_SID,
+                LOCAL_SYSTEM_SID,
+                ADMINISTRATORS_SID
+            }.ToHashSet();
+
+            // Grant the users read access
+            foreach (var user in users)
+                security.AddAccessRule(new FileSystemAccessRule(
+                    user,
+                    FileSystemRights.FullControl,
+                    AccessControlType.Allow
+                ));
+
+            // Explicitly set the owner to the current user so the applied state matches what
+            // HasPermissionUserRWOnly verifies. Without this, the owner is whatever the
+            // filesystem assigned at creation (e.g. the Administrators group or a different
+            // account), which could cause the verification to reject a file we just locked down.
+            TrySetOwner(security, CURRENT_USER_SID);
+
+            // Adjust with the new security settings
+            new FileInfo(path).SetAccessControl(security);
+        }
+
+        /// <summary>
+        /// Attempts to set the owner of the security descriptor to the current user, so that a
+        /// file or directory locked down by <see cref="FileSetPermissionUserRWOnly"/> or
+        /// <see cref="DirectorySetPermissionUserRWOnly"/> has a trusted owner that
+        /// <see cref="HasPermissionUserRWOnly"/> will accept. Setting the owner can require the
+        /// SeRestorePrivilege in some scenarios, so failures are ignored: the existing owner may
+        /// already be a trusted principal (SYSTEM or Administrators), which verification accepts.
+        /// </summary>
+        /// <param name="security">The security descriptor to update.</param>
+        /// <param name="userId">The id of the user to set as owner</param>
+        private static void TrySetOwner(FileSystemSecurity security, SecurityIdentifier userId)
+        {
+            try
+            {
+                security.SetOwner(userId);
+            }
+            catch
+            {
+                // Best-effort: the owner may already be a trusted principal, which is accepted
+                // by the verification. Setting a new owner can require additional privileges.
+            }
+        }
+
+        /// <summary>
+        /// Restricts the directory so only the current user, SYSTEM and Administrators have full control, with inheritance disabled.
+        /// </summary>
+        /// <param name="path">The directory to set permissions on.</param>
+        /// <param name="excludeCurrentUser">Do not include the current user.</param>
+        public void DirectorySetPermissionUserRWOnly(string path, bool excludeCurrentUser)
+        {
+            // Create directory security settings
+            var security = new DirectorySecurity();
+
+            // Remove inherited permissions to ensure only the current user has access
+            security.SetAccessRuleProtection(true, false);
+
+            var self = excludeCurrentUser ? ADMINISTRATORS_SID : CURRENT_USER_SID;
+
+            var users = new[] {
+                self,
+                LOCAL_SYSTEM_SID,
+                ADMINISTRATORS_SID
+            }.ToHashSet();
+
+            // Grant the users full access
+            foreach (var user in users)
+                security.AddAccessRule(new FileSystemAccessRule(
+                    user,
+                    FileSystemRights.FullControl, // Using full-control to allow changing permissions as well
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, // Apply to subfolders & files
+                    PropagationFlags.None, // Keeps inheritance settings intact
+                    AccessControlType.Allow
+                ));
+
+            // Explicitly set the owner to the current user so the applied state matches what
+            // HasPermissionUserRWOnly verifies. Without this, the owner is whatever the
+            // filesystem assigned at creation (e.g. the Administrators group or a different
+            // account), which could cause the verification to reject a folder we just locked down.
+            TrySetOwner(security, self);
+
+            // Adjust with the new security settings
+            new DirectoryInfo(path).SetAccessControl(security);
+        }
+
+
+        /// <summary>
+        /// Checks whether the directory has the read-write only permission for the current user,
+        /// matching the permissions applied by <see cref="DirectorySetPermissionUserRWOnly"/>.
+        /// </summary>
+        /// <param name="path">The directory to check permissions on.</param>
+        /// <param name="excludeCurrentUser">Do not accept the current user as part of the security check</param>
+        /// <param name="detail">A human-readable description of why the check failed, if it did; otherwise <see cref="string.Empty"/>.</param>
+        /// <returns><c>true</c> if the directory has the expected permissions; otherwise <c>false</c>.</returns>
+        public bool DirectoryHasPermissionUserRWOnly(string path, bool excludeCurrentUser, out string detail)
+            => HasPermissionUserRWOnly(new DirectoryInfo(path).GetAccessControl(), excludeCurrentUser, "folder", out detail);
+
+        /// <summary>
+        /// Verifies that a file or directory access control object grants full control to
+        /// only the current user, SYSTEM and Administrators, has inheritance disabled, and is
+        /// owned by one of those principals.
+        /// </summary>
+        /// <param name="security">The access control object for the file or directory.</param>
+        /// <param name="excludeCurrentUser">Do not accept the current user as part of the security check</param>
+        /// <param name="kind">A label such as "file" or "folder" used in detail messages.</param>
+        /// <param name="detail">A human-readable description of why the check failed, if it did; otherwise <see cref="string.Empty"/>.</param>
+        /// <returns><c>true</c> if the expected permissions are set; otherwise <c>false</c>.</returns>
+        private static bool HasPermissionUserRWOnly(FileSystemSecurity security, bool excludeCurrentUser, string kind, out string detail)
+        {
+            detail = string.Empty;
+            try
+            {
+                // The owner must be one of the trusted principals. An unexpected owner
+                // can modify the DACL regardless of the explicit access rules, which
+                // would allow them to grant themselves access later. Any of these principals
+                // is privileged and cannot be impersonated by an unprivileged attacker, so all
+                // three are accepted. DirectorySetPermissionUserRWOnly explicitly sets the owner
+                // to the current user, so a folder we lock down always satisfies this check.
+                var expected = new[] { excludeCurrentUser ? ADMINISTRATORS_SID : CURRENT_USER_SID, LOCAL_SYSTEM_SID, ADMINISTRATORS_SID }.ToHashSet();
+                var ownerRef = security.GetOwner(typeof(SecurityIdentifier));
+                var owner = ownerRef as SecurityIdentifier;
+                if (owner == null || !expected.Contains(owner))
+                {
+                    detail = $"the {kind} owner is {(ownerRef == null ? "(unknown)" : ownerRef.Value)} but expected one of SYSTEM, Administrators or the current user";
+                    return false;
+                }
+
+                // Inheritance must be disabled (protected from parent), matching SetAccessRuleProtection(true, false)
+                if (!security.AreAccessRulesProtected)
+                {
+                    detail = $"the {kind} inherits permissions from its parent";
+                    return false;
+                }
+
+                var rules = security.GetAccessRules(true, true, typeof(SecurityIdentifier));
+                var found = new HashSet<SecurityIdentifier>();
+
+                foreach (var rule in rules.Cast<FileSystemAccessRule>())
+                {
+                    // Any deny rule means the entry is not in the expected secure state
+                    if (rule.AccessControlType == AccessControlType.Deny)
+                    {
+                        detail = $"a deny access rule is present for {rule.IdentityReference}";
+                        return false;
+                    }
+
+                    // Only allow rules for the expected SIDs are permitted
+                    if (!expected.Contains(rule.IdentityReference))
+                    {
+                        detail = $"an unexpected access rule grants rights to {rule.IdentityReference}";
+                        return false;
+                    }
+
+                    found.Add((SecurityIdentifier)rule.IdentityReference);
+                }
+
+                // All expected SIDs must be present
+                if (found.Count != expected.Count)
+                {
+                    var missing = expected.Except(found).Select(x => x.ToString());
+                    detail = $"missing access rules for: {string.Join(", ", missing)}";
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                detail = $"failed to read permissions: {ex.Message}";
+                return false;
+            }
+
+            return true;
         }
         #endregion
     }

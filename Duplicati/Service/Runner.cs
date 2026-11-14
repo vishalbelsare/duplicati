@@ -1,22 +1,28 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
 
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 using System;
+using System.Collections.Concurrent;
 using System.Linq;
+using Duplicati.Library.AutoUpdater;
 
 namespace Duplicati.Service
 {
@@ -27,37 +33,101 @@ namespace Duplicati.Service
         private volatile bool m_softstop = false;
         private System.Diagnostics.Process m_process;
         private readonly Action m_onStartedAction;
-        private readonly Action m_onStoppedAction;
+        private readonly Action<int?> m_onStoppedAction;
         private readonly Action<string, bool> m_reportMessage;
+        private readonly Action<System.Diagnostics.ProcessStartInfo> m_onBeforeFirstStart;
 
         private readonly object m_writelock = new object();
+        private BlockingCollection<string> m_stdoutLines;
         private readonly string[] m_cmdargs;
+        private readonly PackageHelper.NamedExecutable m_executable;
 
 
         private readonly int WAIT_POLL_TIME = (int)TimeSpan.FromMinutes(15).TotalMilliseconds;
 
-        public Runner(string[] cmdargs, Action onStartedAction = null, Action onStoppedAction = null, Action<string, bool> logMessage = null)
+        private readonly bool m_inProcess;
+
+        public Runner(
+            PackageHelper.NamedExecutable executable,
+            string[] cmdargs,
+            bool inProcess,
+            Action onStartedAction = null,
+            Action<int?> onStoppedAction = null,
+            Action<string, bool> logMessage = null,
+            Action<System.Diagnostics.ProcessStartInfo> onBeforeFirstStart = null
+        )
         {
+            m_inProcess = inProcess;
             m_onStartedAction = onStartedAction;
             m_onStoppedAction = onStoppedAction;
             m_reportMessage = logMessage;
+            m_onBeforeFirstStart = onBeforeFirstStart;
+            m_executable = executable;
             if (m_reportMessage == null)
-                m_reportMessage = (x,y) => Console.WriteLine(x);
+                m_reportMessage = (x, y) => Console.WriteLine(x);
 
             m_cmdargs = cmdargs;
-            m_thread = new System.Threading.Thread(Run);
+            m_thread = new System.Threading.Thread(m_inProcess ? RunInProcess : RunSpawned);
             m_thread.IsBackground = true;
             m_thread.Name = "Server Runner";
             m_thread.Start();
         }
 
-        private void Run()
+        private void RunInProcess()
+        {
+            // The exit code passed to the stopped callback when the run ended on its own with an
+            // error, that is, without being asked to stop; null otherwise. A run that ends on its
+            // own with code 0 (for example to let an update replace the files) is not a failure
+            int? failedExitCode = null;
+            try
+            {
+                m_reportMessage(string.Format("Starting in-process {0} with cmd args {1}", m_executable, string.Join(Environment.NewLine, m_cmdargs ?? new string[0])), false);
+
+                m_onBeforeFirstStart?.Invoke(null);
+                m_onStartedAction?.Invoke();
+
+                var exitCode = 0;
+                if (!m_terminate && !m_softstop)
+                {
+                    if (m_executable == PackageHelper.NamedExecutable.Server)
+                        exitCode = Server.Program.Main(m_cmdargs ?? []);
+                    else if (m_executable == PackageHelper.NamedExecutable.Agent)
+                        exitCode = Agent.Program.MainAsync(m_cmdargs ?? []).ConfigureAwait(false).GetAwaiter().GetResult();
+                    else
+                        throw new NotImplementedException($"In-process execution of {m_executable} is not implemented");
+                }
+
+                if (!m_terminate && !m_softstop)
+                {
+                    if (exitCode != 0)
+                        failedExitCode = exitCode;
+                    m_reportMessage($"In-process execution ended unexpectedly with exit code {exitCode}", true);
+                }
+            }
+            catch (Exception ex)
+            {
+                m_reportMessage(string.Format("In-process execution has failed with error message: {0}", ex), true);
+
+                // An exception thrown before the server or agent could turn it into an exit code
+                // is a failure too, unless the run was asked to stop
+                if (!m_terminate && !m_softstop)
+                    failedExitCode = Server.Program.EXITCODE_CRASHED;
+                throw;
+            }
+            finally
+            {
+                m_onStoppedAction?.Invoke(failedExitCode);
+            }
+        }
+
+        private void RunSpawned()
         {
             var path = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
-            var exec = System.IO.Path.Combine(path, "Duplicati.Server.exe");
-            var cmdargs = "--ping-pong-keepalive=true";
-            if (m_cmdargs != null && m_cmdargs.Length > 0)
-                cmdargs = Duplicati.Library.Utility.Utility.WrapAsCommandLine(new string[] { cmdargs }.Concat(m_cmdargs));
+            var exec = System.IO.Path.Combine(path, PackageHelper.GetExecutableName(m_executable));
+            // Preserve order, but ensure the ping-pong-keepalive is set
+            var cmdargs = (m_cmdargs ?? [])
+                .Concat(["--ping-pong-keepalive=true"])
+                .ToArray();
 
             var firstRun = true;
             var startAttempts = 0;
@@ -77,7 +147,7 @@ namespace Duplicati.Service
                         if (!firstRun)
                             m_reportMessage(string.Format("Attempting to restart server process: {0}", exec), true);
 
-                        m_reportMessage(string.Format("Starting process {0} with cmd args {1}", exec, cmdargs), false);
+                        m_reportMessage(string.Format("Starting process {0} with cmd args {1}", exec, string.Join(Environment.NewLine, cmdargs)), false);
 
                         var pr = new System.Diagnostics.ProcessStartInfo(exec, cmdargs)
                         {
@@ -87,9 +157,21 @@ namespace Duplicati.Service
                             RedirectStandardError = false,
                             WorkingDirectory = path
                         };
+                        // The child reports the executable the user started, not itself
+                        pr.Environment[PackageHelper.ENTRY_ASSEMBLY_ENV_NAME] = PackageHelper.EntryAssemblyName;
+
+                        if (firstRun && m_onBeforeFirstStart != null)
+                            m_onBeforeFirstStart(pr);
+
+                        // Declare ourselves as the host, so the update helper can stop the respawn loop
+                        pr.Environment[HostEnvironment.HostKindEnvName] = HostEnvironment.HostKindServiceWrapper;
+                        pr.Environment[HostEnvironment.HostPidEnvName] = Environment.ProcessId.ToString();
 
                         if (!m_terminate)
+                        {
                             m_process = System.Diagnostics.Process.Start(pr);
+                            StartStdoutReader(m_process);
+                        }
 
                         if (firstRun && m_onStartedAction != null)
                         {
@@ -109,6 +191,11 @@ namespace Duplicati.Service
                                     PingProcess();
                             }
                         }
+
+                        if (m_process.ExitCode != 0)
+                            m_reportMessage(string.Format("Process has exited with code {0}", m_process.ExitCode), true);
+                        else if (!m_terminate)
+                            m_reportMessage("Process has exited without an error code", true);
                     }
                     catch (Exception ex)
                     {
@@ -123,36 +210,80 @@ namespace Duplicati.Service
                                 m_terminate = true;
                             }
                         }
-
-                        // Throttle restarts
-                        if (!m_terminate)
-                            System.Threading.Thread.Sleep(TimeSpan.FromSeconds(10));
                     }
+
+                    // Throttle restarts
+                    if (!m_terminate)
+                        System.Threading.Thread.Sleep(TimeSpan.FromSeconds(10));
                 }
             }
             finally
             {
                 if (m_onStoppedAction != null)
-                    m_onStoppedAction();
+                    m_onStoppedAction(null);
             }
+        }
+
+        /// <summary>
+        /// Reads the server stdout on a thread, so the update-pending line is seen outside of a ping
+        /// </summary>
+        private void StartStdoutReader(System.Diagnostics.Process process)
+        {
+            var lines = m_stdoutLines = new BlockingCollection<string>();
+            var reader = process.StandardOutput;
+            var t = new System.Threading.Thread(() =>
+            {
+                try
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        if (string.Equals(line.Trim(), HostEnvironment.ServiceWrapperUpdatePendingLine, StringComparison.OrdinalIgnoreCase))
+                        {
+                            m_reportMessage("The server is being updated, it will not be restarted by this process", true);
+                            m_softstop = true;
+                        }
+                        else
+                        {
+                            lines.Add(line);
+                        }
+                    }
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    lines.CompleteAdding();
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "Server stdout reader"
+            };
+            t.Start();
         }
 
         private void PingProcess()
         {
-            for(var n = 0; n < 5; n++)
+            var lines = m_stdoutLines;
+            for (var n = 0; n < 5; n++)
             {
-                lock(m_writelock)
+                lock (m_writelock)
                 {
                     m_process.StandardInput.WriteLine("ping");
                     m_process.StandardInput.Flush();
                 }
 
-                using (var t = m_process.StandardOutput.ReadLineAsync())
+                try
                 {
-                    t.Wait(TimeSpan.FromMinutes(1));
-
-                    if (t.IsCompleted && !t.IsFaulted && !t.IsCanceled)
+                    if (lines.TryTake(out _, TimeSpan.FromMinutes(1)))
                         return;
+                }
+                catch (InvalidOperationException)
+                {
+                    // Reader completed, the process is gone
+                    break;
                 }
             }
 
@@ -166,18 +297,15 @@ namespace Duplicati.Service
             m_thread.Join();
         }
 
-        public void Stop(bool force = true)
+        public void Stop()
         {
-            if (force)
+            m_softstop = true;
+            if (m_inProcess)
             {
-                m_terminate = true;
-                var p = m_process;
-                if (p != null)
-                    p.Kill();
+
             }
             else
             {
-                m_softstop = true;
                 lock (m_writelock)
                 {
                     if (m_process != null)

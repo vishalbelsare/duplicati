@@ -1,0 +1,527 @@
+// Copyright (c) 2026 Duplicati Inc. All rights reserved.
+
+using Duplicati.Library.Interface;
+using Duplicati.Library.Logging;
+using Duplicati.Library.SourceProvider.ChangeTracking;
+using Duplicati.Proprietary.GoogleWorkspace.SourceItems;
+using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
+using User = Google.Apis.Admin.Directory.directory_v1.Data.User;
+
+namespace Duplicati.Proprietary.GoogleWorkspace;
+
+public sealed partial class SourceProvider : ISourceProviderModule, IChangeTrackingSourceProvider, IDisposable
+{
+    /// <summary>
+    /// The log tag for this class.
+    /// </summary>
+    private static readonly string LOGTAG = Log.LogTagFromType<SourceProvider>();
+
+    private readonly APIHelper _apiHelper;
+    private readonly string _mountPoint;
+    private readonly OptionsHelper.GoogleWorkspaceOptions _options;
+    private readonly ConcurrentDictionary<string, ISourceProviderEntry> _entryCache = new();
+
+    /// <summary>
+    /// What the provider learned during this enumeration about which paths it examined,
+    /// and the tokens it carries between backups.
+    /// </summary>
+    private readonly ChangeTracker _changeTracker = new();
+
+    /// <summary>
+    /// The scope each user's change tracking state is stored under, by primary email. Set when
+    /// the user folder is enumerated, which happens before any entry below it builds a key.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, string> _changeTrackingUserScopes = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The scope the change tracking state of each shared drive listed at the tenant level is
+    /// stored under, by drive id. Set when the drive folder is enumerated, which happens before
+    /// the drive tree builds its key.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, string> _changeTrackingSharedDriveScopes = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// What the provider learned during this enumeration about which paths it examined,
+    /// and the tokens it carries between backups.
+    /// </summary>
+    internal ChangeTracker ChangeTracker => _changeTracker;
+
+    /// <summary>
+    /// Records the scope the change tracking state of a user is stored under
+    /// </summary>
+    /// <param name="userId">The primary email of the user</param>
+    /// <param name="scope">The scope</param>
+    internal void SetChangeTrackingUserScope(string userId, string scope)
+        => _changeTrackingUserScopes[userId] = scope;
+
+    /// <summary>
+    /// Records the scope the change tracking state of a shared drive listed at the tenant level
+    /// is stored under
+    /// </summary>
+    /// <param name="driveId">The drive id</param>
+    /// <param name="scope">The scope, or <c>null</c> for the default</param>
+    internal void SetChangeTrackingSharedDriveScope(string driveId, string? scope)
+    {
+        if (scope == null)
+            _changeTrackingSharedDriveScopes.TryRemove(driveId, out _);
+        else
+            _changeTrackingSharedDriveScopes[driveId] = scope;
+    }
+
+    /// <summary>
+    /// The scope the change tracking state of a shared drive listed at the tenant level is
+    /// stored under. It is <c>null</c>, the scope used before organizational units, unless the
+    /// drives are placed by organizational unit: the organizational unit is then part of the
+    /// scope, so a drive moved to another organizational unit, and thereby to another path, is
+    /// listed in full instead of continuing from the state of the old path.
+    /// </summary>
+    /// <param name="driveId">The drive id</param>
+    /// <returns>The scope</returns>
+    internal string? ChangeTrackingSharedDriveScope(string driveId)
+    {
+        if (_changeTrackingSharedDriveScopes.TryGetValue(driveId, out var scope))
+            return scope;
+        if (_options.UseOuPaths)
+            throw new InvalidOperationException($"The change tracking scope of shared drive {driveId} is not known, as the drive folder was not enumerated");
+        return null;
+    }
+
+    /// <summary>
+    /// The scope the change tracking state of a user is stored under. It is the primary email,
+    /// unless the user folders are placed by organizational unit: the organizational unit is
+    /// then part of the scope, so a user moved to another organizational unit, and thereby to
+    /// another path, is listed in full instead of continuing from the state of the old path.
+    /// </summary>
+    /// <param name="userId">The primary email of the user</param>
+    /// <returns>The scope</returns>
+    internal string ChangeTrackingUserScope(string userId)
+    {
+        if (_changeTrackingUserScopes.TryGetValue(userId, out var scope))
+            return scope;
+        if (_options.UseOuPaths)
+            throw new InvalidOperationException($"The change tracking scope of user {userId} is not known, as the user folder was not enumerated");
+        return userId;
+    }
+
+    /// <summary>
+    /// Builds the API helper of the provider instances created while it is set, in place of
+    /// the one built from the options, so a caller that creates providers through the loader
+    /// can supply its own clients. It follows the asynchronous flow that set it, so flows
+    /// running side by side do not see each other's factory.
+    /// </summary>
+    private static readonly AsyncLocal<Func<OptionsHelper.GoogleWorkspaceOptions, bool, APIHelper>?> _apiHelperFactory = new();
+
+    /// <summary>
+    /// Makes the provider instances created in the current asynchronous flow build their API
+    /// helper with a factory until the returned scope is disposed
+    /// </summary>
+    /// <param name="factory">Builds the API helper from the parsed options and whether the provider is used for a restore</param>
+    /// <returns>A scope that restores the previous factory when disposed</returns>
+    internal static IDisposable UseApiHelperFactory(Func<OptionsHelper.GoogleWorkspaceOptions, bool, APIHelper> factory)
+    {
+        var previous = _apiHelperFactory.Value;
+        _apiHelperFactory.Value = factory;
+        return new ApiHelperFactoryScope(previous);
+    }
+
+    /// <summary>
+    /// Restores the previous API helper factory when disposed
+    /// </summary>
+    /// <param name="previous">The factory to restore</param>
+    private sealed class ApiHelperFactoryScope(Func<OptionsHelper.GoogleWorkspaceOptions, bool, APIHelper>? previous) : IDisposable
+    {
+        /// <inheritdoc />
+        public void Dispose() => _apiHelperFactory.Value = previous;
+    }
+
+    /// <summary>
+    /// Counter for tracking which licensed paths are being enumerated.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, bool> _enumerationCounter = new();
+
+    /// <summary>
+    /// The current number of users that has been enumerated.
+    /// </summary>
+    private int _userCount = 0;
+    /// <summary>
+    /// The current number of groups that has been enumerated.
+    /// </summary>
+    private int _groupCount = 0;
+    /// <summary>
+    /// The current number of shared drives that has been enumerated.
+    /// </summary>
+    private int _sharedDriveCount = 0;
+    /// <summary>
+    /// The current number of sites that has been enumerated.
+    /// </summary>
+    private int _siteCount = 0;
+
+    /// <summary>
+    /// Whether a license warning has been issued for users.
+    /// </summary>
+    private int _userLicenseWarningIssued = 0;
+    /// <summary>
+    /// Whether a license warning has been issued for groups.
+    /// </summary>
+    private int _groupLicenseWarningIssued = 0;
+    /// <summary>
+    /// Whether a license warning has been issued for shared drives.
+    /// </summary>
+    private int _sharedDriveLicenseWarningIssued = 0;
+    /// <summary>
+    /// Whether a license warning has been issued for sites.
+    /// </summary>
+    private int _siteLicenseWarningIssued = 0;
+
+    /// <summary>
+    /// Whether this provider is being used for a restore operation.
+    /// </summary>
+    internal bool UsedForRestoreOperation { get; private init; }
+
+    /// <summary>
+    /// Whether to avoid reading calendar ACLs.
+    /// </summary>
+    internal bool AvoidCalendarAcl { get; private init; }
+
+    /// <summary>
+    /// Indicates whether the metadata storage option has been set.
+    /// </summary>
+    private readonly bool _hasSetMetadataStorageOption;
+
+    public APIHelper ApiHelper => _apiHelper;
+    public OptionsHelper.GoogleWorkspaceOptions Options => _options;
+
+    /// <summary>
+    /// The client for downloads that must not carry the Google credentials, such as a
+    /// calendar attachment that is only a link to some site. It is created for this run,
+    /// so it is built with the certificate and proxy settings of the run, and shared by
+    /// every such download in it, so each does not open a connection pool of its own
+    /// </summary>
+    private readonly Lazy<HttpClient> _linkDownloadClient = new(Library.Utility.HttpClientHelper.CreateClient);
+
+    /// <summary>
+    /// The client for downloads that must not carry the Google credentials
+    /// </summary>
+    public HttpClient LinkDownloadClient => _linkDownloadClient.Value;
+
+    public SourceProvider()
+    {
+        _apiHelper = null!;
+        _mountPoint = null!;
+        _options = null!;
+    }
+
+    public SourceProvider(string url, string mountPoint, Dictionary<string, string?> options)
+        : this(url, mountPoint, options, false)
+    {
+    }
+
+    public SourceProvider(string url, string mountPoint, Dictionary<string, string?> options, bool usedForRestoreOperation)
+    {
+        _hasSetMetadataStorageOption = Library.Utility.Utility.ParseBoolOption(options, "store-metadata-content-in-database");
+
+        _mountPoint = mountPoint;
+        _options = OptionsHelper.ParseOptions(options);
+
+        _apiHelper = _apiHelperFactory.Value?.Invoke(_options, usedForRestoreOperation) ?? new APIHelper(_options, usedForRestoreOperation);
+        UsedForRestoreOperation = usedForRestoreOperation;
+        AvoidCalendarAcl = Library.Utility.Utility.ParseBoolOption(options, OptionsHelper.GOOGLE_AVOID_CALENDAR_ACL_OPTION);
+    }
+
+    public string Key => OptionsHelper.ModuleKey;
+
+    public string DisplayName => Strings.Common.DisplayName;
+
+    public string Description => Strings.Common.Description;
+
+    public IList<ICommandLineArgument> SupportedCommands => OptionsHelper.SourceProviderSupportedCommands;
+
+    public string MountedPath => _mountPoint;
+
+    /// <inheritdoc />
+    public bool NeedsStoredMetadata => true;
+    /// <inheritdoc />
+    public bool NeedsCaseSensitiveFilters => true;
+
+    /// <inheritdoc />
+    public string ChangeTrackingScope => _mountPoint;
+
+    /// <inheritdoc />
+    public void LoadChangeTrackingState(IReadOnlyDictionary<string, string> state)
+        => _changeTracker.Load(state);
+
+    /// <inheritdoc />
+    public IReadOnlyDictionary<string, string> ExportChangeTrackingState()
+        => _changeTracker.Export();
+
+    /// <inheritdoc />
+    public bool WasPathEnumerated(string path)
+        => _changeTracker.WasPathEnumerated(path);
+
+    /// <inheritdoc />
+    public bool IsIncrementallyEnumeratedFolder(string folderPath)
+        => _changeTracker.IsIncrementallyEnumeratedFolder(folderPath);
+
+    /// <inheritdoc />
+    public void SetFolderWalkObserver(Action<string, FolderWalkMode> observer)
+        => _changeTracker.SetFolderWalkObserver(observer);
+
+    /// <summary>
+    /// Whether mailboxes are walked from the Gmail history in this enumeration: the option is
+    /// on and the provider was handed state by a backup
+    /// </summary>
+    internal bool GmailDeltaActive => _options.GmailDelta && _changeTracker.IsActive;
+
+    /// <summary>
+    /// Whether drives are walked from the changes feed in this enumeration
+    /// </summary>
+    internal bool DriveDeltaActive => _options.DriveDelta && _changeTracker.IsActive;
+
+    /// <summary>
+    /// Whether calendars are walked with sync tokens in this enumeration
+    /// </summary>
+    internal bool CalendarDeltaActive => _options.CalendarDelta && _changeTracker.IsActive;
+
+    /// <summary>
+    /// Whether contacts are walked with sync tokens in this enumeration
+    /// </summary>
+    internal bool ContactsDeltaActive => _options.ContactsDelta && _changeTracker.IsActive;
+
+    public void Dispose()
+    {
+        if (_linkDownloadClient.IsValueCreated)
+            _linkDownloadClient.Value.Dispose();
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// The root folder itself is emitted, not what is in it, as the other providers do. The backup recurses into
+    /// it, so the same items are backed up, and a caller that browses the source, such as the managed runner, is
+    /// handed the folder to start from.
+    /// </remarks>
+    public async IAsyncEnumerable<ISourceProviderEntry> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await Task.CompletedTask.ConfigureAwait(false);
+        yield return new RootSourceEntry(this);
+    }
+
+    public async Task<ISourceProviderEntry?> GetEntryAsync(string path, bool isFolder, CancellationToken cancellationToken)
+    {
+        if (_entryCache.TryGetValue(path, out var cachedEntry))
+            return cachedEntry;
+
+        ISourceProviderEntry resultEntry = new RootSourceEntry(this);
+        var targetPath = path.TrimEnd(Path.DirectorySeparatorChar);
+
+        var currentPath = targetPath;
+        while (!string.IsNullOrEmpty(currentPath))
+        {
+            var parentPath = Path.GetDirectoryName(currentPath);
+            if (parentPath != null && _entryCache.TryGetValue(parentPath, out var cachedParent))
+            {
+                resultEntry = cachedParent;
+                break;
+            }
+            currentPath = parentPath;
+        }
+
+        var relativePath = string.IsNullOrEmpty(currentPath)
+            ? targetPath
+            : Path.GetRelativePath(currentPath, targetPath);
+
+        var pathsegments = relativePath?.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries)
+            ?? Array.Empty<string>();
+
+        var segmentIndex = 0;
+        foreach (var item in pathsegments)
+        {
+            var found = false;
+            var isLastSegment = segmentIndex == pathsegments.Length - 1;
+            await foreach (var entry in resultEntry.Enumerate(cancellationToken))
+            {
+                _entryCache.TryAdd(entry.Path, entry);
+
+                var name = entry.Path.TrimEnd(Path.DirectorySeparatorChar)
+                    .Split(Path.DirectorySeparatorChar)
+                    .Last();
+                if (name.Equals(item, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (isLastSegment && entry.IsFolder != isFolder)
+                        throw new UserInformationException($"Path segment '{item}' is not a {(isFolder ? "folder" : "file")}", "PathSegmentNotFolder");
+                    else if (!isLastSegment && !entry.IsFolder)
+                        throw new UserInformationException($"Path segment '{item}' is not a folder", "PathSegmentNotFolder");
+
+                    resultEntry = entry;
+                    found = true;
+                    break;
+                }
+            }
+
+            segmentIndex++;
+            if (!found)
+                return null;
+        }
+
+        return resultEntry;
+    }
+
+    public Task InitializeAsync(CancellationToken cancellationToken)
+    {
+        if (!_hasSetMetadataStorageOption)
+            throw new UserInformationException(Strings.MetadataStorageNotEnabled("store-metadata-content-in-database"), "DatabaseMetadataStorageNotEnabled");
+
+        return Task.CompletedTask;
+    }
+
+    public Task TestAsync(CancellationToken cancellationToken)
+    {
+        _apiHelper.TestConnection();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Determines whether the given user consumes a Duplicati user seat. The intent is that a
+    /// seat is consumed where Google charges the tenant for the account, mirroring the rule the
+    /// Microsoft 365 provider applies to assigned licenses.
+    /// </summary>
+    /// <param name="user">The user to test, as returned by the Directory API.</param>
+    /// <returns><c>true</c> if the user should count as a seat; otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// The Directory API does not expose license assignments, so the decision is made from the
+    /// account state alone: suspended accounts and archived accounts do not consume a seat, every
+    /// other account does. Both flags are core properties of the <c>users.list</c> response, so no
+    /// request is made per user and the cost is a single listing of the tenant. When a flag is
+    /// missing from the object, the account is counted rather than given away.
+    /// </remarks>
+    internal static bool UserCountsAsSeat(User user)
+        => ClassifyUser(user) == UserCategory.Active;
+
+    /// <summary>
+    /// The classification of a user account, used for item metadata and for reporting item
+    /// counts. Only <see cref="Active"/> accounts consume a seat; see <see cref="UserCountsAsSeat"/>.
+    /// </summary>
+    internal enum UserCategory
+    {
+        /// <summary>A regular, usable account, which consumes a seat.</summary>
+        Active,
+        /// <summary>An account that has been suspended by an administrator or by Google.</summary>
+        Suspended,
+        /// <summary>An account that has been archived.</summary>
+        Archived
+    }
+
+    /// <summary>
+    /// Classifies a user account from the Directory object alone. An account that is both
+    /// suspended and archived is reported as archived, so that each account lands in exactly
+    /// one bucket.
+    /// </summary>
+    /// <param name="user">The user to classify.</param>
+    /// <returns>The user category.</returns>
+    internal static UserCategory ClassifyUser(User user)
+    {
+        if (user.Archived == true)
+            return UserCategory.Archived;
+        if (user.Suspended == true)
+            return UserCategory.Suspended;
+        return UserCategory.Active;
+    }
+
+    /// <summary>
+    /// Determines whether the license is approved for the given entry.
+    /// </summary>
+    /// <param name="path">The path to verify.</param>
+    /// <param name="type">The type of entry.</param>
+    /// <param name="id">The ID of the entry.</param>
+    /// <param name="increment">Whether to increment the count if the license is approved.</param>
+    /// <param name="countsAsSeat">
+    /// Whether this entry consumes a licensed seat. When <c>false</c>, the entry is always
+    /// approved and never counted against the seat limit (used for suspended and archived users).
+    /// </param>
+    /// <returns><c>true</c> if the license is approved; otherwise, <c>false</c>.</returns>
+    internal bool LicenseApprovedForEntry(string path, GoogleRootType type, string id, bool increment, bool countsAsSeat)
+    {
+        // We do not limit restores
+        if (UsedForRestoreOperation)
+            return true;
+
+        // Entries that do not consume a seat (e.g. suspended or archived users) are always
+        // approved and never counted against the seat limit.
+        if (!countsAsSeat)
+            return true;
+
+        // Make a unique target path for the type and id, just for counting purposes, not matching actual paths
+        var targetpath = $"{path.TrimEnd(Path.DirectorySeparatorChar)}{Path.DirectorySeparatorChar}{type}{Path.DirectorySeparatorChar}{id}";
+
+        if (_enumerationCounter.ContainsKey(targetpath))
+            return true;
+
+        // The seat warning is written on whichever call first sees the limit. The listing-time
+        // check does not increment and, once it returns false, the entry is never enumerated,
+        // so waiting for the incrementing call would mean never warning at all.
+        if (type == GoogleRootType.Users)
+        {
+            var approved = LicenseChecker.LicenseHelper.AvailableGoogleWorkspaceUserSeats;
+            var current = _userCount;
+            if (current >= approved)
+            {
+                if (Interlocked.Exchange(ref _userLicenseWarningIssued, 1) == 0)
+                    Log.WriteWarningMessage(LOGTAG, "LicenseWarning", null, Strings.LicenseWarning(type, approved));
+                return false;
+            }
+        }
+        else if (type == GoogleRootType.Groups)
+        {
+            var approved = LicenseChecker.LicenseHelper.AvailableGoogleWorkspaceGroupSeats;
+            var current = _groupCount;
+            if (current >= approved)
+            {
+                if (Interlocked.Exchange(ref _groupLicenseWarningIssued, 1) == 0)
+                    Log.WriteWarningMessage(LOGTAG, "LicenseWarning", null, Strings.LicenseWarning(type, approved));
+                return false;
+            }
+        }
+        else if (type == GoogleRootType.SharedDrives)
+        {
+            var approved = LicenseChecker.LicenseHelper.AvailableGoogleWorkspaceSharedDriveSeats;
+            var current = _sharedDriveCount;
+            if (current >= approved)
+            {
+                if (Interlocked.Exchange(ref _sharedDriveLicenseWarningIssued, 1) == 0)
+                    Log.WriteWarningMessage(LOGTAG, "LicenseWarning", null, Strings.LicenseWarning(type, approved));
+                return false;
+            }
+        }
+        else if (type == GoogleRootType.Sites)
+        {
+            var approved = LicenseChecker.LicenseHelper.AvailableGoogleWorkspaceSiteSeats;
+            var current = _siteCount;
+            if (current >= approved)
+            {
+                if (Interlocked.Exchange(ref _siteLicenseWarningIssued, 1) == 0)
+                    Log.WriteWarningMessage(LOGTAG, "LicenseWarning", null, Strings.LicenseWarning(type, approved));
+                return false;
+            }
+        }
+        else
+        {
+            // Unknown type, allow it
+            return true;
+        }
+
+        if (increment && _enumerationCounter.TryAdd(targetpath, true))
+        {
+            // The consumed seats are recorded for a host that collects the usage of the backup it runs in-process
+            if (type == GoogleRootType.Users)
+                LicenseChecker.LicenseUsageTracker.Current?.Record(LicenseChecker.DuplicatiLicenseFeatures.GoogleWorkspaceUsers, Interlocked.Increment(ref _userCount));
+            else if (type == GoogleRootType.Groups)
+                LicenseChecker.LicenseUsageTracker.Current?.Record(LicenseChecker.DuplicatiLicenseFeatures.GoogleWorkspaceGroups, Interlocked.Increment(ref _groupCount));
+            else if (type == GoogleRootType.SharedDrives)
+                LicenseChecker.LicenseUsageTracker.Current?.Record(LicenseChecker.DuplicatiLicenseFeatures.GoogleWorkspaceSharedDrives, Interlocked.Increment(ref _sharedDriveCount));
+            else if (type == GoogleRootType.Sites)
+                LicenseChecker.LicenseUsageTracker.Current?.Record(LicenseChecker.DuplicatiLicenseFeatures.GoogleWorkspaceSites, Interlocked.Increment(ref _siteCount));
+        }
+
+        return true;
+    }
+}

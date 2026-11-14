@@ -1,22 +1,28 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using System.Threading.Tasks;
 using CoCoL;
+using Duplicati.Library.Utility;
 
 namespace Duplicati.Library.UsageReporter
 {
@@ -29,7 +35,7 @@ namespace Duplicati.Library.UsageReporter
         /// The tag used for logging
         /// </summary>
         private static readonly string LOGTAG = Logging.Log.LogTagFromType(typeof(Reporter));
-        
+
         /// <summary>
         /// The primary input channel for new report messages
         /// </summary>
@@ -49,7 +55,7 @@ namespace Duplicati.Library.UsageReporter
         public static void Report(string key, string data = null, ReportType type = ReportType.Information)
         {
             if (_eventChannel != null && type >= MaxReportLevel)
-                try { _eventChannel.WriteNoWait(new ReportItem(type, null, key, data)); }
+                try { _eventChannel.WriteNoWait(new ReportItem(type, null, key, SensitiveDataFilter.RedactPaths(data))); }
                 catch { }
         }
 
@@ -74,8 +80,41 @@ namespace Duplicati.Library.UsageReporter
         public static void Report(Exception ex, ReportType type = ReportType.Warning)
         {
             if (_eventChannel != null && type >= MaxReportLevel)
-                try { _eventChannel.WriteNoWait(new ReportItem(type, null, "EXCEPTION", ex.ToString())); }
+                try { _eventChannel.WriteNoWait(new ReportItem(type, null, "EXCEPTION", DescribeException(ex))); }
                 catch { }
+        }
+
+        /// <summary>
+        /// Describes an exception for the usage report: the exception type chain and stack frames only.
+        /// Messages are left out on purpose, since they can carry paths, names and other data from the
+        /// user's machine that the path filter cannot reliably remove.
+        /// The frames are built from the method metadata rather than read from the exception's own
+        /// stack trace text, which an exception can override, and without file information, so they
+        /// carry type and method names only and no file paths.
+        /// </summary>
+        /// <param name="ex">The exception</param>
+        /// <returns>The description</returns>
+        public static string DescribeException(Exception ex)
+        {
+            if (ex == null)
+                return string.Empty;
+
+            var sb = new System.Text.StringBuilder();
+            var current = ex;
+            var depth = 0;
+            while (current != null && depth < 10)
+            {
+                if (depth > 0)
+                    sb.AppendLine(" ---> ");
+                sb.AppendLine(current.GetType().FullName);
+                var frames = new System.Diagnostics.StackTrace(current, fNeedFileInfo: false).ToString();
+                if (!string.IsNullOrWhiteSpace(frames))
+                    sb.AppendLine(frames.TrimEnd());
+                current = current.InnerException;
+                depth++;
+            }
+
+            return sb.ToString();
         }
 
         /// <summary>
@@ -121,7 +160,7 @@ namespace Duplicati.Library.UsageReporter
         public static void ShutDown()
         {
             if (_eventChannel != null && !_eventChannel.IsRetiredAsync.Result)
-                _eventChannel.Retire();
+                _eventChannel.RetireAsync().Await();
 
             if (ShutdownTask != null)
             {
@@ -171,7 +210,7 @@ namespace Duplicati.Library.UsageReporter
             {
                 if (Cached_MaxReportLevel == null)
                 {
-                    var str = Environment.GetEnvironmentVariable(string.Format(DISABLED_ENVNAME_TEMPLATE, AutoUpdater.AutoUpdateSettings.AppName));
+                    var str = Environment.GetEnvironmentVariable(string.Format(DISABLED_ENVNAME_TEMPLATE, Duplicati.Library.AutoUpdater.AutoUpdateSettings.AppName));
                     ReportType tmp;
                     if (string.IsNullOrWhiteSpace(str) || !Enum.TryParse(str, true, out tmp))
                         Cached_MaxReportLevel = ReportType.Information;
@@ -189,7 +228,7 @@ namespace Duplicati.Library.UsageReporter
         /// <value><c>true</c> if is disabled; otherwise, <c>false</c>.</value>
         private static bool IsDisabled
         {
-            get 
+            get
             {
                 if (Forced_Disabled)
                     return true;
@@ -207,6 +246,10 @@ namespace Duplicati.Library.UsageReporter
         {
             get
             {
+                // Support the DO_NOT_TRACK=1 environment variable
+                if (Environment.GetEnvironmentVariable("DO_NOT_TRACK")?.Trim() == "1")
+                    return true;
+
                 var str = Environment.GetEnvironmentVariable(string.Format(DISABLED_ENVNAME_TEMPLATE, AutoUpdater.AutoUpdateSettings.AppName));
 #if DEBUG
                 // Default to not report crashes etc from debug builds

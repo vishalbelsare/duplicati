@@ -1,10 +1,33 @@
-﻿using System;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Duplicati.Library.Interface;
-using Duplicati.Library.Logging;
-using System.Net.NetworkInformation;
-using Duplicati.Library.Modules.Builtin.ResultSerialization;
+using Duplicati.Library.ResultSerialization;
+using Artalk.Xmpp.Client;
+using System.Runtime.CompilerServices;
+
+[assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
 namespace Duplicati.Library.Modules.Builtin
 {
@@ -33,6 +56,11 @@ namespace Duplicati.Library.Modules.Builtin
         /// </summary>
         private const string OPTION_MESSAGE = "send-xmpp-message";
         /// <summary>
+        /// Option used to specify extra parameters
+        /// </summary>
+        private const string OPTION_EXTRA_PARAMETERS = "send-xmpp-extra-parameters";
+
+        /// <summary>
         /// Option used to specify report level
         /// </summary>
         private const string OPTION_SENDLEVEL = "send-xmpp-level";
@@ -40,6 +68,10 @@ namespace Duplicati.Library.Modules.Builtin
         /// Option used to specify if reports are sent for other operations than backups
         /// </summary>
         private const string OPTION_SENDALL = "send-xmpp-any-operation";
+        /// <summary>
+        /// Option used to specify the list of operations that send reports
+        /// </summary>
+        private const string OPTION_SEND_OPERATIONS = "send-xmpp-operations";
         /// <summary>
         /// Option used to specify what format the result is sent in.
         /// </summary>
@@ -57,6 +89,18 @@ namespace Duplicati.Library.Modules.Builtin
         /// Option used to set the maximum number of log lines
         /// </summary>
         private const string OPTION_MAX_LOG_LINES = "send-xmpp-max-log-lines";
+        /// <summary>
+        /// Option used to accept any server certificate
+        /// </summary>
+        private const string OPTION_ACCEPT_ANY_CERTIFICATE = "send-xmpp-accept-any-ssl-certificate";
+        /// <summary>
+        /// Option used to accept server certificates with the given hashes
+        /// </summary>
+        private const string OPTION_ACCEPT_SPECIFIED_CERTIFICATE = "send-xmpp-accept-specified-ssl-hash";
+        /// <summary>
+        /// Option used to ignore certificate revocation check failures
+        /// </summary>
+        private const string OPTION_IGNORE_REVOCATION_FAILURE = "send-xmpp-ignore-revocation-failure";
 
         #endregion
 
@@ -64,7 +108,7 @@ namespace Duplicati.Library.Modules.Builtin
         /// <summary>
         /// The default message body
         /// </summary>
-        protected override string DEFAULT_BODY => string.Format("Duplicati %OPERATIONNAME% report for %backup-name%{0}{0}%RESULT%", Environment.NewLine);
+        protected override string DEFAULT_BODY => string.Format("Duplicati %OPERATIONNAME% report for %backup-name%{0}{0} %RESULT%", Environment.NewLine);
         /// <summary>
         /// Don't use the subject for XMPP
         /// </summary>
@@ -84,6 +128,18 @@ namespace Duplicati.Library.Modules.Builtin
         /// The XMPP recipient
         /// </summary>
         private string m_to;
+        /// <summary>
+        /// Whether to accept any server certificate
+        /// </summary>
+        private bool m_acceptAnyCertificate;
+        /// <summary>
+        /// The hashes of the server certificates to accept
+        /// </summary>
+        private string[] m_acceptSpecificCertificates;
+        /// <summary>
+        /// Whether to ignore certificate revocation check failures
+        /// </summary>
+        private bool m_ignoreRevocationFailure;
 
         #endregion
 
@@ -98,7 +154,7 @@ namespace Duplicati.Library.Modules.Builtin
         /// <summary>
         /// A localized string describing the module with a friendly name
         /// </summary>
-        public override string DisplayName { get { return Strings.SendJabberMessage.DisplayName;} }
+        public override string DisplayName { get { return Strings.SendJabberMessage.DisplayName; } }
 
         /// <summary>
         /// A localized description of the module
@@ -115,35 +171,38 @@ namespace Duplicati.Library.Modules.Builtin
         /// <summary>
         /// Gets a list of supported commandline arguments
         /// </summary>
-        public override IList<ICommandLineArgument> SupportedCommands
-        {
-            get
-            {
-                return new List<ICommandLineArgument>(new ICommandLineArgument[] {
-                    new CommandLineArgument(OPTION_RECIPIENT, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmpptoShort, Strings.SendJabberMessage.SendxmpptoLong),
-                    new CommandLineArgument(OPTION_MESSAGE, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmppmessageShort, Strings.SendJabberMessage.SendxmppmessageLong, DEFAULT_BODY),
-                    new CommandLineArgument(OPTION_USERNAME, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmppusernameShort, Strings.SendJabberMessage.SendxmppusernameLong),
-                    new CommandLineArgument(OPTION_PASSWORD, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmpppasswordShort, Strings.SendJabberMessage.SendxmpppasswordLong),
-                    new CommandLineArgument(OPTION_SENDLEVEL, CommandLineArgument.ArgumentType.Enumeration, Strings.SendJabberMessage.SendxmpplevelShort, Strings.SendJabberMessage.SendxmpplevelLong(ParsedResultType.Success.ToString(), ParsedResultType.Warning.ToString(), ParsedResultType.Error.ToString(), ParsedResultType.Fatal.ToString(), "All"), DEFAULT_LEVEL, null, Enum.GetNames(typeof(ParsedResultType)).Union(new string[] { "All" } ).ToArray()),
-                    new CommandLineArgument(OPTION_SENDALL, CommandLineArgument.ArgumentType.Boolean, Strings.SendJabberMessage.SendxmppanyoperationShort, Strings.SendJabberMessage.SendxmppanyoperationLong),
+        public override IList<ICommandLineArgument> SupportedCommands =>
+        [
+            new CommandLineArgument(OPTION_RECIPIENT, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmpptoShort, Strings.SendJabberMessage.SendxmpptoLong),
+            new CommandLineArgument(OPTION_MESSAGE, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmppmessageShort, Strings.SendJabberMessage.SendxmppmessageLong, DEFAULT_BODY),
+            new CommandLineArgument(OPTION_EXTRA_PARAMETERS, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmppextraparametersShort, Strings.SendJabberMessage.SendxmppextraparametersLong),
+            new CommandLineArgument(OPTION_USERNAME, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmppusernameShort, Strings.SendJabberMessage.SendxmppusernameLong),
+            new CommandLineArgument(OPTION_PASSWORD, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmpppasswordShort, Strings.SendJabberMessage.SendxmpppasswordLong),
+            new CommandLineArgument(OPTION_ACCEPT_ANY_CERTIFICATE, CommandLineArgument.ArgumentType.Boolean, Strings.SendJabberMessage.AcceptAnyCertificateShort, Strings.SendJabberMessage.AcceptAnyCertificateLong(OPTION_ACCEPT_SPECIFIED_CERTIFICATE), "false"),
+            new CommandLineArgument(OPTION_ACCEPT_SPECIFIED_CERTIFICATE, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.AcceptSpecifiedCertificateShort, Strings.SendJabberMessage.AcceptSpecifiedCertificateLong),
+            new CommandLineArgument(OPTION_IGNORE_REVOCATION_FAILURE, CommandLineArgument.ArgumentType.Boolean, Strings.SendJabberMessage.IgnoreRevocationFailureShort, Strings.SendJabberMessage.IgnoreRevocationFailureLong, "false"),
+            new CommandLineArgument(OPTION_SENDLEVEL, CommandLineArgument.ArgumentType.String, Strings.SendJabberMessage.SendxmpplevelShort, Strings.SendJabberMessage.SendxmpplevelLong(ParsedResultType.Success.ToString(), ParsedResultType.Warning.ToString(), ParsedResultType.Error.ToString(), ParsedResultType.Fatal.ToString(), "All"), DEFAULT_LEVEL, null, Enum.GetNames(typeof(ParsedResultType)).Union(new string[] { "All" } ).ToArray()),
+            new CommandLineArgument(OPTION_SENDALL, CommandLineArgument.ArgumentType.Boolean, Strings.SendJabberMessage.SendxmppanyoperationShort, Strings.SendJabberMessage.SendxmppanyoperationLong),
+            new CommandLineArgument(OPTION_SEND_OPERATIONS, CommandLineArgument.ArgumentType.Flags, Strings.ReportHelper.OptionOperationsShort, Strings.ReportHelper.OptionOperationsLong, DEFAULT_OPERATIONS, null, ValidOperationNames),
 
-                    new CommandLineArgument(OPTION_LOG_LEVEL, CommandLineArgument.ArgumentType.Enumeration, Strings.ReportHelper.OptionLoglevellShort, Strings.ReportHelper.OptionLoglevelLong, DEFAULT_LOG_LEVEL.ToString(), null, Enum.GetNames(typeof(Logging.LogMessageType))),
-                    new CommandLineArgument(OPTION_LOG_FILTER, CommandLineArgument.ArgumentType.String, Strings.ReportHelper.OptionLogfilterShort, Strings.ReportHelper.OptionLogfilterLong),
-                    new CommandLineArgument(OPTION_MAX_LOG_LINES, CommandLineArgument.ArgumentType.Integer, Strings.ReportHelper.OptionmaxloglinesShort, Strings.ReportHelper.OptionmaxloglinesLong, DEFAULT_LOGLINES.ToString()),
+            new CommandLineArgument(OPTION_LOG_LEVEL, CommandLineArgument.ArgumentType.Enumeration, Strings.ReportHelper.OptionLoglevelShort, Strings.ReportHelper.OptionLoglevelLong, DEFAULT_LOG_LEVEL.ToString(), null, Enum.GetNames(typeof(Logging.LogMessageType))),
+            new CommandLineArgument(OPTION_LOG_FILTER, CommandLineArgument.ArgumentType.String, Strings.ReportHelper.OptionLogfilterShort, Strings.ReportHelper.OptionLogfilterLong),
+            new CommandLineArgument(OPTION_MAX_LOG_LINES, CommandLineArgument.ArgumentType.Integer, Strings.ReportHelper.OptionmaxloglinesShort, Strings.ReportHelper.OptionmaxloglinesLong, DEFAULT_LOGLINES.ToString()),
 
-                    new CommandLineArgument(OPTION_RESULT_FORMAT, CommandLineArgument.ArgumentType.Enumeration, Strings.ReportHelper.ResultFormatShort, Strings.ReportHelper.ResultFormatLong(Enum.GetNames(typeof(ResultExportFormat))), DEFAULT_EXPORT_FORMAT.ToString(), null, Enum.GetNames(typeof(ResultExportFormat))),
-                });
-            }
-        }
+            new CommandLineArgument(OPTION_RESULT_FORMAT, CommandLineArgument.ArgumentType.Enumeration, Strings.ReportHelper.ResultFormatShort, Strings.ReportHelper.ResultFormatLong(Enum.GetNames(typeof(ResultExportFormat))), DEFAULT_EXPORT_FORMAT.ToString(), null, Enum.GetNames(typeof(ResultExportFormat))),
+        ];
+
 
         protected override string SubjectOptionName => OPTION_MESSAGE;
         protected override string BodyOptionName => OPTION_MESSAGE;
         protected override string ActionLevelOptionName => OPTION_SENDLEVEL;
         protected override string ActionOnAnyOperationOptionName => OPTION_SENDALL;
+        protected override string ActionOnOperationsOptionName => OPTION_SEND_OPERATIONS;
         protected override string LogLevelOptionName => OPTION_LOG_LEVEL;
         protected override string LogFilterOptionName => OPTION_LOG_FILTER;
         protected override string LogLinesOptionName => OPTION_MAX_LOG_LINES;
         protected override string ResultFormatOptionName => OPTION_RESULT_FORMAT;
+        protected override string ExtraDataOptionName => OPTION_EXTRA_PARAMETERS;
 
         /// <summary>
         /// This method is the interception where the module can interact with the execution environment and modify the settings.
@@ -159,96 +218,118 @@ namespace Duplicati.Library.Modules.Builtin
             commandlineOptions.TryGetValue(OPTION_USERNAME, out m_username);
             commandlineOptions.TryGetValue(OPTION_PASSWORD, out m_password);
 
+            m_acceptAnyCertificate = Utility.Utility.ParseBoolOption(commandlineOptions.AsReadOnly(), OPTION_ACCEPT_ANY_CERTIFICATE);
+            m_acceptSpecificCertificates = commandlineOptions.TryGetValue(OPTION_ACCEPT_SPECIFIED_CERTIFICATE, out var hashes) && !string.IsNullOrWhiteSpace(hashes)
+                ? hashes.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                : null;
+            m_ignoreRevocationFailure = Utility.Utility.ParseBoolOption(commandlineOptions.AsReadOnly(), OPTION_IGNORE_REVOCATION_FAILURE);
+
             return true;
         }
 
         #endregion
 
-        protected override string ReplaceTemplate(string input, object result, bool subjectline)
+        protected override string ReplaceTemplate(string input, object result, Exception exception, bool subjectline)
         {
             // No need to do the expansion as we throw away the result
             if (subjectline)
                 return string.Empty;
-            return base.ReplaceTemplate(input, result, subjectline);
+            return base.ReplaceTemplate(input, result, exception, subjectline);
         }
 
-        protected override void SendMessage(string subject, string body)
+        /// <summary>
+        /// The parts of the xmpp target needed to open a connection.
+        /// </summary>
+        /// <param name="Host">The server to connect to.</param>
+        /// <param name="Username">The user part of the jid.</param>
+        /// <param name="Password">The password from the jid, if it carries one.</param>
+        /// <param name="Port">The port to connect on, defaulted from the scheme.</param>
+        /// <param name="Resource">The xmpp resource, "Duplicati" when the jid has none.</param>
+        internal readonly record struct XmppTarget(string Host, string Username, string Password, int Port, string Resource);
+
+        /// <summary>
+        /// Splits the configured jid into the parts needed to connect. The value is a jid
+        /// rather than a url, so a scheme is prepended when it has none, and the url parser
+        /// is used to separate the user, server, port and resource.
+        /// </summary>
+        /// <param name="usernameOption">The value of the username option.</param>
+        /// <returns>The parts needed to connect.</returns>
+        internal static XmppTarget ParseXmppTarget(string usernameOption)
         {
-            Exception ex = null;
-            var waitEvent = new System.Threading.ManualResetEvent(false);
-
-            var uri = new Library.Utility.Uri(m_username.Contains("://") ? m_username : "http://" + m_username);
-            var con = new agsXMPP.XmppClientConnection(uri.Host, uri.Port == -1 ? (uri.Scheme == "https" ? 5223 :5222) : uri.Port);
-            if (uri.Scheme == "https")
-                con.UseSSL = true;
-
-            var resource = uri.Path ?? "";
+            var uri = new Uri(usernameOption.Contains("://") ? usernameOption : "http://" + usernameOption);
+            var resource = uri.AbsolutePath;
             if (resource.StartsWith("/", StringComparison.Ordinal))
                 resource = resource.Substring(1);
 
             if (string.IsNullOrWhiteSpace(resource))
                 resource = "Duplicati";
 
-            agsXMPP.ObjectHandler loginDelegate = (sender) =>
+            // The user info is not decoded by System.Uri, so it is decoded here to keep
+            // the jid readable the same way it was before.
+            var userinfo = uri.UserInfo.Split(new[] { ':' }, 2);
+            var username = userinfo.Length > 0 && userinfo[0].Length > 0 ? Uri.UnescapeDataString(userinfo[0]) : null;
+            var password = userinfo.Length > 1 ? Uri.UnescapeDataString(userinfo[1]) : null;
+
+            return new XmppTarget(
+                uri.Host,
+                username,
+                password,
+                // System.Uri answers with the scheme's default port when the jid does not
+                // name one, so the absence of a port is asked for directly.
+                uri.IsDefaultPort ? (uri.Scheme == "https" ? 5223 : 5222) : uri.Port,
+                resource);
+        }
+
+        protected override void SendMessage(string subject, string body)
+        {
+            var target = ParseXmppTarget(m_username);
+            var resource = target.Resource;
+
+            // Without a validation callback, the client accepts any server certificate
+            var validator = new Utility.SslCertificateValidator(m_acceptAnyCertificate, m_acceptSpecificCertificates, m_ignoreRevocationFailure);
+            using (ArtalkXmppClient client = new ArtalkXmppClient(target.Host, target.Username, string.IsNullOrWhiteSpace(m_password) ? target.Password : m_password, target.Port, true, validator.ValidateServerCertificate))
             {
+                client.Connect(resource);
                 try
                 {
-                    foreach(var recipient in m_to.Split(new string[] { "," }, StringSplitOptions.RemoveEmptyEntries))
-                        con.Send(new agsXMPP.protocol.client.Message(recipient, agsXMPP.protocol.client.MessageType.chat, body));
-                }
-                catch (Exception e)
-                {
-                    Logging.Log.WriteWarningMessage(LOGTAG, "XMPPSendError", e, "Failed to send to XMPP messages: {0}", e.Message);
-                    ex = e;
+                    SendToRecipients(m_to, jid =>
+                    {
+                        client.SendMessage(jid, new Dictionary<string, string>() { { "en", body } });
+                        // hack to work around a failure to send the second time
+                        // (the xmpp server reports a read failure)
+                        try
+                        {
+                            client.Ping(jid);
+                        }
+                        catch { }
+                    });
                 }
                 finally
                 {
-                    waitEvent.Set();
+                    client.Close();
                 }
-            };
-
-            agsXMPP.ErrorHandler errorHandler = (sender, e) => {
-                Logging.Log.WriteWarningMessage(LOGTAG, "XMPPError", e, "An error ocurred in XMPP: {0}", e.Message);
-
-                ex = e;
-                waitEvent.Set();
-            };
-
-            agsXMPP.XmppElementHandler loginErroHandler = (sender, e) => {
-                Logging.Log.WriteWarningMessage(LOGTAG, "XMPPLoginError", null, "Failed to login to XMPP: {0}", e);
-
-                ex = new Exception(string.Format("Failed to log in: {0}", e));
-                waitEvent.Set();
-            };
-    
-            con.OnLogin += loginDelegate;
-            con.OnError += errorHandler;
-            con.OnAuthError += loginErroHandler;
-            //con.OnBinded += (sender) => {Console.WriteLine("Binded: {0}", sender);};
-            //con.OnIq += (sender, iq) => {Console.WriteLine("Iq: {0}", iq);};
-            //con.OnReadXml += (sender, xml) => {Console.WriteLine("ReadXml: {0}", xml);};
-            //con.OnWriteXml += (sender, xml) => {Console.WriteLine("writeXml: {0}", xml);};;
-            con.Open(uri.Username, string.IsNullOrWhiteSpace(m_password) ? uri.Password : m_password, resource);
-
-            var timeout = !waitEvent.WaitOne(TimeSpan.FromSeconds(30), true);
-
-            con.OnLogin -= loginDelegate;
-            con.OnError -= errorHandler;
-            con.OnAuthError -= loginErroHandler;
-
-            try
-            {
-                con.Close();
-            }
-            catch (Exception lex)
-            {
-                Logging.Log.WriteExplicitMessage(LOGTAG, "CloseConnectionError", lex, "Failed to close XMPP connection: {0}", lex.Message);
             }
 
-            if (ex != null)
-                throw ex;
-            if (timeout)
-                throw new TimeoutException(Strings.SendJabberMessage.LoginTimeoutError);
+        }
+
+        /// <summary>
+        /// Sends to each recipient in the comma separated list, so a failure for one does not stop the others
+        /// </summary>
+        /// <param name="recipients">The recipients option value</param>
+        /// <param name="send">Sends the message to one recipient</param>
+        internal static void SendToRecipients(string recipients, Action<Artalk.Xmpp.Jid> send)
+        {
+            foreach (var recipient in recipients.Split(new string[] { "," }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                try
+                {
+                    send(new Artalk.Xmpp.Jid(recipient));
+                }
+                catch (Exception e)
+                {
+                    Logging.Log.WriteWarningMessage(LOGTAG, "XMPPSendError", e, "Failed to send XMPP message to {0}: {1}", recipient, e.Message);
+                }
+            }
         }
     }
 }

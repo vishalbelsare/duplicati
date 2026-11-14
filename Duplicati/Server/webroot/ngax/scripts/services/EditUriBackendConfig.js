@@ -24,12 +24,16 @@ backupApp.service('EditUriBackendConfig', function(AppService, AppUtils, SystemI
     this.defaulttemplate = 'templates/backends/generic.html';
     this.defaultbuilder = function(scope) {
         var opts = {};
-        self.merge_in_advanced_options(scope, opts);
+        self.merge_in_advanced_options(scope, opts, true);
 
-        var url = AppUtils.format('{0}{1}://{2}{3}/{4}{5}',
+        // An IPv6 address goes in brackets, so its colons are not read as a port
+        var server = scope.Server || '';
+        if (server.indexOf(':') >= 0 && /^[0-9a-fA-F:.]+$/.test(server))
+            server = '[' + server + ']';
+
+        var url = AppUtils.format('{0}://{1}{2}/{3}{4}',
             scope.Backend.Key,
-            (scope.SupportsSSL && scope.UseSSL) ? 's' : '',
-            scope.Server || '',
+            server,
             (scope.Port || '') == '' ? '' : ':' + scope.Port,
             scope.Path || '',
             AppUtils.encodeDictAsUrl(opts)
@@ -38,11 +42,20 @@ backupApp.service('EditUriBackendConfig', function(AppService, AppUtils, SystemI
         return url;
     };
 
-    this.merge_in_advanced_options = function(scope, dict) {
-        if (scope.Username != null && scope.Username != '')
+    this.merge_in_advanced_options = function (scope, dict, includeUserPassword) {
+        if (includeUserPassword == null) {
+            includeUserPassword = true;
+        }
+        // Some backends do not have input fields for Username and Password
+        // When changing backends, these variables are not cleared
+        // Only include them if the backend supports it and shows input fields for them
+        // Other options appear in the AdvancedOptions list and can be removed manually if not supported
+        if (includeUserPassword && scope.Username != null && scope.Username != '')
             dict['auth-username'] = scope.Username;
-        if (scope.Password != null && scope.Password != '')
+        if (includeUserPassword && scope.Password != null && scope.Password != '')
             dict['auth-password'] = scope.Password;
+        if (scope.UseSSL)
+            dict['use-ssl'] = 'true';
 
         if (!AppUtils.parse_extra_options(scope.AdvancedOptions, dict))
             return false;
@@ -82,7 +95,7 @@ backupApp.service('EditUriBackendConfig', function(AppService, AppUtils, SystemI
 
     this.recommend_field = function (scope, field, label, reason, continuation) {
         if ((scope[field] || '').trim().length == 0)
-            return self.show_warning_dialog(gettextCatalog.getString('You should fill in {{field}}{{reason}}', { field: label || field, reason: reason }), continuation);
+            return self.show_warning_dialog(gettextCatalog.getString('You should fill in {{field}} {{reason}}', { field: label || field, reason: reason }), continuation);
         else
             continuation();
     };
@@ -123,5 +136,13 @@ backupApp.service('EditUriBackendConfig', function(AppService, AppUtils, SystemI
 
         return true;
     };
+
+    this.recommend_username = function(scope, continuation) {
+        if ((scope.Username || '').trim().length == 0)
+            return self.show_warning_dialog(gettextCatalog.getString('Most servers require a username, so you will likely need to enter one.\nAre you sure want to continue without a username?'), continuation);
+        else
+            continuation();
+    };
+
 
 });

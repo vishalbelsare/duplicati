@@ -1,19 +1,24 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using CoCoL;
 using System.Linq;
@@ -24,17 +29,23 @@ using System.Collections.Generic;
 namespace Duplicati.Library.Main.Operation.Backup
 {
     /// <summary>
-    /// The progress handler reads all progress messages and reports progress as if the processing is sequential
+    /// The progress handler reads all progress messages and reports progress as if the processing is sequential.
+    /// The files processed in parallel are also reported as a list, for clients that can show them.
     /// </summary>
     internal static class ProgressHandler
     {
-        public static Task Run(BackupResults stat)
+        /// <summary>
+        /// The maximum number of active files reported
+        /// </summary>
+        private const int MAX_ACTIVE_FILES = 32;
+
+        public static Task RunAsync(Channels channels, BackupResults stat)
         {
             return AutomationExtensions.RunTask(new
             {
-                Input = Channels.ProgressEvents.ForRead
+                Input = channels.ProgressEvents.AsRead()
             },
-            
+
             async self =>
             {
                 var filesStarted = new Dictionary<string, long>();
@@ -43,43 +54,75 @@ namespace Duplicati.Library.Main.Operation.Backup
                 long processedFileSize = 0;
                 string current = null;
 
-                while(true)
+                // Bytes actually read, which unlike the processed size leaves out skipped files.
+                // The bytes of open files are counted from their last progress update.
+                long closedBytesRead = 0;
+                long openBytesRead = 0;
+                stat.OperationProgressUpdater.UpdateSourceBytesRead(0);
+
+                // The list is read from the thread that reports progress, so changes to the files are locked
+                var filesLock = new object();
+                stat.OperationProgressUpdater.SetActiveFilesProvider(() =>
+                {
+                    lock (filesLock)
+                        return filesStarted
+                            .OrderByDescending(x => x.Value)
+                            .Take(MAX_ACTIVE_FILES)
+                            .Select(x => new ActiveFileProgress(x.Key, x.Value, fileProgress.TryGetValue(x.Key, out var offset) ? offset : 0))
+                            .ToArray();
+                });
+
+                while (true)
                 {
                     var t = await self.Input.ReadAsync();
-                    switch(t.Type)
+                    lock (filesLock)
                     {
-                        case EventType.FileStarted:
-                            filesStarted[t.Filepath] = t.Length;
-                            fileProgress[t.Filepath] = 0;
-                            break;
-                        case EventType.FileProgressUpdate:
-                            if (t.Filepath == current)
-                                stat.OperationProgressUpdater.UpdateFileProgress(t.Length);
-                            break;
-                        case EventType.FileClosed:
-                            if (fileProgress.ContainsKey(t.Filepath))
-                                fileProgress[t.Filepath] = t.Length;
-                        
-                            if (t.Filepath == current)
-                            {
-                                stat.OperationProgressUpdater.UpdateFileProgress(t.Length);
-                                current = null;
-                            }
+                        switch (t.Type)
+                        {
+                            case EventType.FileStarted:
+                                filesStarted[t.Filepath] = t.Length;
+                                fileProgress[t.Filepath] = 0;
+                                break;
+                            case EventType.FileProgressUpdate:
+                                if (fileProgress.TryGetValue(t.Filepath, out var lastOffset))
+                                {
+                                    openBytesRead += t.Length - lastOffset;
+                                    fileProgress[t.Filepath] = t.Length;
+                                    stat.OperationProgressUpdater.UpdateSourceBytesRead(closedBytesRead + openBytesRead);
+                                }
+                                if (t.Filepath == current)
+                                    stat.OperationProgressUpdater.UpdateFileProgress(t.Length);
+                                break;
+                            case EventType.FileClosed:
+                                if (fileProgress.TryGetValue(t.Filepath, out var openOffset))
+                                {
+                                    openBytesRead -= openOffset;
+                                    fileProgress[t.Filepath] = t.Length;
+                                }
+                                closedBytesRead += t.Length;
+                                stat.OperationProgressUpdater.UpdateSourceBytesRead(closedBytesRead + openBytesRead);
 
-                            processedFileCount += 1;
-                            processedFileSize += t.Length;
+                                if (t.Filepath == current)
+                                {
+                                    stat.OperationProgressUpdater.UpdateFileProgress(t.Length);
+                                    current = null;
+                                }
 
-                            stat.OperationProgressUpdater.UpdatefilesProcessed(processedFileCount, processedFileSize);
-                            filesStarted.Remove(t.Filepath);
-                            fileProgress.Remove(t.Filepath);
-                            break;
-                        case EventType.FileSkipped:
+                                processedFileCount += 1;
+                                processedFileSize += t.Length;
 
-                            processedFileCount += 1;
-                            processedFileSize += t.Length;
+                                stat.OperationProgressUpdater.UpdatefilesProcessed(processedFileCount, processedFileSize);
+                                filesStarted.Remove(t.Filepath);
+                                fileProgress.Remove(t.Filepath);
+                                break;
+                            case EventType.FileSkipped:
 
-                            stat.OperationProgressUpdater.UpdatefilesProcessed(processedFileCount, processedFileSize);
-                            break;
+                                processedFileCount += 1;
+                                processedFileSize += t.Length;
+
+                                stat.OperationProgressUpdater.UpdatefilesProcessed(processedFileCount, processedFileSize);
+                                break;
+                        }
                     }
 
                     if (current == null)
@@ -89,7 +132,7 @@ namespace Duplicati.Library.Main.Operation.Backup
                         {
                             stat.OperationProgressUpdater.StartFile(current, filesStarted[current]);
                             if (fileProgress.ContainsKey(current) && fileProgress[current] > 0)
-                                stat.OperationProgressUpdater.UpdateFileProgress(fileProgress[current]);       
+                                stat.OperationProgressUpdater.UpdateFileProgress(fileProgress[current]);
                         }
                     }
                 }

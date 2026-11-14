@@ -1,23 +1,26 @@
-#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 // 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
 // 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
 // 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-#endregion
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using System;
+using System.Net.Http.Headers;
 using Duplicati.Library.Localization.Short;
 
 namespace Duplicati.Library.Interface
@@ -92,6 +95,69 @@ namespace Duplicati.Library.Interface
 
         public FileMissingException(string message, Exception innerException)
             : base(message, "FileMissing", innerException)
+        { }
+    }
+
+    /// <summary>
+    /// An exception indicating that the destination cannot apply object locks,
+    /// either because the backend has no locking support or because the
+    /// feature is not enabled for the bucket, container or account.
+    /// This is a permanent condition, so operations failing with this
+    /// exception are not retried.
+    /// </summary>
+    [Serializable]
+    public class ObjectLockNotSupportedException : UserInformationException
+    {
+        /// <summary>
+        /// The default help ID used when no backend specific ID is supplied
+        /// </summary>
+        public const string DEFAULT_HELP_ID = "ObjectLockNotSupported";
+
+        public ObjectLockNotSupportedException()
+            : base(Strings.Common.ObjectLockNotSupportedError, DEFAULT_HELP_ID)
+        { }
+
+        public ObjectLockNotSupportedException(string message)
+            : base(message, DEFAULT_HELP_ID)
+        { }
+
+        public ObjectLockNotSupportedException(string message, Exception innerException)
+            : base(message, DEFAULT_HELP_ID, innerException)
+        { }
+
+        public ObjectLockNotSupportedException(string message, string helpId)
+            : base(message, helpId)
+        { }
+
+        public ObjectLockNotSupportedException(string message, string helpId, Exception innerException)
+            : base(message, helpId, innerException)
+        { }
+    }
+
+    /// <summary>
+    /// An exception indicating that the destination cannot create hard links, because
+    /// the filesystem or share it points at has no hard-link support. This is a
+    /// permanent condition, so operations failing with this exception are not retried
+    /// and callers fall back to storing the content again.
+    /// </summary>
+    [Serializable]
+    public class HardLinkNotSupportedException : UserInformationException
+    {
+        /// <summary>
+        /// The help ID used for this exception
+        /// </summary>
+        public const string HELP_ID = "HardLinkNotSupported";
+
+        public HardLinkNotSupportedException()
+            : base(Strings.Common.HardLinkNotSupportedError, HELP_ID)
+        { }
+
+        public HardLinkNotSupportedException(string message)
+            : base(message, HELP_ID)
+        { }
+
+        public HardLinkNotSupportedException(string message, Exception innerException)
+            : base(message, HELP_ID, innerException)
         { }
     }
 
@@ -193,10 +259,128 @@ namespace Duplicati.Library.Interface
     {
         public RemoteListVerificationException(string message, string helpId)
             : base(message, helpId)
-        {}
+        { }
 
         public RemoteListVerificationException(string message, string helpId, Exception innerException)
             : base(message, helpId, innerException)
-        {}
+        { }
+    }
+
+    /// <summary>
+    /// An exception indicating that the current encryption key does not match the key
+    /// used to encrypt the settings.
+    /// </summary>
+    [Serializable]
+    public class SettingsEncryptionKeyMismatchException : UserInformationException
+    {
+        public SettingsEncryptionKeyMismatchException()
+            : base(Strings.Common.SettingsKeyMismatchExceptionError, "SettingsKeyMismatch")
+        { }
+    }
+
+    /// <summary>
+    /// An exception indicating that the current encryption key does not match the key
+    /// used to encrypt the settings.
+    /// </summary>
+    [Serializable]
+    public class SettingsEncryptionKeyMissingException : UserInformationException
+    {
+        public SettingsEncryptionKeyMissingException()
+            : base(Strings.Common.SettingsKeyMissingExceptionError, "SettingsKeyMissing")
+        { }
+    }
+
+    /// <summary>
+    /// An exception for carrying the Retry-After header value on 429 Exceptions
+    /// </summary>
+    [Serializable]
+    public class TooManyRequestException(RetryConditionHeaderValue retryAfter) : Exception
+    {
+        public readonly RetryConditionHeaderValue RetryAfter = retryAfter;
+    }
+
+    /// <summary>
+    /// An exception indicating that the database state is inconsistent
+    /// </summary>
+    [Serializable]
+    public class DatabaseInconsistencyException : UserInformationException
+    {
+        public DatabaseInconsistencyException(string message)
+            : base(message, "DatabaseInconsistency")
+        { }
+
+        public DatabaseInconsistencyException(string message, string helpId)
+            : base(message, helpId)
+        { }
+
+        public DatabaseInconsistencyException(string message, Exception innerException)
+            : base(message, "DatabaseInconsistency", innerException)
+        { }
+
+        public DatabaseInconsistencyException(string message, string helpId, Exception innerException)
+            : base(message, helpId, innerException)
+        { }
+    }
+
+    /// <summary>
+    /// Exception indicating that the test failed after the connection was established and authenticated
+    /// </summary>
+    [Serializable]
+    public class TestAfterConnectException : UserInformationException
+    {
+        public TestAfterConnectException(string message, string helpId)
+            : base(message, helpId)
+        { }
+
+        public TestAfterConnectException(string message, string helpId, Exception innerException)
+            : base(message, helpId, innerException)
+        { }
+    }
+
+    /// <summary>
+    /// Exception indicating that the backup database is currently locked by another running operation
+    /// and cannot be accessed concurrently.
+    /// </summary>
+    [Serializable]
+    public class DatabaseLockedException : UserInformationException
+    {
+        /// <summary>
+        /// The path to the database file that is locked.
+        /// </summary>
+        public readonly string DatabasePath;
+
+        public DatabaseLockedException(string databasePath)
+            : base(LC.L($"The backup database is currently in use by another operation and cannot be accessed concurrently. Please wait for the running operation to finish and try again."), "DatabaseLocked")
+        {
+            DatabasePath = databasePath;
+        }
+
+        public DatabaseLockedException(string databasePath, Exception innerException)
+            : base(LC.L($"The backup database is currently in use by another operation and cannot be accessed concurrently. Please wait for the running operation to finish and try again."), "DatabaseLocked", innerException)
+        {
+            DatabasePath = databasePath;
+        }
+
+        public DatabaseLockedException(string message, string helpId, Exception innerException)
+            : base(message, helpId, innerException)
+        {
+            DatabasePath = string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Thrown by a source provider when an entry it listed turns out, on reading, to be one
+    /// the backup should leave out: the reason is final and expected, such as content the
+    /// account used for the backup is not allowed, so the backup records it as information
+    /// rather than a warning, and change tracking does not hold the entry back for another
+    /// attempt. The message says what was skipped and why.
+    /// </summary>
+    [Serializable]
+    public class SourceEntrySkippedException : Exception
+    {
+        public SourceEntrySkippedException(string message, Exception innerException)
+            : base(message, innerException)
+        {
+        }
     }
 }

@@ -11,11 +11,14 @@ REM --run-script-before = <filename>
 REM --run-script-before-required = <filename>
 REM --run-script-timeout = <time>
 REM --run-script-after = <filename>
+REM --run-script-post-backup = <filename>
+REM --run-script-with-arguments = <boolean>
 REM
-REM --run-script-before = <filename>
-REM Duplicati will run the script before the backup job and waits for its 
-REM completion for 60 seconds (default timeout value). After a timeout a 
-REM warning is logged and the backup is started.
+REM --run-script-before-required = <filename>
+REM Duplicati will run the script before the backup job and wait for its 
+REM completion for 60 seconds (default timeout value). The backup will only be
+REM run if the script completes with an allowed exit code (0, 2, or 4). 
+REM A timeout or any other exit code will abort the backup.
 REM The following exit codes are supported:
 REM
 REM - 0: OK, run operation
@@ -26,11 +29,11 @@ REM - 4: Error, run operation
 REM - 5: Error don't run operation
 REM - other: Error don't run operation
 REM
-REM --run-script-before-required = <filename>
-REM Duplicati will run the script before the backup job and wait for its 
-REM completion for 60 seconds (default timeout value). The backup will only be
-REM run if the script completes with the exit code 0. Other exit codes or a
-REM timeout will cancel the backup job.
+REM --run-script-before = <filename>
+REM Duplicati will run the script before the backup job and waits for its 
+REM completion for 60 seconds (default timeout value). After a timeout a 
+REM warning is logged and the backup is started.
+REM Any other exit code than 0 will be logged as a warning.
 REM
 REM --run-script-timeout = <time>
 REM Specify a new value for the timeout. Default is 60s. Accepted values are
@@ -44,6 +47,29 @@ REM warning is logged.
 REM The same exit codes as in --run-script-before are supported, but
 REM the operation will always continue (i.e. 1 => 0, 3 => 2, 5 => 4)
 REM as it has already completed so stopping it during stop is useless.
+REM
+REM --run-script-post-backup = <filename>
+REM Duplicati will run the script after the backup data has been written and
+REM source resources (like VSS snapshots) have been released, but before the
+REM remote verification is performed. This allows scripts to run at the earliest
+REM point where the backup is complete but verification has not yet started.
+REM This is useful for scenarios where you want to minimize the time that
+REM operations are suspended or paused. The script will wait for its completion
+REM for 60 seconds (default timeout value). After a timeout a warning is logged.
+REM The same exit codes as in --run-script-before are supported, but
+REM the operation will always continue.
+REM
+REM --run-script-with-arguments = <boolean>
+REM If set to true, the script path will be parsed as a command line, and the
+REM arguments will be passed to the script. If set to false (default), 
+REM the script path will used as a single path.
+REM If you do not have spaces in your script path or arguments, simply enter 
+REM it as a string:
+REM Example: --run-script-before="C:\path\to\script.bat arg1 arg2 --option1=a"
+REM If you have spaces in the path or arguements, use double- or single-quotes
+REM around the elements that have spaces, similar to how you would do 
+REM on the command line:
+REM Example: --run-script-before="\"C:\path to\script.bat\" \"arg1 \" arg2"
 
 
 
@@ -89,8 +115,9 @@ REM Special Environment Variables
 REM ###############################################################################
 
 REM DUPLICATI__EVENTNAME
-REM Eventname is BEFORE if invoked as --run-script-before, and AFTER if 
-REM invoked as --run-script-after. This value cannot be changed by writing
+REM Eventname is BEFORE if invoked as --run-script-before, AFTER if 
+REM invoked as --run-script-after, and POST-BACKUP if invoked as
+REM --run-script-post-backup. This value cannot be changed by writing
 REM it back!
 
 REM DUPLICATI__OPERATIONNAME
@@ -123,14 +150,15 @@ REM Example script
 REM ###############################################################################
 
 REM We read a few variables first.
-SET EVENTNAME=%DUPLICATI__EVENTNAME%
-SET OPERATIONNAME=%DUPLICATI__OPERATIONNAME%
-SET REMOTEURL=%DUPLICATI__REMOTEURL%
-SET LOCALPATH=%DUPLICATI__LOCALPATH%
+SET "EVENTNAME=%DUPLICATI__EVENTNAME%"
+SET "OPERATIONNAME=%DUPLICATI__OPERATIONNAME%"
+SET "REMOTEURL=%DUPLICATI__REMOTEURL%"
+SET "LOCALPATH=%DUPLICATI__LOCALPATH%"
 
 REM Basic setup, we use the same file for both before and after,
 REM so we need to figure out which event has happened
 if "%EVENTNAME%" == "BEFORE" GOTO ON_BEFORE
+if "%EVENTNAME%" == "POST-BACKUP" GOTO ON_POST_BACKUP
 if "%EVENTNAME%" == "AFTER" GOTO ON_AFTER
 
 REM This should never happen, but there may be new operations
@@ -163,6 +191,24 @@ GOTO end
 :SET_VOLSIZE
 REM Write the option to stdout to change it
 echo --dblock-size=25mb
+GOTO end
+
+
+:ON_POST_BACKUP
+
+REM This event is triggered after the backup data has been written and
+REM source resources (like VSS snapshots) have been released, but before
+REM the remote verification is performed. This is the earliest point where
+REM you can safely resume operations that were suspended for the backup.
+
+IF "%OPERATIONNAME%" == "Backup" GOTO ON_POST_BACKUP_BACKUP
+REM This will be ignored
+echo Got operation "%OPERATIONNAME%", ignoring
+GOTO end
+
+:ON_POST_BACKUP_BACKUP
+echo Backup data written, resuming normal operations before verification
+REM Add your post-backup logic here, e.g., resuming services
 GOTO end
 
 

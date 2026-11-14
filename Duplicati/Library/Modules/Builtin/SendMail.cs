@@ -1,20 +1,37 @@
-﻿using System;
-using System.Collections;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net;
 using System.Text;
-using System.Text.RegularExpressions;
-using DnsLib;
 using Duplicati.Library.Interface;
-using Duplicati.Library.Logging;
-using Duplicati.Library.Utility;
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
+using Duplicati.Library.ResultSerialization;
 using MailKit.Net.Smtp;
 using MimeKit;
-using Duplicati.Library.Modules.Builtin.ResultSerialization;
+using DnsClient;
+using Duplicati.Library.Logging;
+
+#nullable enable
 
 namespace Duplicati.Library.Modules.Builtin
 {
@@ -56,6 +73,10 @@ namespace Duplicati.Library.Modules.Builtin
         /// </summary>
         private const string OPTION_BODY = "send-mail-body";
         /// <summary>
+        /// Option used to send the mail body as HTML
+        /// </summary>
+        private const string OPTION_BODY_HTML = "send-mail-body-html";
+        /// <summary>
         /// Option used to specify mail level
         /// </summary>
         private const string OPTION_SENDLEVEL = "send-mail-level";
@@ -64,9 +85,18 @@ namespace Duplicati.Library.Modules.Builtin
         /// </summary>
         private const string OPTION_SENDALL = "send-mail-any-operation";
         /// <summary>
+        /// Option used to specify the list of operations that send reports
+        /// </summary>
+        private const string OPTION_SEND_OPERATIONS = "send-mail-operations";
+        /// <summary>
         /// Option used to specify what format the result is sent in.
         /// </summary>
         private const string OPTION_RESULT_FORMAT = "send-mail-result-output-format";
+        /// <summary>
+        /// Option used to specify extra parameters
+        /// </summary>
+        private const string OPTION_EXTRA_PARAMETERS = "send-mail-extra-parameters";
+
         /// <summary>
         /// Option used to set the log level for mail reports
         /// </summary>
@@ -79,6 +109,18 @@ namespace Duplicati.Library.Modules.Builtin
         /// Option used to set the maximum number of log lines
         /// </summary>
         private const string OPTION_MAX_LOG_LINES = "send-mail-max-log-lines";
+        /// <summary>
+        /// Option used to accept any server certificate
+        /// </summary>
+        private const string OPTION_ACCEPT_ANY_CERTIFICATE = "send-mail-accept-any-ssl-certificate";
+        /// <summary>
+        /// Option used to accept server certificates with the given hashes
+        /// </summary>
+        private const string OPTION_ACCEPT_SPECIFIED_CERTIFICATE = "send-mail-accept-specified-ssl-hash";
+        /// <summary>
+        /// Option used to ignore certificate revocation check failures
+        /// </summary>
+        private const string OPTION_IGNORE_REVOCATION_FAILURE = "send-mail-ignore-revocation-failure";
         #endregion
 
         #region Option defaults
@@ -92,23 +134,39 @@ namespace Duplicati.Library.Modules.Builtin
         /// <summary>
         /// The server url to use
         /// </summary>
-        private string m_server;
+        private string? m_server;
         /// <summary>
         /// The server username
         /// </summary>
-        private string m_username;
+        private string? m_username;
         /// <summary>
         /// The server password
         /// </summary>
-        private string m_password;
+        private string? m_password;
         /// <summary>
         /// The mail sender
         /// </summary>
-        private string m_from;
+        private string? m_from;
+        /// <summary>
+        /// Whether to accept any server certificate
+        /// </summary>
+        private bool m_acceptAnyCertificate;
+        /// <summary>
+        /// The hashes of the server certificates to accept
+        /// </summary>
+        private string[]? m_acceptSpecificCertificates;
+        /// <summary>
+        /// Whether to ignore certificate revocation check failures
+        /// </summary>
+        private bool m_ignoreRevocationFailure;
+        /// <summary>
+        /// Whether the body is sent as HTML
+        /// </summary>
+        private bool m_bodyHtml;
         /// <summary>
         /// The mail recipient
         /// </summary>
-        private string m_to;
+        private string? m_to;
         #endregion
 
 
@@ -121,7 +179,7 @@ namespace Duplicati.Library.Modules.Builtin
         /// <summary>
         /// A localized string describing the module with a friendly name
         /// </summary>
-        public override string DisplayName { get { return Strings.SendMail.Displayname;} }
+        public override string DisplayName { get { return Strings.SendMail.Displayname; } }
 
         /// <summary>
         /// A localized description of the module
@@ -138,44 +196,47 @@ namespace Duplicati.Library.Modules.Builtin
         /// <summary>
         /// Gets a list of supported commandline arguments
         /// </summary>
-        public override IList<ICommandLineArgument> SupportedCommands
-        {
-            get
-            {
-                return new List<ICommandLineArgument>(new ICommandLineArgument[] {
-                    new CommandLineArgument(OPTION_RECIPIENT, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionRecipientShort, Strings.SendMail.OptionRecipientLong),
-                    new CommandLineArgument(OPTION_SENDER, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSenderShort, Strings.SendMail.OptionSenderLong, DEFAULT_SENDER),
-                    new CommandLineArgument(OPTION_SUBJECT, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSubjectShort, Strings.SendMail.OptionSubjectLong(OPTION_BODY), DEFAULT_SUBJECT),
-                    new CommandLineArgument(OPTION_BODY, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionBodyShort, Strings.SendMail.OptionBodyLong, DEFAULT_BODY),
-                    new CommandLineArgument(OPTION_SERVER, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionServerShort, Strings.SendMail.OptionServerLong),
-                    new CommandLineArgument(OPTION_USERNAME, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionUsernameShort, Strings.SendMail.OptionUsernameLong),
-                    new CommandLineArgument(OPTION_PASSWORD, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionPasswordShort, Strings.SendMail.OptionPasswordLong),
-                    new CommandLineArgument(OPTION_SENDLEVEL, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSendlevelShort, Strings.SendMail.OptionSendlevelLong(ParsedResultType.Success.ToString(), ParsedResultType.Warning.ToString(), ParsedResultType.Error.ToString(), ParsedResultType.Fatal.ToString(), "All"), DEFAULT_LEVEL, null, Enum.GetNames(typeof(ParsedResultType)).Union(new string [] { "All" }).ToArray()),
-                    new CommandLineArgument(OPTION_SENDALL, CommandLineArgument.ArgumentType.Boolean, Strings.SendHttpMessage.SendhttpanyoperationShort, Strings.SendHttpMessage.SendhttpanyoperationLong),
+        public override IList<ICommandLineArgument> SupportedCommands =>
+        [
+            new CommandLineArgument(OPTION_RECIPIENT, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionRecipientShort, Strings.SendMail.OptionRecipientLong),
+            new CommandLineArgument(OPTION_SENDER, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSenderShort, Strings.SendMail.OptionSenderLong, DEFAULT_SENDER),
+            new CommandLineArgument(OPTION_SUBJECT, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSubjectShort, Strings.SendMail.OptionSubjectLong(OPTION_BODY), DEFAULT_SUBJECT),
+            new CommandLineArgument(OPTION_BODY, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionBodyShort, Strings.SendMail.OptionBodyLong, DEFAULT_BODY),
+            new CommandLineArgument(OPTION_BODY_HTML, CommandLineArgument.ArgumentType.Boolean, Strings.SendMail.OptionBodyHtmlShort, Strings.SendMail.OptionBodyHtmlLong(OPTION_BODY), "false"),
+            new CommandLineArgument(OPTION_SERVER, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionServerShort, Strings.SendMail.OptionServerLong),
+            new CommandLineArgument(OPTION_USERNAME, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionUsernameShort, Strings.SendMail.OptionUsernameLong),
+            new CommandLineArgument(OPTION_PASSWORD, CommandLineArgument.ArgumentType.Password, Strings.SendMail.OptionPasswordShort, Strings.SendMail.OptionPasswordLong),
+            new CommandLineArgument(OPTION_ACCEPT_ANY_CERTIFICATE, CommandLineArgument.ArgumentType.Boolean, Strings.SendMail.AcceptAnyCertificateShort, Strings.SendMail.AcceptAnyCertificateLong(OPTION_ACCEPT_SPECIFIED_CERTIFICATE), "false"),
+            new CommandLineArgument(OPTION_ACCEPT_SPECIFIED_CERTIFICATE, CommandLineArgument.ArgumentType.String, Strings.SendMail.AcceptSpecifiedCertificateShort, Strings.SendMail.AcceptSpecifiedCertificateLong),
+            new CommandLineArgument(OPTION_IGNORE_REVOCATION_FAILURE, CommandLineArgument.ArgumentType.Boolean, Strings.SendMail.IgnoreRevocationFailureShort, Strings.SendMail.IgnoreRevocationFailureLong, "false"),
+            new CommandLineArgument(OPTION_SENDLEVEL, CommandLineArgument.ArgumentType.String, Strings.SendMail.OptionSendlevelShort, Strings.SendMail.OptionSendlevelLong(ParsedResultType.Success.ToString(), ParsedResultType.Warning.ToString(), ParsedResultType.Error.ToString(), ParsedResultType.Fatal.ToString(), "All"), DEFAULT_LEVEL, null, Enum.GetNames(typeof(ParsedResultType)).Union(new string [] { "All" }).ToArray()),
+            new CommandLineArgument(OPTION_SENDALL, CommandLineArgument.ArgumentType.Boolean, Strings.SendHttpMessage.SendhttpanyoperationShort, Strings.SendHttpMessage.SendhttpanyoperationLong),
+            new CommandLineArgument(OPTION_SEND_OPERATIONS, CommandLineArgument.ArgumentType.Flags, Strings.ReportHelper.OptionOperationsShort, Strings.ReportHelper.OptionOperationsLong, DEFAULT_OPERATIONS, null, ValidOperationNames),
+            new CommandLineArgument(OPTION_EXTRA_PARAMETERS, CommandLineArgument.ArgumentType.String, Strings.SendMail.SendmailextraparametersShort, Strings.SendMail.SendmailextraparametersLong),
 
-                    new CommandLineArgument(OPTION_LOG_LEVEL, CommandLineArgument.ArgumentType.Enumeration, Strings.ReportHelper.OptionLoglevellShort, Strings.ReportHelper.OptionLoglevelLong, DEFAULT_LOG_LEVEL.ToString(), null, Enum.GetNames(typeof(Logging.LogMessageType))),
-                    new CommandLineArgument(OPTION_LOG_FILTER, CommandLineArgument.ArgumentType.String, Strings.ReportHelper.OptionLogfilterShort, Strings.ReportHelper.OptionLogfilterLong),
-                    new CommandLineArgument(OPTION_MAX_LOG_LINES, CommandLineArgument.ArgumentType.Integer, Strings.ReportHelper.OptionmaxloglinesShort, Strings.ReportHelper.OptionmaxloglinesLong, DEFAULT_LOGLINES.ToString()),
+            new CommandLineArgument(OPTION_LOG_LEVEL, CommandLineArgument.ArgumentType.Enumeration, Strings.ReportHelper.OptionLoglevelShort, Strings.ReportHelper.OptionLoglevelLong, DEFAULT_LOG_LEVEL.ToString(), null, Enum.GetNames(typeof(Logging.LogMessageType))),
+            new CommandLineArgument(OPTION_LOG_FILTER, CommandLineArgument.ArgumentType.String, Strings.ReportHelper.OptionLogfilterShort, Strings.ReportHelper.OptionLogfilterLong),
+            new CommandLineArgument(OPTION_MAX_LOG_LINES, CommandLineArgument.ArgumentType.Integer, Strings.ReportHelper.OptionmaxloglinesShort, Strings.ReportHelper.OptionmaxloglinesLong, DEFAULT_LOGLINES.ToString()),
 
-                    new CommandLineArgument(OPTION_RESULT_FORMAT, CommandLineArgument.ArgumentType.Enumeration, Strings.ReportHelper.ResultFormatShort, Strings.ReportHelper.ResultFormatLong(Enum.GetNames(typeof(ResultExportFormat))), DEFAULT_EXPORT_FORMAT.ToString(), null, Enum.GetNames(typeof(ResultExportFormat))),
-                });
-            }
-        }
+            new CommandLineArgument(OPTION_RESULT_FORMAT, CommandLineArgument.ArgumentType.Enumeration, Strings.ReportHelper.ResultFormatShort, Strings.ReportHelper.ResultFormatLong(Enum.GetNames(typeof(ResultExportFormat))), DEFAULT_EXPORT_FORMAT.ToString(), null, Enum.GetNames(typeof(ResultExportFormat))),
+        ];
 
         protected override string SubjectOptionName => OPTION_SUBJECT;
         protected override string BodyOptionName => OPTION_BODY;
         protected override string ActionLevelOptionName => OPTION_SENDLEVEL;
         protected override string ActionOnAnyOperationOptionName => OPTION_SENDALL;
+        protected override string ActionOnOperationsOptionName => OPTION_SEND_OPERATIONS;
         protected override string LogLevelOptionName => OPTION_LOG_LEVEL;
         protected override string LogFilterOptionName => OPTION_LOG_FILTER;
         protected override string LogLinesOptionName => OPTION_MAX_LOG_LINES;
         protected override string ResultFormatOptionName => OPTION_RESULT_FORMAT;
+        protected override string ExtraDataOptionName => OPTION_EXTRA_PARAMETERS;
 
-		/// <summary>
-		/// This method is the interception where the module can interact with the execution environment and modify the settings.
-		/// </summary>
-		/// <param name="commandlineOptions">A set of commandline options passed to Duplicati</param>
-		protected override bool ConfigureModule(IDictionary<string, string> commandlineOptions)
+        /// <summary>
+        /// This method is the interception where the module can interact with the execution environment and modify the settings.
+        /// </summary>
+        /// <param name="commandlineOptions">A set of commandline options passed to Duplicati</param>
+        protected override bool ConfigureModule(IDictionary<string, string> commandlineOptions)
         {
             //We need at least a recipient
             commandlineOptions.TryGetValue(OPTION_RECIPIENT, out m_to);
@@ -190,8 +251,19 @@ namespace Duplicati.Library.Modules.Builtin
             if (string.IsNullOrEmpty(m_from))
                 m_from = DEFAULT_SENDER;
 
+            // As ParseBoolOption, where an option given without a value is set
+            m_acceptAnyCertificate = commandlineOptions.TryGetValue(OPTION_ACCEPT_ANY_CERTIFICATE, out var acceptAny) && Utility.Utility.ParseBool(acceptAny, true);
+            m_acceptSpecificCertificates = commandlineOptions.TryGetValue(OPTION_ACCEPT_SPECIFIED_CERTIFICATE, out var hashes) && !string.IsNullOrWhiteSpace(hashes)
+                ? hashes.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                : null;
+            m_ignoreRevocationFailure = commandlineOptions.TryGetValue(OPTION_IGNORE_REVOCATION_FAILURE, out var ignoreRevocation) && Utility.Utility.ParseBool(ignoreRevocation, true);
+            m_bodyHtml = commandlineOptions.TryGetValue(OPTION_BODY_HTML, out var bodyHtml) && Utility.Utility.ParseBool(bodyHtml, true);
+
             return true;
         }
+
+        /// <inheritdoc/>
+        protected override bool BodyIsHtml => m_bodyHtml;
 
         #endregion
 
@@ -205,15 +277,20 @@ namespace Duplicati.Library.Modules.Builtin
         protected override void SendMessage(string subject, string body)
         {
             var message = new MimeMessage();
-            MailboxAddress mailbox;
-            foreach (string s in m_to.Split(new[] { "," }, StringSplitOptions.RemoveEmptyEntries))
+            MailboxAddress? mailbox;
+            foreach (var s in (m_to ?? "").Split(new[] { "," }, StringSplitOptions.RemoveEmptyEntries))
                 if (MailboxAddress.TryParse(s.Replace("\"", ""), out mailbox))
                     message.To.Add(mailbox);
+                else
+                    Log.WriteWarningMessage(LOGTAG, "SendMailInvalidRecipient", null, Strings.SendMail.InvalidRecipient(s));
+
+            if (!message.To.Any())
+                throw new ArgumentException(Strings.SendMail.NoRecipientsSpecified(OPTION_RECIPIENT));
 
             var mailboxToFirst = (MailboxAddress)message.To.First();
             string toMailDomain = mailboxToFirst.Address.Substring(mailboxToFirst.Address.LastIndexOf("@", StringComparison.Ordinal) + 1);
 
-            string from = m_from.Trim().Replace("\"", "");
+            var from = (m_from ?? "").Trim().Replace("\"", "");
             if (from.IndexOf('@') < 0)
             {
                 if (from.EndsWith(">", StringComparison.Ordinal))
@@ -226,47 +303,15 @@ namespace Duplicati.Library.Modules.Builtin
                 message.From.Add(mailbox);
 
             message.Subject = subject;
-            message.Body = new TextPart("plain") { Text = body, ContentTransferEncoding = ContentEncoding.EightBit };
+            message.Body = new TextPart(m_bodyHtml ? "html" : "plain") { Text = body, ContentTransferEncoding = ContentEncoding.EightBit };
 
-            List<string> servers = null;
+            List<string>? servers = null;
             if (string.IsNullOrEmpty(m_server))
             {
-                var dnslite = new DnsLib.DnsLite();
-                var dnslist = new List<string>();
+                var dnsclient = new LookupClient();
+                var records = dnsclient.Query(toMailDomain, QueryType.MX).Answers.MxRecords();
 
-                //Grab all IPv4 addresses
-                foreach (NetworkInterface networkInterface in NetworkInterface.GetAllNetworkInterfaces())
-                    try
-                    {
-                        foreach (IPAddress dnsAddress in networkInterface.GetIPProperties().DnsAddresses)
-                            if (dnsAddress.AddressFamily == AddressFamily.InterNetwork)
-                                dnslist.Add(dnsAddress.ToString());
-                    }
-                    catch (Exception ex) { Logging.Log.WriteExplicitMessage(LOGTAG, "DNSServerLookupFailure", ex, "Failed to get DNS servers from network interface"); }
-
-                dnslist = dnslist.Distinct().ToList();
-
-                // If we have no DNS servers, try Google and OpenDNS
-                if (dnslist.Count == 0)
-                {
-                    // https://developers.google.com/speed/public-dns/
-                    dnslist.Add("8.8.8.8");
-                    dnslist.Add("8.8.4.4");
-
-                    //http://www.opendns.com/opendns-ip-addresses/
-                    dnslist.Add("208.67.222.222");
-                    dnslist.Add("208.67.220.220");
-                }
-
-                var records = new List<MXRecord>();
-                foreach (var s in dnslist)
-                {
-                    var res = dnslite.getMXRecords(toMailDomain, s);
-                    if (res != null)
-                        records.AddRange(res.OfType<MXRecord>());
-                }
-
-                servers = records.OrderBy(record => record.preference).Select(x => "smtp://" + x.exchange).Distinct().ToList();
+                servers = records.OrderBy(record => record.Preference).Select(x => "smtp://" + x.Exchange).Distinct().ToList();
                 if (servers.Count == 0)
                     throw new IOException(Strings.SendMail.FailedToLookupMXServer(OPTION_SERVER));
             }
@@ -278,8 +323,8 @@ namespace Duplicati.Library.Modules.Builtin
                            select srv).Distinct().ToList();
             }
 
-            Exception lastEx = null;
-            string lastServer = null;
+            Exception? lastEx = null;
+            string? lastServer = null;
 
             foreach (var server in servers)
             {
@@ -289,13 +334,21 @@ namespace Duplicati.Library.Modules.Builtin
                 lastServer = server;
                 try
                 {
-                    using (MemoryStream ms = new MemoryStream())
+                    using (var ms = new MemoryStream())
                     {
                         try
                         {
                             using (var client = new SmtpClient(new MailKit.ProtocolLogger(ms)))
                             {
                                 client.Timeout = (int)TimeSpan.FromMinutes(1).TotalMilliseconds;
+
+                                // Without any of the certificate options, MailKit validates the certificate as before
+                                if (m_acceptAnyCertificate || m_acceptSpecificCertificates != null || m_ignoreRevocationFailure)
+                                {
+                                    client.ServerCertificateValidationCallback = new Utility.SslCertificateValidator(m_acceptAnyCertificate, m_acceptSpecificCertificates, m_ignoreRevocationFailure).ValidateServerCertificate;
+                                    // The revocation status is then fetched by the validator, if at all
+                                    client.CheckCertificateRevocation = false;
+                                }
 
                                 // Backward compatibility fix for setup prior to using MailKit
                                 var uri = new System.Uri(server);

@@ -1,0 +1,478 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using Duplicati.Library.Interface;
+using Duplicati.Library.Backend.SMB;
+using Duplicati.Library.Backend.SMB.Model;
+using SMBLibrary;
+using Duplicati.Library.SourceProvider;
+using System.Runtime.CompilerServices;
+using Duplicati.Library.Common.IO;
+using Duplicati.Library.Utility.Options;
+using Duplicati.Library.Utility;
+
+[assembly: InternalsVisibleTo("Duplicati.UnitTest")]
+
+namespace Duplicati.Library.Backend;
+
+/// <summary>
+/// Native CIFS/SMB Backend implementation
+/// </summary>
+public class SMBBackend : IStreamingBackend, IFolderEnabledBackend, IRenameEnabledBackend, ILinkEnabledBackend, IFolderDeleteEnabledBackend
+{
+    /// <inheritdoc/>
+    public virtual string ProtocolKey => "smb";
+
+    /// <inheritdoc/>
+    // The casing rules are those of the share, which is not known
+    public bool HasCaseSensitivePaths => false;
+
+    /// <inheritdoc/>
+    public virtual string DisplayName => Strings.SMBBackend.DisplayName;
+
+    /// <inheritdoc/>
+    public virtual string Description => Strings.SMBBackend.Description;
+
+    /// <inheritdoc/>
+    public virtual bool SupportsStreaming => true;
+
+    /// <summary>
+    /// Hostname only (no ports or paths) to be used on DNS resolutions.
+    /// </summary>
+    private string _DnsName;
+
+    /// <summary>
+    /// Path separators (both Windows \ and unix /) to be used in path manipulation
+    /// </summary>
+    private static readonly char[] PATH_SEPARATORS = ['/', '\\'];
+
+    /// <summary>
+    /// Cache of parsed connection parameters
+    /// </summary>
+    private readonly SMBConnectionParameters _connectionParameters;
+
+    /// <summary>
+    /// Timeout options to be used in the backend
+    /// </summary>
+    private readonly TimeoutOptionsHelper.Timeouts _timeouts;
+
+    /// <summary>
+    /// Shared connection between all methods to avoid re-authentication
+    /// </summary>
+    private SMBShareConnection? _sharedConnection;
+
+    /// <summary>
+    /// Creates the connection; replaced by tests that have no server
+    /// </summary>
+    internal Func<CancellationToken, Task<SMBShareConnection>>? ConnectionFactory { get; init; }
+
+    /// <summary>
+    /// Read buffer size for SMB operations (will be capped automatically by SMB negotiated values)
+    /// </summary>
+    private const string READ_BUFFER_SIZE_OPTION = "read-buffer-size";
+
+    /// <summary>
+    /// Write buffer size for SMB operations (will be capped automatically by SMB negotiated values)
+    /// </summary>
+    private const string WRITE_BUFFER_SIZE_OPTION = "write-buffer-size";
+
+    /// <summary>
+    /// Backend option for controlling the transport (directtcp or netbios)
+    /// </summary>
+    private const string TRANSPORT_OPTION = "transport";
+
+    /// <summary>
+    /// Domain (complementary part of authentication) option
+    /// </summary>
+    private const string AUTH_DOMAIN_OPTION = "auth-domain";
+
+    /// <summary>
+    /// Option to offer the SMB 3.1.1 dialect, which SMBLibrary leaves off by default
+    /// </summary>
+    private const string ENABLE_SMB311_OPTION = "enable-smb311";
+
+    /// <summary>
+    /// Defines the default transport to be used in CIFS connection
+    /// </summary>
+    private const string DEFAULT_TRANSPORT = "directtcp";
+
+    /// <summary>
+    /// Mapping of transport string to SMBTransportType enum to be used in parsing the option string
+    /// </summary>
+    private readonly Dictionary<string, SMBTransportType> _transportMap = new()
+    {
+        ["directtcp"] = SMBTransportType.DirectTCPTransport,
+        ["netbios"] = SMBTransportType.NetBiosOverTCP
+    };
+
+    /// <summary>
+    /// Empty constructor is required for the backend to be loaded by the backend factory
+    /// </summary>
+    public SMBBackend()
+    {
+        _DnsName = null!;
+        _connectionParameters = null!;
+        _timeouts = null!;
+    }
+
+    /// <summary>
+    /// The parts of an smb url that the backend configures itself from.
+    /// </summary>
+    /// <param name="Host">The server to connect to. An IPv6 literal keeps its brackets.</param>
+    /// <param name="ShareName">The share, which is the first segment of the url path.</param>
+    /// <param name="Path">The path inside the share, without a trailing slash.</param>
+    /// <param name="Username">The user from the url, or null when it has none.</param>
+    /// <param name="Password">The password from the url, or null when it has none.</param>
+    internal readonly record struct SmbUrl(string Host, string ShareName, string Path, string? Username, string? Password);
+
+    /// <summary>
+    /// Splits an smb url into the parts the backend needs.
+    /// </summary>
+    /// <param name="url">The url to split.</param>
+    /// <returns>The parts the backend needs.</returns>
+    internal static SmbUrl ParseSmbUrl(string url)
+    {
+        var uri = new Uri(url);
+        uri.RequireHost(url);
+        uri.RequireNoFragment(url);
+
+        // The path arrives escaped and with its leading separator, where the previous
+        // parser handed it over decoded and without one. Decoding first keeps an
+        // encoded separator in the place it used to land in.
+        var path = Uri.UnescapeDataString(uri.AbsolutePath);
+        if (path.StartsWith("/", StringComparison.Ordinal))
+            path = path.Substring(1);
+
+        // The user info is not decoded, so it is decoded here.
+        var userinfo = uri.UserInfo.Split(new[] { ':' }, 2);
+        var username = userinfo.Length > 0 && userinfo[0].Length > 0 ? Uri.UnescapeDataString(userinfo[0]) : null;
+        var password = userinfo.Length > 1 ? Uri.UnescapeDataString(userinfo[1]) : null;
+
+        var input = path.TrimEnd('/');
+        var slashIndex = input.IndexOf('/');  // Find first slash to separate share and path if present.
+
+        return new SmbUrl(
+            uri.Host,
+            slashIndex >= 0 ? input[..slashIndex] : input,
+            slashIndex >= 0 ? input[(slashIndex + 1)..] : "",
+            username,
+            password);
+    }
+
+    /// <summary>
+    /// Actual constructor for the backend that accepts the url and options
+    /// </summary>
+    /// <param name="url">URL in Duplicati Uri format</param>
+    /// <param name="options">options to be used in the backend</param>
+    public SMBBackend(string url, Dictionary<string, string?> options)
+    {
+        if (string.IsNullOrEmpty(url))
+            throw new ArgumentNullException(nameof(url));
+        if (options == null)
+            throw new ArgumentNullException(nameof(options));
+
+        var uri = ParseSmbUrl(url);
+        _DnsName = uri.Host;
+
+        var auth = AuthOptionsHelper.Parse(options, uri.Username, uri.Password);
+        var authDomain = options.GetValueOrDefault(AUTH_DOMAIN_OPTION);
+        var transport = options.GetValueOrDefault(TRANSPORT_OPTION);
+
+        int? readBufferSize = null, writeBufferSize = null;
+
+        var readBufferSizeConfig = options.GetValueOrDefault(READ_BUFFER_SIZE_OPTION);
+        if (!string.IsNullOrWhiteSpace(readBufferSizeConfig))
+            readBufferSize = int.TryParse(readBufferSizeConfig, out int value) ? value : null;
+
+        var writeBufferSizeConfig = options.GetValueOrDefault(WRITE_BUFFER_SIZE_OPTION);
+        if (!string.IsNullOrWhiteSpace(writeBufferSizeConfig))
+            writeBufferSize = int.TryParse(writeBufferSizeConfig, out int value) ? value : null;
+
+        // Normalize to 10KB minimum buffers size
+        readBufferSize = readBufferSize < 1024 * 10 ? null : readBufferSize;
+        writeBufferSize = writeBufferSize < 1024 * 10 ? null : writeBufferSize;
+
+        var transportType = _transportMap.TryGetValue(
+            string.IsNullOrEmpty(transport) ? DEFAULT_TRANSPORT : transport.ToLower(),
+            out SMBTransportType type)
+            ? type
+            : throw new UserInformationException($"Transport must be one of: {string.Join(", ", _transportMap.Keys)}", "CIFSConfig");
+
+        _timeouts = TimeoutOptionsHelper.Parse(options);
+        _connectionParameters = new SMBConnectionParameters(
+            _DnsName,
+            transportType,
+            uri.ShareName,
+            uri.Path,
+            authDomain,
+            auth.Username,
+            auth.Password,
+            readBufferSize,
+            writeBufferSize,
+            Utility.Utility.ParseBoolOption(options, ENABLE_SMB311_OPTION)
+        );
+    }
+
+    /// <summary>
+    /// Implementation of interface property to return supported command parameters
+    /// </summary>
+    public IList<ICommandLineArgument> SupportedCommands =>
+        [
+            .. AuthOptionsHelper.GetOptions(),
+            new CommandLineArgument(AUTH_DOMAIN_OPTION, CommandLineArgument.ArgumentType.String, Strings.SMBBackend.DescriptionAuthDomainShort, Strings.SMBBackend.DescriptionAuthDomainLong),
+            new CommandLineArgument(TRANSPORT_OPTION, CommandLineArgument.ArgumentType.Enumeration, Strings.Options.TransportShort, Strings.Options.TransportLong, DEFAULT_TRANSPORT, null, _transportMap.Keys.ToArray()),
+            new CommandLineArgument(ENABLE_SMB311_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.EnableSMB311Short, Strings.Options.EnableSMB311Long, "false"),
+            new CommandLineArgument(READ_BUFFER_SIZE_OPTION, CommandLineArgument.ArgumentType.String, Strings.Options.DescriptionReadBufferSizeShort, Strings.Options.DescriptionReadBufferSizeLong),
+            new CommandLineArgument(WRITE_BUFFER_SIZE_OPTION, CommandLineArgument.ArgumentType.String, Strings.Options.DescriptionWriteBufferSizeShort, Strings.Options.DescriptionWriteBufferSizeLong),
+            .. TimeoutOptionsHelper.GetOptions()
+        ];
+
+    /// <summary>
+    /// Implementation of interface method for listing remote folder contents
+    /// </summary>
+    /// <returns>List of IFileEntry with directory listing result</returns>
+    public async IAsyncEnumerable<IFileEntry> ListAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var v in await con.ListAsync(_connectionParameters.Path, cancellationToken).ConfigureAwait(false))
+            yield return v;
+    }
+
+    /// <summary>
+    /// Upload files to remote location
+    /// </summary>
+    /// <param name="remotename">Filename at remote location</param>
+    /// <param name="localname">Filename to read from</param>
+    /// <param name="cancellationToken">CancellationToken that is combined with internal timeout token</param>
+    /// <exception cref="FileMissingException">FileMissingException when file is not found</exception>
+    /// <exception cref="Exception">Exceptions arising from either code execution</exception>
+    public async Task PutAsync(string remotename, string localname, CancellationToken cancellationToken)
+    {
+        await using var fs = File.Open(localname,
+            FileMode.Open, FileAccess.Read, FileShare.Read);
+        await PutAsync(remotename, fs, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Upload files to remote location
+    /// </summary>
+    /// <param name="remotename">Filename at remote location</param>
+    /// <param name="input">Stream to read from</param>
+    /// <param name="cancellationToken">CancellationToken that is combined with internal timeout token</param>
+    /// <exception cref="FileMissingException">FileMissingException when file is not found</exception>
+    /// <exception cref="Exception">Exceptions arising from either code execution</exception>
+    public async Task PutAsync(string remotename, Stream input, CancellationToken cancellationToken)
+    {
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await con.PutAsync(remotename, input, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Download files from remote
+    /// </summary>
+    /// <param name="remotename">Filename at remote location</param>
+    /// <param name="localname">Local filename to write to</param>
+    /// <param name="cancellationToken">CancellationToken that is combined with internal timeout token</param>
+    /// <exception cref="FileMissingException">FileMissingException when file is not found</exception>
+    /// <exception cref="Exception">Exceptions arising from either code execution or FileMissingException</exception>
+    public async Task GetAsync(string remotename, string localname, CancellationToken cancellationToken)
+    {
+        await using var fs = File.Open(localname,
+            FileMode.Create, FileAccess.Write,
+            FileShare.None);
+        await GetAsync(remotename, fs, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Download files from remote
+    /// </summary>
+    /// <param name="remotename">Filename at remote location</param>
+    /// <param name="output">Destination stream to write to</param>
+    /// <param name="cancellationToken">CancellationToken that is combined with internal timeout token</param>
+    /// <exception cref="FileMissingException">FileMissingException when file is not found</exception>
+    /// <exception cref="Exception">Exceptions arising from either code execution or FileMissingException</exception>
+    public async Task GetAsync(string remotename, Stream output, CancellationToken cancellationToken)
+    {
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await con.GetAsync(remotename, output, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Delete remote file if it exists, if not, throws FileMissingException
+    /// </summary>
+    /// <param name="remotename">filename to be deleted on the remote</param>
+    /// <param name="cancellationToken">CancellationToken that is combined with internal timeout token</param>
+    /// <returns></returns>
+    /// <exception cref="FileMissingException">FileMissingException when file is not found</exception>
+    /// <exception cref="Exception">Exceptions arising from either code execution or business logic errors</exception>
+    public async Task DeleteAsync(string remotename, CancellationToken cancellationToken)
+    {
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await con.DeleteAsync(remotename, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Implementation of interface function to return hosnames used by the backend
+    /// </summary>
+    /// <param name="cancellationToken">CancellationToken, in this call not used.</param>
+    /// <returns></returns>
+    public Task<string[]> GetDNSNamesAsync(CancellationToken cancellationToken) =>
+        Task.FromResult(new[] { _DnsName ?? string.Empty });
+
+    /// <summary>
+    /// Tests backend connectivity by verifying the configured path exists
+    /// </summary>
+    /// <param name="cancellationToken">The cancellation token (not used)</param>
+    /// <exception cref="FolderMissingException">Thrown when configured path does not exist</exception>
+    public Task TestAsync(bool alsoWrite, CancellationToken cancellationToken)
+        => this.TestBackendAsync(alsoWrite, cancellationToken);
+
+    /// <summary>
+    /// Creates the configured remote folder path if it doesn't exist
+    /// </summary>
+    /// <param name="cancellationToken">CancellationToken that will be combined with internal timeout token</param>
+    /// <returns>Task representing the asynchronous operation</returns>
+    /// <exception cref="Exception">Thrown when folder creation fails</exception>
+    public async Task CreateFolderAsync(CancellationToken cancellationToken)
+    {
+        var pathParts = _connectionParameters.Path?
+            .Split(PATH_SEPARATORS, StringSplitOptions.RemoveEmptyEntries);
+
+        if (pathParts == null || pathParts.Length == 0)
+            return;
+
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await con.CreateFolderAsync(_connectionParameters.Path ?? "", cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gets or creates a shared SMB connection
+    /// </summary>
+    /// <returns>An SMB connection that can be used for file operations</returns>
+    private async Task<SMBShareConnection> GetConnectionAsync(CancellationToken cancellationToken)
+    {
+        // A connection is closed for good when an operation on it timed out
+        if (_sharedConnection?.IsBroken == true)
+        {
+            _sharedConnection.Dispose();
+            _sharedConnection = null;
+        }
+
+        return _sharedConnection ??= await (ConnectionFactory?.Invoke(cancellationToken) ?? SMBShareConnection.CreateAsync(_connectionParameters, _timeouts, cancellationToken)).ConfigureAwait(false);
+    }
+
+
+
+    /// <summary>
+    /// Implementation of Dispose pattern enforced by interface
+    /// </summary>
+    public void Dispose()
+    {
+        try
+        {
+            _sharedConnection?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            // Log the exception but don't rethrow since we're in Dispose
+            System.Diagnostics.Debug.WriteLine($"Error disposing CIFS connection: {ex.Message}");
+        }
+    }
+
+    /// <inheritdoc/>
+    public async IAsyncEnumerable<IFileEntry> ListAsync(string? path, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var sourcePath = _connectionParameters.Path;
+        if (!string.IsNullOrWhiteSpace(sourcePath))
+            sourcePath = Util.AppendDirSeparator(sourcePath, "/");
+
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var v in await con.ListAsync(sourcePath + BackendSourceFileEntry.NormalizePathTo(path, '/'), cancellationToken).ConfigureAwait(false))
+            if (v.Name != "." && v.Name != "..")
+                yield return v;
+    }
+
+    /// <inheritdoc/>
+    public async Task RenameAsync(string oldname, string newname, CancellationToken cancellationToken)
+    {
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await con.RenameAsync(oldname, newname, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task DeleteFolderRecursiveAsync(string path, CancellationToken cancellationToken)
+    {
+        // Only a relative path below the configured folder is accepted, so the delete
+        // cannot reach the configured folder itself or anything outside it.
+        var segments = (path ?? "").Split('/');
+        if (string.IsNullOrWhiteSpace(path) || path.StartsWith('/') || segments.Any(x => x is "" or "." or ".." || x.Contains('\\')))
+            throw new ArgumentException($"Refusing to delete the folder \"{path}\"", nameof(path));
+
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await DeleteTreeAsync(con, path, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Deletes a folder after deleting everything below it.
+    /// </summary>
+    /// <param name="con">The connection</param>
+    /// <param name="folder">The folder, relative to the configured path</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    private async Task DeleteTreeAsync(SMBShareConnection con, string folder, CancellationToken cancellationToken)
+    {
+        var children = new List<(string Path, bool IsFolder)>();
+        await foreach (var entry in ListAsync(folder, cancellationToken).ConfigureAwait(false))
+        {
+            var name = entry.Name.TrimEnd('/', '\\');
+            if (!string.IsNullOrEmpty(name))
+                children.Add((folder + "/" + name, entry.IsFolder));
+        }
+
+        foreach (var (childPath, isFolder) in children)
+        {
+            if (isFolder)
+                await DeleteTreeAsync(con, childPath, cancellationToken).ConfigureAwait(false);
+            else
+                await con.DeleteAsync(childPath, cancellationToken).ConfigureAwait(false);
+        }
+
+        await con.DeleteDirectoryAsync(folder, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task CreateHardLinkAsync(string existingName, string targetName, CancellationToken cancellationToken)
+    {
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await con.CreateHardLinkAsync(existingName, targetName, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task<IFileEntry?> GetEntryAsync(string path, CancellationToken cancellationToken)
+    {
+        var sourcePath = _connectionParameters.Path;
+        if (!string.IsNullOrWhiteSpace(sourcePath))
+            sourcePath = Util.AppendDirSeparator(sourcePath, "/");
+
+        var con = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        return await con.GetEntryAsync(sourcePath + BackendSourceFileEntry.NormalizePathTo(path, '/'), cancellationToken).ConfigureAwait(false);
+    }
+}

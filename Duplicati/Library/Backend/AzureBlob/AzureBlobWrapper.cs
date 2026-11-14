@@ -1,33 +1,36 @@
-#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 // 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
 // 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
 // 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-#endregion
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
 
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
+using Azure;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using System.Runtime.CompilerServices;
 using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
+using Duplicati.Library.Utility.Options;
 using Duplicati.Library.Utility;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
+using Azure.Core.Pipeline;
+using Duplicati.StreamUtil;
+
+[assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
 namespace Duplicati.Library.Backend.AzureBlob
 {
@@ -36,121 +39,354 @@ namespace Duplicati.Library.Backend.AzureBlob
     /// </summary>
     public class AzureBlobWrapper
     {
-        private readonly string _containerName;
-        private readonly CloudBlobContainer _container;
+        private readonly BlobContainerClient _container;
+        private readonly TimeoutOptionsHelper.Timeouts _timeouts;
+        private readonly IReadOnlySet<AccessTier> _archiveClasses;
+        private readonly AccessTier? _accessTier;
 
+        /// <summary>
+        /// The size of each request that uploads a file. Each request must finish within the
+        /// read-write timeout, so a file is sent in blocks of this size rather than in a single request.
+        /// </summary>
+        private readonly long _uploadBlockSize;
+
+        /// <summary>
+        /// The blob name prefix from the backend URL path, ending with a '/' when
+        /// non-empty. All blob names are prefixed with this value so a backend URL
+        /// of azure://container/some/folder stores blobs under "some/folder/".
+        /// </summary>
+        private readonly string _prefix;
+
+        /// <summary>
+        /// Gets an array of DNS names associated with the blob container.
+        /// </summary>
+        /// <returns>An array of DNS hostnames for the primary and secondary URIs of the container.</returns>
         public string[] DnsNames
         {
             get
             {
                 var lst = new List<string>();
-                if (_container != null)
-                {
-                    if (_container.Uri != null)
-                        lst.Add(_container.Uri.Host);
-
-                    if (_container.StorageUri != null)
-                    {
-                        if (_container.StorageUri.PrimaryUri != null)
-                            lst.Add(_container.StorageUri.PrimaryUri.Host);
-                        if (_container.StorageUri.SecondaryUri != null)
-                            lst.Add(_container.StorageUri.SecondaryUri.Host);
-                    }
-                }
-
+                if (_container != null && _container.Uri != null) lst.Add(_container.Uri.Host);
                 return lst.ToArray();
             }
         }
 
-        public AzureBlobWrapper(string accountName, string accessKey, string sasToken, string containerName)
+        /// <summary>
+        /// Initializes a new instance of the AzureBlobWrapper class.
+        /// </summary>
+        /// <param name="accountName">The Azure storage account name.</param>
+        /// <param name="accessKey">The access key for the storage account.</param>
+        /// <param name="sasToken">The Shared Access Signature (SAS) token for authentication.</param>
+        /// <param name="containerName">The name of the blob container.</param>
+        /// <param name="prefix">The blob name prefix from the URL path; empty or ending with '/'.</param>
+        /// <param name="accessTier">The access tier assigned to blobs on upload.</param>
+        /// <param name="archiveClasses">The storage classes that are considered archive classes.</param>
+        /// <param name="timeouts">The timeout options.</param>
+        /// <param name="maxRetries">The maximum number of retries for Azure operations.</param>
+        /// <param name="uploadBlockSize">The size of each block sent when uploading a file.</param>
+        public AzureBlobWrapper(string accountName, string? accessKey, string? sasToken, string containerName, string prefix, AccessTier? accessTier, IReadOnlySet<AccessTier> archiveClasses, TimeoutOptionsHelper.Timeouts timeouts, int maxRetries, long uploadBlockSize)
+            : this(accountName, accessKey, sasToken, containerName, prefix, accessTier, archiveClasses, timeouts, maxRetries, uploadBlockSize, null)
         {
-            OperationContext.GlobalSendingRequest += (sender, args) =>
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the AzureBlobWrapper class that sends its requests through the
+        /// supplied handler, so the responses can be stubbed in tests.
+        /// </summary>
+        /// <param name="accountName">The Azure storage account name.</param>
+        /// <param name="accessKey">The access key for the storage account.</param>
+        /// <param name="sasToken">The Shared Access Signature (SAS) token for authentication.</param>
+        /// <param name="containerName">The name of the blob container.</param>
+        /// <param name="prefix">The blob name prefix from the URL path; empty or ending with '/'.</param>
+        /// <param name="accessTier">The access tier assigned to blobs on upload.</param>
+        /// <param name="archiveClasses">The storage classes that are considered archive classes.</param>
+        /// <param name="timeouts">The timeout options.</param>
+        /// <param name="maxRetries">The maximum number of retries for Azure operations.</param>
+        /// <param name="uploadBlockSize">The size of each block sent when uploading a file.</param>
+        /// <param name="handler">The handler that sends the requests, or null to use the default.</param>
+        internal AzureBlobWrapper(string accountName, string? accessKey, string? sasToken, string containerName, string prefix, AccessTier? accessTier, IReadOnlySet<AccessTier> archiveClasses, TimeoutOptionsHelper.Timeouts timeouts, int maxRetries, long uploadBlockSize, HttpMessageHandler? handler)
+        {
+            BlobServiceClient blobServiceClient;
+            var maxTicks = timeouts.ReadWriteTimeout.Ticks - TimeSpan.FromSeconds(1).Ticks;
+
+            // If not infinite, then share the timeout across retries
+            var delay = maxTicks <= 0
+                ? TimeSpan.FromSeconds(1)
+                : TimeSpan.FromTicks(maxTicks / Math.Max(1, maxRetries));
+
+            var maxDelay = maxTicks <= 0
+                ? TimeSpan.FromSeconds(10)
+                : TimeSpan.FromTicks(maxTicks);
+
+            var httpClient = handler == null ? new HttpClient() : new HttpClient(handler);
+            httpClient.Timeout = Timeout.InfiniteTimeSpan;
+
+            var blobServiceOptions = new BlobClientOptions()
             {
-                args.Request.UserAgent = string.Format(
-                    "APN/1.0 Duplicati/{0} AzureBlob/2.0 {1}",
-                    System.Reflection.Assembly.GetExecutingAssembly().GetName().Version,
-                    Microsoft.WindowsAzure.Storage.Shared.Protocol.Constants.HeaderConstants.UserAgent
-                );
+                Retry =
+                {
+                    MaxRetries = maxRetries,
+                    Mode = Azure.Core.RetryMode.Exponential,
+                    Delay = delay,
+                    MaxDelay = maxDelay
+                },
+                Transport = new HttpClientTransport(httpClient)
             };
 
-            string connectionString;
             if (sasToken != null)
             {
-                connectionString = string.Format("DefaultEndpointsProtocol=https;AccountName={0};SharedAccessSignature={1}",
-                    accountName, sasToken);
+                var sasUri = new Uri($"https://{accountName}.blob.core.windows.net/?{sasToken}");
+                blobServiceClient = new BlobServiceClient(sasUri, blobServiceOptions);
             }
             else
             {
-                connectionString = string.Format("DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1}",
-                            accountName, accessKey);
+                var connectionString = $"DefaultEndpointsProtocol=https;AccountName={accountName};AccountKey={accessKey};EndpointSuffix=core.windows.net";
+                blobServiceClient = new BlobServiceClient(connectionString, blobServiceOptions);
             }
 
-            var storageAccount = CloudStorageAccount.Parse(connectionString);
-            var blobClient = storageAccount.CreateCloudBlobClient();
-
-            _containerName = containerName;
-            _container = blobClient.GetContainerReference(containerName);
+            _accessTier = accessTier;
+            _archiveClasses = archiveClasses;
+            _container = blobServiceClient.GetBlobContainerClient(containerName);
+            _prefix = prefix ?? "";
+            _timeouts = timeouts;
+            _uploadBlockSize = uploadBlockSize;
         }
 
-        public void AddContainer()
+        /// <summary>
+        /// Creates a new blob container asynchronously and sets its access permissions to private.
+        /// </summary>
+        /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
+        /// <returns>A task that represents the asynchronous operation.</returns>
+        public async Task AddContainerAsync(CancellationToken cancellationToken)
         {
-            _container.Create(BlobContainerPublicAccessType.Off);
+            await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, async ct =>
+                // Even though PublicAccessType.None is by default, we set it explicitly to highlight it.
+                await _container.CreateAsync(PublicAccessType.None, cancellationToken: ct).ConfigureAwait(false)
+            ).ConfigureAwait(false);
         }
 
-        public virtual void GetFileStream(string keyName, Stream target)
+        /// <summary>
+        /// Downloads a blob to a stream asynchronously.
+        /// </summary>
+        /// <param name="keyName">The name of the blob to download.</param>
+        /// <param name="target">The stream to download the blob to.</param>
+        /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
+        /// <returns>A task that represents the asynchronous download operation.</returns>
+        public async Task GetFileStreamAsync(string keyName, Stream target, CancellationToken cancellationToken)
         {
-            _container.GetBlockBlobReference(keyName).DownloadToStream(target);
+            var blobClient = _container.GetBlobClient(_prefix + keyName);
+            using var timeoutStream = target.ObserveWriteTimeout(_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
+            await blobClient.DownloadToAsync(timeoutStream, cancellationToken).ConfigureAwait(false);
         }
 
-        public virtual async Task AddFileStream(string keyName, Stream source, CancellationToken cancelToken)
+        /// <summary>
+        /// Uploads a stream to a blob asynchronously.
+        /// </summary>
+        /// <param name="keyName">The name to give the uploaded blob.</param>
+        /// <param name="source">The stream containing the data to upload.</param>
+        /// <param name="cancelToken">A token to monitor for cancellation requests.</param>
+        /// <returns>A task that represents the asynchronous upload operation.</returns>
+        public async Task AddFileStream(string keyName, Stream source, CancellationToken cancelToken)
         {
-            await _container.GetBlockBlobReference(keyName).UploadFromStreamAsync(source, cancelToken);
-        }
-
-        public void DeleteObject(string keyName)
-        {
-            _container.GetBlockBlobReference(keyName).DeleteIfExists();
-        }
-
-        public virtual List<IFileEntry> ListContainerEntries()
-        {
-            var listBlobItems = _container.ListBlobs(blobListingDetails: BlobListingDetails.Metadata);
-            try
+            var blobClient = _container.GetBlobClient(_prefix + keyName);
+            using var timeoutStream = source.ObserveReadTimeout(_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
+            var options = new BlobUploadOptions()
             {
-                return listBlobItems.Select(x =>
+                Conditions = null, // Overwrite any existing blob
+                AccessTier = _accessTier,
+                TransferOptions = new Azure.Storage.StorageTransferOptions
                 {
-                    var absolutePath = x.StorageUri.PrimaryUri.AbsolutePath;
-                    var containerSegment = string.Concat("/", _containerName, "/");
-                    var blobName = absolutePath.Substring(absolutePath.IndexOf(
-                        containerSegment, System.StringComparison.Ordinal) + containerSegment.Length);
+                    InitialTransferSize = _uploadBlockSize,
+                    MaximumTransferSize = _uploadBlockSize,
+                    // One block at a time, as the uploads of several files already share the bandwidth
+                    MaximumConcurrency = 1
+                }
+            };
 
-                    try
-                    {
-                        if (x is CloudBlockBlob cb)
-                        {
-                            var lastModified = new System.DateTime();
-                            if (cb.Properties.LastModified != null)
-                                lastModified = new System.DateTime(cb.Properties.LastModified.Value.Ticks, System.DateTimeKind.Utc);
-                            return new FileEntry(Uri.UrlDecode(blobName.Replace("+", "%2B")), cb.Properties.Length, lastModified, lastModified);
-                        }
-                    }
-                    catch
-                    {
-                        // If the metadata fails to parse, return the basic entry
-                    }
+            await blobClient.UploadAsync(timeoutStream, options, cancelToken).ConfigureAwait(false);
+        }
 
-                    return new FileEntry(Uri.UrlDecode(blobName.Replace("+", "%2B")));
-                })
-                .Cast<IFileEntry>()
-                .ToList();
-            }
-            catch (StorageException ex)
+        /// <summary>
+        /// Deletes a blob if it exists asynchronously.
+        /// </summary>
+        /// <param name="keyName">The name of the blob to delete.</param>
+        /// <param name="cancelToken">A token to monitor for cancellation requests.</param>
+        public async Task DeleteObjectAsync(string keyName, CancellationToken cancelToken)
+        {
+            var blobClient = _container.GetBlobClient(_prefix + keyName);
+            await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, async ct =>
+                await blobClient.DeleteIfExistsAsync(cancellationToken: ct).ConfigureAwait(false)
+            ).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Copies a blob to a new name asynchronously.
+        /// </summary>
+        /// <param name="sourceKeyName">The name of the source blob.</param>
+        /// <param name="destinationKeyName">The name of the destination blob.</param>
+        /// <param name="cancelToken">A token to monitor for cancellation requests.</param>
+        /// <returns>A task that represents the asynchronous copy operation.</returns>
+        public async Task CopyFileAsync(string sourceKeyName, string destinationKeyName, CancellationToken cancelToken)
+        {
+            var sourceBlobClient = _container.GetBlobClient(_prefix + sourceKeyName);
+            var destinationBlobClient = _container.GetBlobClient(_prefix + destinationKeyName);
+
+            // Start the copy operation
+            var operation = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, async ct =>
+                await destinationBlobClient.StartCopyFromUriAsync(sourceBlobClient.Uri, cancellationToken: ct).ConfigureAwait(false)
+            ).ConfigureAwait(false);
+
+            // Wait for the copy to complete
+            await operation.WaitForCompletionAsync(cancelToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// List container files.
+        /// </summary>
+        /// <param name="cancelToken">A token to monitor for cancellation requests.</param>
+        /// <returns></returns>
+        /// <exception cref="FolderMissingException">Thrown when the container is not found</exception>
+        public virtual async IAsyncEnumerable<IFileEntry> ListContainerEntriesAsync([EnumeratorCancellation] CancellationToken cancelToken)
+        {
+            // Only list blobs below the prefix (if any), and strip the prefix from the
+            // returned names so callers see names relative to the bound URL path.
+            await using var blobEnumerator = _container.GetBlobsAsync(BlobTraits.None, BlobStates.None, string.IsNullOrEmpty(_prefix) ? null : _prefix, cancelToken).GetAsyncEnumerator(cancelToken);
+
+            while (true)
             {
-                if (ex.RequestInformation.HttpStatusCode == 404)
+                bool hasNext;
+
+                try
+                {
+                    hasNext = await Utility.Utility.WithTimeout(_timeouts.ListTimeout, cancelToken, async ct
+                        => await blobEnumerator.MoveNextAsync().ConfigureAwait(false)
+                    ).ConfigureAwait(false);
+                }
+                catch (Azure.RequestFailedException ex) when (ex.Status == 404)
                 {
                     throw new FolderMissingException(ex);
                 }
+
+                if (!hasNext) break;
+
+                cancelToken.ThrowIfCancellationRequested();
+
+                if (blobEnumerator.Current is { } blob)
+                {
+                    // Match and strip the prefix on the raw name, which is the
+                    // representation the server-side prefix filter operates on.
+                    // Decoding before comparing could drop blobs when the prefix
+                    // contains characters affected by the unescape step below.
+                    var rawName = blob.Name;
+                    if (!string.IsNullOrEmpty(_prefix))
+                    {
+                        if (!rawName.StartsWith(_prefix, StringComparison.Ordinal))
+                            continue;
+                        rawName = rawName.Substring(_prefix.Length);
+                    }
+                    var blobName = Uri.UnescapeDataString(rawName.Replace("+", "%2B"));
+                    var lastModified = blob.Properties.LastModified?.UtcDateTime ?? DateTime.UtcNow;
+                    var isArchive = blob.Properties.AccessTier.HasValue && _archiveClasses.Contains(blob.Properties.AccessTier.Value);
+
+                    yield return new FileEntry(
+                        blobName,
+                        blob.Properties.ContentLength ?? 0,
+                        lastModified,
+                        lastModified
+                    )
+                    {
+                        IsArchived = isArchive,
+                        IsFolder = false,
+                    };
+                }
+            }
+        }
+
+        public async Task<DateTime?> GetObjectLockUntilAsync(string keyName, CancellationToken cancellationToken)
+        {
+            var blobClient = _container.GetBlobClient(_prefix + keyName);
+
+            try
+            {
+                var properties = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, ct
+                    => blobClient.GetPropertiesAsync(cancellationToken: ct)
+                ).ConfigureAwait(false);
+
+                return properties.Value.ImmutabilityPolicy?.ExpiresOn?.UtcDateTime;
+            }
+            catch (RequestFailedException e) when (e.Status == 404
+                                                    || e.ErrorCode == BlobErrorCode.BlobNotFound
+                                                    || e.ErrorCode == BlobErrorCode.ResourceNotFound)
+            {
+                throw new FileMissingException(e.Message, e);
+            }
+            catch (RequestFailedException e) when (e.ErrorCode == BlobErrorCode.ContainerNotFound
+                                                    || e.ErrorCode == BlobErrorCode.ContainerBeingDeleted
+                                                    || e.ErrorCode == BlobErrorCode.ContainerDisabled)
+            {
+                throw new FolderMissingException(e.Message, e);
+            }
+        }
+
+        public async Task SetObjectLockUntilAsync(string keyName, DateTime lockUntilUtc, BlobImmutabilityPolicyMode policyMode, CancellationToken cancellationToken)
+        {
+            var blobClient = _container.GetBlobClient(_prefix + keyName);
+            var policy = new BlobImmutabilityPolicy
+            {
+                ExpiresOn = new DateTimeOffset(lockUntilUtc.ToUniversalTime(), TimeSpan.Zero),
+                PolicyMode = policyMode
+            };
+
+            try
+            {
+                var result = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, async ct
+                    => await blobClient.SetImmutabilityPolicyAsync(policy, cancellationToken: ct).ConfigureAwait(false)
+                ).ConfigureAwait(false);
+
+                if (result.Value.ExpiresOn == null)
+                    throw new Exception("Failed to set object lock, call succeeded but no immutability policy returned");
+            }
+            catch (RequestFailedException e) when (e.Status == 404
+                                                    || e.ErrorCode == BlobErrorCode.BlobNotFound
+                                                    || e.ErrorCode == BlobErrorCode.ResourceNotFound)
+            {
+                throw new FileMissingException(e.Message, e);
+            }
+            catch (RequestFailedException e) when (e.ErrorCode == BlobErrorCode.ContainerNotFound
+                                                    || e.ErrorCode == BlobErrorCode.ContainerBeingDeleted
+                                                    || e.ErrorCode == BlobErrorCode.ContainerDisabled)
+            {
+                throw new FolderMissingException(e.Message, e);
+            }
+            catch (RequestFailedException e)
+            {
+                // Azure has no dedicated error code for a container without version-level immutability,
+                // so ask the container whether the feature is enabled before reporting the failure
+                if (await IsImmutableStorageDisabledAsync(cancellationToken).ConfigureAwait(false))
+                    throw new ObjectLockNotSupportedException($"Version-level immutability is not enabled for container {_container.Name}: {e.Message}", e);
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// Checks if the container reports that version-level immutable storage is disabled
+        /// </summary>
+        /// <param name="cancellationToken">The cancellation token</param>
+        /// <returns><c>true</c> if the container reports the feature as disabled, <c>false</c> if it is enabled or the state cannot be determined</returns>
+        private async Task<bool> IsImmutableStorageDisabledAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var properties = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, ct
+                    => _container.GetPropertiesAsync(cancellationToken: ct)
+                ).ConfigureAwait(false);
+
+                return properties.Value.HasImmutableStorageWithVersioning == false;
+            }
+            catch
+            {
+                // Unable to determine the state, report the original error
+                return false;
             }
         }
     }

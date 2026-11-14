@@ -1,29 +1,36 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
-//
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-//
-#endregion
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
 
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using Duplicati.Library.Common.IO;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Snapshots.Windows;
+
+[assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
 namespace Duplicati.Library.Snapshots
 {
@@ -34,56 +41,149 @@ namespace Duplicati.Library.Snapshots
     /// The class presents all files and folders with their regular filenames to the caller,
     /// and internally handles the conversion to the shadow path.
     /// </summary>
+    [SupportedOSPlatform("windows")]
     public sealed class WindowsSnapshot : SnapshotBase
     {
-		/// <summary>
+        /// <summary>
+        /// The default snapshot provider
+        /// </summary>
+        public static readonly WindowsSnapshotProvider DEFAULT_WINDOWS_SNAPSHOT_PROVIDER = WindowsSnapshotProvider.Native;
+
+        /// <summary>
+        /// The default snapshot query provider
+        /// </summary>
+        public static readonly WindowsSnapshotProvider DEFAULT_WINDOWS_SNAPSHOT_QUERY_PROVIDER = WindowsSnapshotProvider.Native;
+
+        /// <summary>
+        /// The snapshot providers that require VC Redist to be installed
+        /// </summary>
+        public static readonly IReadOnlySet<WindowsSnapshotProvider> VCREDIST_PROVIDERS = new HashSet<WindowsSnapshotProvider>()
+        {
+            WindowsSnapshotProvider.AlphaVSS,
+            WindowsSnapshotProvider.Vanara
+        };
+
+        /// <summary>
+        /// The supported snapshot providers on this platform
+        /// </summary>
+        public static IReadOnlyList<WindowsSnapshotProvider> SUPPORTED_PROVIDERS =
+            RuntimeInformation.ProcessArchitecture == Architecture.Arm
+            || RuntimeInformation.ProcessArchitecture == Architecture.Arm64
+            || RuntimeInformation.ProcessArchitecture == Architecture.Armv6
+            ?
+            [
+                WindowsSnapshotProvider.Native,
+                WindowsSnapshotProvider.Wmi
+            ]
+            : Enum.GetValues<Snapshots.WindowsSnapshotProvider>();
+
+        /// <summary>
+        /// The provider ID of the Microsoft Software Shadow Copy provider,
+        /// used as a fallback when a third-party provider does not expose the snapshot
+        /// </summary>
+        public static readonly Guid MS_SOFTWARE_PROVIDER_ID = new Guid("{b5946137-7b9f-4925-af80-51abd60b20d5}");
+
+        /// <summary>
+        /// The VSS error for a shadow copy that cannot be created while another one is being created
+        /// </summary>
+        private const int VSS_E_SNAPSHOT_SET_IN_PROGRESS = unchecked((int)0x80042316);
+
+        /// <summary>
+        /// The time to wait before trying again, while another shadow copy is being created
+        /// </summary>
+        internal static TimeSpan SnapshotInProgressRetryDelay = TimeSpan.FromSeconds(10);
+
+        /// <summary>
         /// The tag used for logging messages
         /// </summary>
-		public static readonly string LOGTAG = Logging.Log.LogTagFromType<WindowsSnapshot>();
+        public static readonly string LOGTAG = Logging.Log.LogTagFromType<WindowsSnapshot>();
+
+        /// <summary>
+        /// The system IO for the current platform
+        /// </summary>
+        private static readonly ISystemIO IO_WIN = SystemIO.IO_OS;
+
+        /// <summary>
+        /// The name of the special system folder that is excluded from backups
+        /// </summary>
+        private const string SYSTEM_VOLUME_INFORMATION_FOLDER = "System Volume Information";
 
         /// <summary>
         /// The main reference to the backup controller
         /// </summary>
-        private readonly VssBackupComponents _vssBackupComponents;
+        private readonly SnapshotManager _snapshotManager;
+
+        /// <summary>
+        /// The source folders included in the snapshot, which are the entries that are enumerated
+        /// </summary>
+        private readonly IReadOnlyList<string> _sourceEntries;
+
+        /// <summary>
+        /// The paths that decide which volumes are snapshotted: the sources and the extra snapshot paths
+        /// </summary>
+        private readonly IReadOnlyList<string> _snapshotPaths;
+
+        /// <summary>
+        /// A flag indicating if alternate data streams should be backed up
+        /// </summary>
+        private readonly bool _enableAdsBackup;
+
+        /// <summary>
+        /// The factory used to create the snapshot provider
+        /// </summary>
+        private readonly Func<WindowsSnapshotProvider, TimeSpan, Guid, ISnapshotProvider> _providerFactory;
 
         /// <summary>
         /// Constructs a new backup snapshot, using all the required disks
         /// </summary>
-        /// <param name="sources">Sources to determine which volumes to include in snapshot</param>
+        /// <param name="sources">The sources, which are enumerated and determine which volumes to include in snapshot</param>
+        /// <param name="extraSnapshotPaths">Paths that are not sources, but must be readable through the snapshot; they only determine which volumes to include</param>
         /// <param name="options">A set of commandline options</param>
-        public WindowsSnapshot(IEnumerable<string> sources, IDictionary<string, string> options)
+        /// <param name="followSymlinks">A flag indicating if symlinks should be followed</param>
+        public WindowsSnapshot(IEnumerable<string> sources, IEnumerable<string> extraSnapshotPaths, IDictionary<string, string> options, bool followSymlinks)
+            : this(sources, extraSnapshotPaths, options, followSymlinks, WindowsShimLoader.GetSnapshotProvider)
         {
+        }
+
+        /// <summary>
+        /// Constructs a new backup snapshot, using all the required disks and a custom provider factory
+        /// </summary>
+        /// <param name="sources">The sources, which are enumerated and determine which volumes to include in snapshot</param>
+        /// <param name="extraSnapshotPaths">Paths that are not sources, but must be readable through the snapshot; they only determine which volumes to include</param>
+        /// <param name="options">A set of commandline options</param>
+        /// <param name="followSymlinks">A flag indicating if symlinks should be followed</param>
+        /// <param name="providerFactory">The factory used to create the snapshot provider</param>
+        internal WindowsSnapshot(IEnumerable<string> sources, IEnumerable<string> extraSnapshotPaths, IDictionary<string, string> options, bool followSymlinks, Func<WindowsSnapshotProvider, TimeSpan, Guid, ISnapshotProvider> providerFactory)
+            : base(followSymlinks)
+        {
+            _providerFactory = providerFactory;
+            _enableAdsBackup = Utility.Utility.ParseBoolOption(options.AsReadOnly(), "enable-ads-backup");
             // For Windows, ensure we don't store paths with extended device path prefixes (i.e., @"\\?\" or @"\\?\UNC\")
-            sources = sources.Select(SystemIOWindows.RemoveExtendedDevicePathPrefix);
+            _sourceEntries = sources.Select(SystemIOWindows.RemoveExtendedDevicePathPrefix).ToList();
+            _snapshotPaths = _sourceEntries.Concat(extraSnapshotPaths.Select(SystemIOWindows.RemoveExtendedDevicePathPrefix)).ToList();
+
+            var provider = Utility.Utility.ParseEnumOption(options.AsReadOnly(), "snapshot-provider", DEFAULT_WINDOWS_SNAPSHOT_PROVIDER);
+            var vssTimeout = Utility.Utility.ParseTimespanOption(options.AsReadOnly(), "vss-timeout", SnapshotManager.DefaultMaxWaitTime);
+            var useMapping = Utility.Utility.ParseBoolOption(options.AsReadOnly(), "vss-use-mapping");
+            var providerId = Utility.Utility.ParseGuidOption(options.AsReadOnly(), "vss-provider-id", Guid.Empty);
+
+            // Default to exclude the System State writer
+            var excludedWriters = new Guid[] { new Guid("{e8132975-6f93-4464-a53e-1050253ae220}") };
+            if (options.TryGetValue("vss-exclude-writers", out var excludedWritersString))
+            {
+                excludedWriters = excludedWritersString
+                    .Split(';')
+                    .Where(x => !string.IsNullOrWhiteSpace(x) && x.Trim().Length > 0)
+                    .Select(x => new Guid(x))
+                    .ToArray();
+            }
+
             try
             {
-                _vssBackupComponents = new VssBackupComponents();
-
-                // Default to exclude the System State writer
-                var excludedWriters = new Guid[] { new Guid("{e8132975-6f93-4464-a53e-1050253ae220}") };
-                if (options.ContainsKey("vss-exclude-writers"))
-                {
-                    excludedWriters = options["vss-exclude-writers"]
-                        .Split(';')
-                        .Where(x => !string.IsNullOrWhiteSpace(x) && x.Trim().Length > 0)
-                        .Select(x => new Guid(x))
-                        .ToArray();
-                }
-                _vssBackupComponents.SetupWriters(null, excludedWriters);
-
-                _vssBackupComponents.InitShadowVolumes(sources);
-
-                _vssBackupComponents.MapVolumesToSnapShots();
-
-                //If we should map the drives, we do that now and update the volumeMap
-                if (Utility.Utility.ParseBoolOption(options, "vss-use-mapping"))
-                {
-                    _vssBackupComponents.MapDrives();
-                }
+                _snapshotManager = CreateSnapshotManager(provider, vssTimeout, providerId, useMapping, excludedWriters);
             }
             catch (Exception ex1)
             {
-
                 Logging.Log.WriteVerboseMessage(LOGTAG, "WindowsSnapshotCreation", ex1, "Failed to initialize windows snapshot instance");
 
                 //In case we fail in the constructor, we do not want a snapshot to be active
@@ -91,12 +191,179 @@ namespace Duplicati.Library.Snapshots
                 {
                     Dispose();
                 }
-				catch(Exception ex2)
+                catch (Exception ex2)
                 {
-					Logging.Log.WriteVerboseMessage(LOGTAG, "VSSCleanupOnError", ex2, "Failed during VSS error cleanup");
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "VSSCleanupOnError", ex2, "Failed during VSS error cleanup");
                 }
 
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// Creates a snapshot manager and creates the snapshot.
+        /// Only one shadow copy can be created at a time, so while another program is creating
+        /// one, the snapshot is tried again until the VSS timeout has passed.
+        /// </summary>
+        /// <param name="provider">The snapshot provider implementation</param>
+        /// <param name="vssTimeout">The maximum time to wait for asynchronous VSS operations</param>
+        /// <param name="providerId">The VSS provider to use, or an empty GUID for automatic selection</param>
+        /// <param name="useMapping">Whether to map snapshot volumes to drive letters</param>
+        /// <param name="excludedWriters">The VSS writers to exclude</param>
+        /// <returns>The snapshot manager with an active snapshot</returns>
+        private SnapshotManager CreateSnapshotManager(WindowsSnapshotProvider provider, TimeSpan vssTimeout, Guid providerId, bool useMapping, Guid[] excludedWriters)
+        {
+            var started = DateTime.UtcNow;
+            while (true)
+            {
+                try
+                {
+                    return CreateSnapshotManagerWithFallback(provider, vssTimeout, providerId, useMapping, excludedWriters);
+                }
+                catch (Exception ex) when (IsSnapshotSetInProgress(ex) && DateTime.UtcNow - started + SnapshotInProgressRetryDelay < vssTimeout)
+                {
+                    Logging.Log.WriteInformationMessage(LOGTAG, "VssSnapshotSetInProgress", "Another program is creating a shadow copy, trying again in {0}", SnapshotInProgressRetryDelay);
+                    System.Threading.Thread.Sleep(SnapshotInProgressRetryDelay);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Checks whether the snapshot failed because another shadow copy was being created
+        /// </summary>
+        /// <param name="ex">The exception from the snapshot provider</param>
+        /// <returns><c>true</c> if another shadow copy was being created</returns>
+        private static bool IsSnapshotSetInProgress(Exception ex)
+        {
+            for (var e = ex; e != null; e = e.InnerException)
+                if (e.HResult == VSS_E_SNAPSHOT_SET_IN_PROGRESS || e is Alphaleonis.Win32.Vss.VssSnapshotSetInProgressException)
+                    return true;
+
+            return false;
+        }
+
+        /// <summary>
+        /// Creates a snapshot manager and creates the snapshot.
+        /// If the snapshot device path cannot be resolved (a provider created the snapshot
+        /// but did not expose a browsable shadow copy) and no provider was explicitly
+        /// requested, the snapshot is retried once using the Microsoft Software Shadow
+        /// Copy provider, which always exposes a device path.
+        /// </summary>
+        /// <param name="provider">The snapshot provider implementation</param>
+        /// <param name="vssTimeout">The maximum time to wait for asynchronous VSS operations</param>
+        /// <param name="providerId">The VSS provider to use, or an empty GUID for automatic selection</param>
+        /// <param name="useMapping">Whether to map snapshot volumes to drive letters</param>
+        /// <param name="excludedWriters">The VSS writers to exclude</param>
+        /// <returns>The snapshot manager with an active snapshot</returns>
+        private SnapshotManager CreateSnapshotManagerWithFallback(WindowsSnapshotProvider provider, TimeSpan vssTimeout, Guid providerId, bool useMapping, Guid[] excludedWriters)
+        {
+            try
+            {
+                return CreateSnapshotManagerCore(provider, vssTimeout, providerId, useMapping, excludedWriters);
+            }
+            catch (UserInformationException ex) when (ex.HelpID == "SnapshotDeviceEmpty" && providerId == Guid.Empty)
+            {
+                // A third-party provider (such as the QEMU Guest Agent VSS provider) created the
+                // snapshot but did not expose a usable device path. Retry once with the Microsoft
+                // Software Shadow Copy provider, which always exposes a device path.
+                Logging.Log.WriteWarningMessage(LOGTAG, "VssRetryWithSystemProvider", null,
+                    "The snapshot provider did not expose a usable snapshot device path; retrying with the Microsoft Software Shadow Copy provider. Set --vss-provider-id={0} to avoid this retry.", MS_SOFTWARE_PROVIDER_ID);
+
+                return CreateSnapshotManagerCore(provider, vssTimeout, MS_SOFTWARE_PROVIDER_ID, useMapping, excludedWriters);
+            }
+        }
+
+        /// <summary>
+        /// Creates a snapshot manager and creates the snapshot
+        /// </summary>
+        /// <param name="provider">The snapshot provider implementation</param>
+        /// <param name="vssTimeout">The maximum time to wait for asynchronous VSS operations</param>
+        /// <param name="providerId">The VSS provider to use, or an empty GUID for automatic selection</param>
+        /// <param name="useMapping">Whether to map snapshot volumes to drive letters</param>
+        /// <param name="excludedWriters">The VSS writers to exclude</param>
+        /// <returns>The snapshot manager with an active snapshot</returns>
+        private SnapshotManager CreateSnapshotManagerCore(WindowsSnapshotProvider provider, TimeSpan vssTimeout, Guid providerId, bool useMapping, Guid[] excludedWriters)
+        {
+            var manager = new SnapshotManager(_providerFactory(provider, vssTimeout, providerId));
+            try
+            {
+                manager.SetupWriters(null, excludedWriters);
+
+                manager.InitShadowVolumes(_snapshotPaths);
+
+                manager.MapVolumesToSnapShots();
+
+                //If we should map the drives, we do that now and update the volumeMap
+                if (useMapping)
+                    manager.MapDrives();
+
+                return manager;
+            }
+            catch
+            {
+                // Do not let a cleanup failure replace the original exception,
+                // as the caller relies on it to decide whether to retry
+                try
+                {
+                    manager.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "VSSCleanupOnError", ex, "Failed during VSS error cleanup");
+                }
+
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Checks if a given path is a "System Volume Information" folder.
+        /// The folder is identified by being located at the root of a volume,
+        /// having the expected name, and having the hidden and system attributes set.
+        /// </summary>
+        /// <param name="path">The path to check</param>
+        /// <param name="attributes">The attributes of the path</param>
+        /// <returns>True if the path is a "System Volume Information" folder, false otherwise</returns>
+        public static bool IsSystemVolumeInformationFolder(string path, FileAttributes attributes)
+        {
+            // The folder must be marked as both hidden and system,
+            // which is the case for the real "System Volume Information" folder,
+            // but unlikely for a user-created folder
+            if (!attributes.HasFlag(FileAttributes.Directory)
+                || !attributes.HasFlag(FileAttributes.Hidden)
+                || !attributes.HasFlag(FileAttributes.System))
+                return false;
+
+            // The folder must be located at the root of a volume
+            var root = Path.GetPathRoot(path.TrimEnd(Path.DirectorySeparatorChar));
+            if (string.IsNullOrEmpty(root))
+                return false;
+
+            // The name of the folder must be exactly "System Volume Information"
+            // and the only component after the root.
+            // Note that the root does not always end with a separator,
+            // such as for UNC paths, so we trim any leading separators
+            var relative = path.TrimEnd(Path.DirectorySeparatorChar).Substring(root.Length).TrimStart(Path.DirectorySeparatorChar);
+            return string.Equals(relative, SYSTEM_VOLUME_INFORMATION_FOLDER, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Gets the source folders
+        /// </summary>
+        public override IEnumerable<string> SourceEntries => _sourceEntries;
+
+        /// <summary>
+        /// Enumerates the root source files and folders
+        /// </summary>
+        /// <returns>The source files and folders</returns>
+        public override IEnumerable<ISourceProviderEntry> EnumerateFilesystemEntries()
+        {
+            foreach (var folder in _sourceEntries)
+            {
+                if (folder.EndsWith(Path.DirectorySeparatorChar) || DirectoryExists(folder))
+                    yield return new SnapshotSourceFileEntry(this, Util.AppendDirSeparator(folder), true, true, false);
+                else
+                    yield return new SnapshotSourceFileEntry(this, folder, false, true, IO_WIN.IsAlternateDataStream(folder));
             }
         }
 
@@ -108,19 +375,16 @@ namespace Duplicati.Library.Snapshots
         /// </summary>
         /// <param name="localFolderPath">The non-shadow path of the folder to list</param>
         /// <returns>A list of non-shadow paths</returns>
-        protected override string[] ListFolders(string localFolderPath)
+        protected override IEnumerable<string> ListFolders(string localFolderPath)
         {
-            string[] tmp = null;
             var spath = ConvertToSnapshotPath(localFolderPath);
-            tmp = SystemIO.IO_WIN.GetDirectories(spath); 
-            var root = Util.AppendDirSeparator(SystemIO.IO_WIN.GetPathRoot(localFolderPath));
+            var tmp = IO_WIN.GetDirectories(spath);
+            var root = Util.AppendDirSeparator(IO_WIN.GetPathRoot(localFolderPath));
             var volumePath = Util.AppendDirSeparator(ConvertToSnapshotPath(root));
             volumePath = SystemIOWindows.AddExtendedDevicePathPrefix(volumePath);
 
             for (var i = 0; i < tmp.Length; i++)
-            {
                 tmp[i] = root + SystemIOWindows.AddExtendedDevicePathPrefix(tmp[i]).Substring(volumePath.Length);
-            }
 
             return tmp;
         }
@@ -132,40 +396,34 @@ namespace Duplicati.Library.Snapshots
         /// </summary>
         /// <param name="localFolderPath">The non-shadow path of the folder to list</param>
         /// <returns>A list of non-shadow paths</returns>
-        protected override string[] ListFiles(string localFolderPath)
+        protected override IEnumerable<string> ListFiles(string localFolderPath)
         {
-
-            string[] files = null;
             var spath = ConvertToSnapshotPath(localFolderPath);
-            files = SystemIO.IO_WIN.GetFiles(spath);
+            var files = IO_WIN.GetFiles(spath);
 
             // convert back to non-shadow, i.e., non-vss version
-            var root = Util.AppendDirSeparator(SystemIO.IO_WIN.GetPathRoot(localFolderPath));
+            var root = Util.AppendDirSeparator(IO_WIN.GetPathRoot(localFolderPath));
             var volumePath = Util.AppendDirSeparator(ConvertToSnapshotPath(root));
             volumePath = SystemIOWindows.AddExtendedDevicePathPrefix(volumePath);
 
             for (var i = 0; i < files.Length; i++)
-            {
                 files[i] = root + SystemIOWindows.AddExtendedDevicePathPrefix(files[i]).Substring(volumePath.Length);
-            }
 
-            return files;
+            if (!_enableAdsBackup || !SystemIO.IO_OS.SupportsAlternateDataStreams)
+                return files;
+
+            // Expand ADS for each file
+            var expanded = ExpandAlternateDataStreams(files, f => SystemIO.IO_OS.EnumerateAlternateDataStreams(ConvertToSnapshotPath(f)));
+
+            // Also include ADS on the parent folder itself
+            var folderPath = localFolderPath.TrimEnd(Path.DirectorySeparatorChar);
+            var folderShadowPath = ConvertToSnapshotPath(folderPath);
+
+            return expanded.Concat(SystemIO.IO_OS.EnumerateAlternateDataStreams(folderShadowPath).Select(stream => folderPath + stream));
         }
         #endregion
 
         #region ISnapshotService Members
-
-        /// <summary>
-        /// Enumerates all files and folders in the snapshot, restricted to sources
-        /// </summary>
-        /// <param name="sources">Sources to enumerate</param>
-        /// <param name="callback">The callback to invoke with each found path</param>
-        /// <param name="errorCallback">The callback used to report errors</param>
-        public override IEnumerable<string> EnumerateFilesAndFolders(IEnumerable<string> sources, Utility.Utility.EnumerationFilterDelegate callback, Utility.Utility.ReportAccessError errorCallback)
-        {
-            // For Windows, ensure we don't store paths with extended device path prefixes (i.e., @"\\?\" or @"\\?\UNC\")
-            return base.EnumerateFilesAndFolders(sources.Select(SystemIOWindows.RemoveExtendedDevicePathPrefix), callback, errorCallback);
-        }
 
         /// <summary>
         /// Gets the last write time of a given file in UTC
@@ -176,7 +434,7 @@ namespace Duplicati.Library.Snapshots
         {
             var spath = ConvertToSnapshotPath(localPath);
 
-            return SystemIO.IO_WIN.GetLastWriteTimeUtc(SystemIOWindows.AddExtendedDevicePathPrefix(spath));
+            return IO_WIN.GetLastWriteTimeUtc(SystemIOWindows.AddExtendedDevicePathPrefix(spath));
         }
 
         /// <summary>
@@ -188,7 +446,21 @@ namespace Duplicati.Library.Snapshots
         {
             var spath = ConvertToSnapshotPath(localPath);
 
-            return SystemIO.IO_WIN.GetCreationTimeUtc(SystemIOWindows.AddExtendedDevicePathPrefix(spath));
+            return IO_WIN.GetCreationTimeUtc(SystemIOWindows.AddExtendedDevicePathPrefix(spath));
+        }
+
+        /// <inheritdoc />
+        public override ISourceProviderEntry GetFilesystemEntry(string path, bool isFolder)
+        {
+            if (_enableAdsBackup && SystemIO.IO_OS.IsAlternateDataStream(path))
+            {
+                var entry = base.GetFilesystemEntry(path, false);
+                if (entry != null)
+                    entry = new SnapshotSourceFileEntry(this, entry.Path, false, entry.IsRootEntry, true);
+                return entry;
+            }
+
+            return base.GetFilesystemEntry(path, isFolder);
         }
 
         /// <summary>
@@ -198,7 +470,7 @@ namespace Duplicati.Library.Snapshots
         /// <returns>An open filestream that can be read</returns>
         public override Stream OpenRead(string localPath)
         {
-            return SystemIO.IO_WIN.FileOpenRead(ConvertToSnapshotPath(localPath));
+            return IO_WIN.FileOpenRead(ConvertToSnapshotPath(localPath));
         }
 
         /// <summary>
@@ -208,7 +480,7 @@ namespace Duplicati.Library.Snapshots
         /// <returns>The length of the file</returns>
         public override long GetFileSize(string localPath)
         {
-            return SystemIO.IO_WIN.FileLength(ConvertToSnapshotPath(localPath));
+            return IO_WIN.FileLength(ConvertToSnapshotPath(localPath));
         }
 
         /// <summary>
@@ -218,7 +490,7 @@ namespace Duplicati.Library.Snapshots
         /// <param name="localPath">The file or folder to examine</param>
         public override FileAttributes GetAttributes(string localPath)
         {
-            return SystemIO.IO_WIN.GetFileAttributes(ConvertToSnapshotPath(localPath));
+            return IO_WIN.GetFileAttributes(ConvertToSnapshotPath(localPath));
         }
 
         /// <summary>
@@ -229,7 +501,7 @@ namespace Duplicati.Library.Snapshots
         public override string GetSymlinkTarget(string localPath)
         {
             var spath = ConvertToSnapshotPath(localPath);
-            return SystemIO.IO_WIN.GetSymlinkTarget(spath);
+            return IO_WIN.GetSymlinkTarget(spath);
         }
 
         /// <summary>
@@ -238,23 +510,16 @@ namespace Duplicati.Library.Snapshots
         /// <returns>The metadata for the given file or folder</returns>
         /// <param name="localPath">The file or folder to examine</param>
         /// <param name="isSymlink">A flag indicating if the target is a symlink</param>
-        /// <param name="followSymlink">A flag indicating if a symlink should be followed</param>
-        public override Dictionary<string, string> GetMetadata(string localPath, bool isSymlink, bool followSymlink)
+        public override Dictionary<string, string> GetMetadata(string localPath, bool isSymlink)
         {
-            return SystemIO.IO_WIN.GetMetadata(ConvertToSnapshotPath(localPath), isSymlink, followSymlink);
+            return SystemIO.IO_OS.GetMetadata(ConvertToSnapshotPath(localPath), isSymlink, FollowSymlinks);
         }
 
         /// <inheritdoc />
-        public override bool IsBlockDevice(string localPath)
-        {
-            return false;
-        }
+        public override bool IsBlockDevice(string localPath) => false;
 
         /// <inheritdoc />
-        public override string HardlinkTargetID(string localPath)
-        {
-            return null;
-        }
+        public override string HardlinkTargetID(string localPath) => null;
 
         /// <inheritdoc />
         public override string ConvertToLocalPath(string snapshotPath)
@@ -262,10 +527,10 @@ namespace Duplicati.Library.Snapshots
             if (!Path.IsPathRooted(snapshotPath))
                 throw new InvalidOperationException();
 
-            foreach (var kvp in _vssBackupComponents.SnapshotDeviceAndVolumes)
+            foreach (var kvp in _snapshotManager.SnapshotDeviceAndVolumes)
             {
-				if (snapshotPath.StartsWith(kvp.Key, Utility.Utility.ClientFilenameStringComparison))
-                    return SystemIO.IO_WIN.PathCombine(kvp.Value, snapshotPath.Substring(kvp.Key.Length));
+                if (snapshotPath.StartsWith(kvp.Key, Utility.Utility.ClientFilenameStringComparison))
+                    return IO_WIN.PathCombine(kvp.Value, snapshotPath.Substring(kvp.Key.Length));
             }
 
             throw new InvalidOperationException();
@@ -280,8 +545,8 @@ namespace Duplicati.Library.Snapshots
             if (!Path.IsPathRooted(localPath))
                 throw new InvalidOperationException();
 
-            var root = SystemIO.IO_WIN.GetPathRoot(localPath);
-            var volumePath = _vssBackupComponents.GetVolumeFromCache(root);
+            var root = IO_WIN.GetPathRoot(localPath);
+            var volumePath = _snapshotManager.GetVolumeFromCache(root);
 
             // Note that using a simple Path.Combine() for the following code
             // can result in invalid snapshot paths; e.g., if localPath is
@@ -300,17 +565,14 @@ namespace Duplicati.Library.Snapshots
         /// <inheritdoc />
         public override bool FileExists(string localFilePath)
         {
-            return SystemIO.IO_WIN.FileExists(ConvertToSnapshotPath(localFilePath));
+            return IO_WIN.FileExists(ConvertToSnapshotPath(localFilePath));
         }
 
         /// <inheritdoc />
         public override bool DirectoryExists(string localFolderPath)
         {
-            return SystemIO.IO_WIN.DirectoryExists(ConvertToSnapshotPath(localFolderPath));
+            return IO_WIN.DirectoryExists(ConvertToSnapshotPath(localFolderPath));
         }
-
-        /// <inheritdoc />
-        public override bool IsSnapshot => true;
 
         #endregion
 
@@ -319,7 +581,7 @@ namespace Duplicati.Library.Snapshots
         {
             if (disposing)
             {
-                _vssBackupComponents.Dispose();
+                _snapshotManager?.Dispose();
             }
 
             base.Dispose(disposing);

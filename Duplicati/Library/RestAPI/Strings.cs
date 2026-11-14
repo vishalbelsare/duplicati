@@ -1,0 +1,171 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+using System.Collections.Generic;
+using Duplicati.Library.Localization.Short;
+using System.Linq;
+
+namespace Duplicati.Server.Strings
+{
+    public static class Program
+    {
+        public static string AnotherInstanceDetected { get { return LC.L(@"Another instance is running, and was notified"); } }
+        public static string DatabaseOpenError(string message) { return LC.L(@"Failed to create, open or upgrade the database.
+Error message: {0}", message); }
+        public static string DatabaseMissingAndAutocreateDisabled(string databasepath, string optionname) { return LC.L(@"The database file does not exist: {0}. Automatic database creation is disabled with the option --{1}.", databasepath, optionname); }
+        public static string HelpCommandDescription { get { return LC.L(@"Display this help"); } }
+        public static string HelpDisplayDialog { get { return LC.L(@"Supported commandline arguments:
+
+"); } }
+        public static string HelpDisplayFormat(string optionname, string optiontext) { return LC.L(@"--{0}: {1}", optionname, optiontext); }
+        public static string ParametersFileOptionLong { get { return LC.L(@"Use this option to store some or all of the options given to the commandline client. The file must be a plain text file, and UTF-8 encoding is preferred. Each line in the file should be of the format --option=value. Use the special options --{0} and --{1} to override the localpath and the remote destination uri, respectively. The options in this file take precedence over the options provided on the commandline. You cannot specify filters in both the file and on the commandline. Instead, you can use the special --{2}, --{3}, or --{4} options to specify filters inside the parameter file. Each filter must be prefixed with either a + or a -, and multiple filters must be joined with {5} ", "source", "target", "replace-filter", "append-filter", "prepend-filter", System.IO.Path.PathSeparator); } }
+        public static string ParametersFileOptionShort { get { return LC.L(@"Path to a file with parameters"); } }
+        public static string FiltersCannotBeUsedWithFileError2 { get { return LC.L(@"Filters cannot be specified on the commandline if filters are also present in the parameter file. Use the special --{0}, --{1}, or --{2} options to specify filters inside the parameter file. Each filter must be prefixed with either a + or a -, and multiple filters must be joined with {3}", "replace-filter", "append-filter", "prepend-filter", System.IO.Path.PathSeparator); } }
+        public static string FailedToParseParametersFileError(string path, string message) { return LC.L(@"Unable to read the parameters file ""{0}"", reason: {1}", path, message); }
+        public static string SkippingSourceArgumentsOnNonBackupOperation { get { return @"The --source argument was specified in the parameter file, but the current operation is not a backup operation, so the argument is ignored"; } }
+        public static string LogfileCommandDescription { get { return LC.L(@"Output log information to the file given"); } }
+        public static string LoglevelCommandDescription { get { return LC.L(@"Determine the amount of information written in the log file"); } }
+        public static string LogConsoleDescription { get { return LC.L(@"Output log information to the console"); } }
+        public static string PortablemodeCommandDescription { get { return LC.L(@"Activate portable mode where the database is placed below the program executable"); } }
+        public static string SeriousError(string message) { return LC.L(@"A serious error occurred in Duplicati: {0}", message); }
+        public static string TearDownError(string message) { return LC.L(@"An error occurred on server tear down: {0}", message); }
+        public static string StartupFailure(System.Exception error) { return LC.L(@"Unable to start up. Perhaps another process is already running?
+Error message: {0}", error); }
+        public static string UnencrypteddatabaseCommandDescription { get { return LC.L(@"Disable database encryption"); } }
+        public static string WrongSQLiteVersion(System.Version actualversion, string expectedversion) { return LC.L(@"Unsupported version of SQLite detected ({0}), must be {1} or higher", actualversion, expectedversion); }
+        public static string WebserverWebrootDescription { get { return LC.L(@"The path to the folder where the static files for the webserver is present. The folder must be located beneath the installation folder."); } }
+        public static string WebserverPortDescription { get { return LC.L(@"The port the webserver listens on. Multiple values may be supplied with a comma in between."); } }
+        public static string WebserverDisableHTTPSDescription { get { return LC.L(@"Deactivates the use of HTTPS even if a certificate is stored in the database or provided on the commandline."); } }
+        public static string WebserverRemoveCertificateDescription { get { return LC.L(@"Removes any existing certificate from the database. This option also disables HTTPS."); } }
+        public static string WebserverCertificateFileDescription { get { return LC.L(@"The certificate and key file in PKCS #12 format the webserver use for SSL."); } }
+        public static string WebserverCertificatePasswordDescription { get { return LC.L(@"The password for decryption of the provided certificate PKCS #12 file."); } }
+        public static string WebserverInterfaceDescription { get { return LC.L(@"The interface the webserver listens on. The special values ""*"" and ""any"" means any interface. The special value ""loopback"" means the loopback adapter."); } }
+        public static string WebserverPasswordDescription { get { return LC.L(@"The password required to access the webserver. This option is saved so you do not need to set it on each run. An access password is mandatory."); } }
+        public static string WebserverPasswordInitDescription { get { return LC.L(@"Access password feature for automated installation. Sets the password only if not already set, and then exits."); } }
+        public static string WebserverAllowedhostnamesDescription { get { return LC.L(@"The hostnames that are accepted, separated with semicolons. If any of the hostnames are ""*"", all hostnames are allowed and the hostname checking is disabled."); } }
+        public static string PingpongkeepaliveLong { get { return LC.L(@"When running as a server, the service daemon must verify that the process is responding. If this option is enabled, the server reads stdin and writes a reply to each line read."); } }
+        public static string PingpongkeepaliveShort { get { return LC.L(@"Enable the ping-pong responder"); } }
+        public static string DisableupdatecheckShort { get { return LC.L(@"Disable the automatic update check"); } }
+        public static string DisableupdatecheckLong { get { return LC.L(@"Use this option to disable the automatic update check. Manual update checks can still be performed."); } }
+        public static string LogretentionLong { get { return LC.L(@"Set the time after which log data will be purged from the database."); } }
+        public static string LogretentionShort { get { return LC.L(@"Clean up old log data"); } }
+        public static string ServerdatafolderLong(string envname) { return LC.L(@"Duplicati needs to store a small database with all settings. Use this option to choose where the settings are stored. This option can also be set with the environment variable {0}.", envname); }
+        public static string ServerdatafolderShort { get { return LC.L(@"Set the folder where settings are stored"); } }
+        public static string AllowInsecureDatafolderLong { get { return LC.L(@"Allow the data folder to be placed in a shared location without restricting the permissions to SYSTEM and Administrators. This bypasses the security check that prevents using a world-readable folder for the database and configuration. Only use this option if you understand the risks and have restricted the permissions manually."); } }
+        public static string AllowInsecureDatafolderShort { get { return LC.L(@"Allow the data folder to be in a shared location without restricted permissions"); } }
+        public static string ServerencryptionkeyLong(string envname, string decryptionoption) { return LC.L(@"This option sets the encryption key used to scramble the local settings database. This option can also be set with the environment variable {0}. Use the option --{1} to disable the database scrambling.", envname, decryptionoption); }
+        public static string ServerencryptionkeyShort { get { return LC.L(@"Set the database encryption key"); } }
+        public static string TempdirLong { get { return LC.L(@"Use this option to supply an alternative folder for temporary storage. By default the system default temporary folder is used. Note that also SQLite will put temporary files in this temporary folder."); } }
+        public static string TempdirShort { get { return LC.L(@"Temporary storage folder"); } }
+        public static string ForcelocaleLong { get { return LC.L(@"By default, your system locale and culture settings will be used. In some cases you may prefer to run with another locale, for example to get messages in another language. Use this option to set the locale. Supply a blank string to choose the ""Invariant Culture""."); } }
+        public static string ForcelocaleShort { get { return LC.L(@"Force the locale setting"); } }
+        public static string FailedForceLocaleError(string option, string locale, string exMsg) { return LC.L(@"Failed to apply the --{0} setting with the value ""{1}"", using the system locale instead. Exception was: ""{2}""", option, locale, exMsg); }
+        public static string UsefilewatcherShort { get { return LC.L(@"Track changed files between backups"); } }
+        public static string UsefilewatcherLong { get { return LC.L(@"Keeps a file system watcher on the local source folders between backups, so a backup examines only the paths that changed since the previous one and copies everything else from the previous backup. Off by default, and only read from the backup's own settings, not from the default options for all backups. The first backup after the server starts, after the backup was edited, and after any event the watcher cannot vouch for scans all files. Not used when the USN journal is enabled, symlinks are followed, empty folders are excluded, alternate data streams are backed up, or the hardlink policy is not ""all""."); } }
+        public static string DisablefilewatcherShort { get { return LC.L(@"Disable the file watcher for all backups"); } }
+        public static string DisablefilewatcherLong { get { return LC.L(@"Turns off change tracking with a file system watcher for every backup, regardless of the per-backup setting."); } }
+        public static string FilewatcherflushintervalShort { get { return LC.L(@"File watcher flush interval"); } }
+        public static string FilewatcherflushintervalLong { get { return LC.L(@"How often the file watcher writes the changes it holds in memory to its tracking database."); } }
+        public static string FilewatcherhighwaterShort { get { return LC.L(@"File watcher in-memory limit"); } }
+        public static string FilewatcherhighwaterLong { get { return LC.L(@"The number of changed paths the file watcher holds in memory before writing them to its tracking database ahead of the flush interval."); } }
+        public static string FilewatchermaxchangesShort { get { return LC.L(@"File watcher change limit"); } }
+        public static string FilewatchermaxchangesLong { get { return LC.L(@"The number of changed paths recorded between two backups above which the next backup scans all files instead of using the list."); } }
+        public static string FilewatchergracedelayShort { get { return LC.L(@"File watcher grace delay"); } }
+        public static string FilewatchergracedelayLong { get { return LC.L(@"How long a backup waits for late file system events after closing the recording, before it reads the change list. Changes observed within this window before the snapshot are reported to both the current and the next backup."); } }
+        public static string WebserverResetJwtConfigDescription { get { return LC.L(@"Reset the JWT configuration, invalidating any issued login tokens"); } }
+        public static string WebserverEnableForeverTokenDescription { get { return LC.L(@"Enable the use of long-lived access tokens"); } }
+        public static string WebserverApiOnlyDescription { get { return LC.L(@"Disable the web interface and only allow API access"); } }
+        public static string WebserverDontAutocreateDatabaseDescription { get { return LC.L(@"Do not automatically create the server database if it does not exist. If the database is missing, the server will not start."); } }
+        public static string WebserverDisableSigninTokensDescription { get { return LC.L(@"Disable the use of signin tokens"); } }
+        public static string ReducedReportingShort { get { return LC.L(@"Switch reduced reporting on or off"); } }
+        public static string ReducedReportingLong { get { return LC.L(@"Stores the operator's reduced reporting setting for this machine. When active, every report leaving the machine carries log message ids only. A value enforced by the console cannot be switched off with this option."); } }
+        public static string WebserverSpaPathsDescription { get { return LC.L(@"The relative paths that should be served as single page applications, separated with semicolons."); } }
+        public static string WebserverCorsOriginsDescription { get { return LC.L(@"A list of CORS origins to allow, separated with semicolons. Each origin must be a valid URL."); } }
+        public static string WebserverTimezoneDescription { get { return LC.L(@"The timezone to use for the webserver. The timezone must be a valid timezone identifier, such as ""America/New_York"" or ""UTC"". Common three-letter abbreviations like ""CET"" are supported, but ambiguous in some cases."); } }
+        public static string WebserverPreAuthTokensDescription { get { return LC.L(@"A list of pre-authenticated tokens, separated with semicolons. These can be used in cases where the authentication is provided by a proxy. Each token must be at least 10 characters and not contain extended characters. The token must be provided by setting the header on each request to contain: Authorization: PreAuth <token>"); } }
+        public static string WebserverDisableApiExtensionsDescription { get { return LC.L(@"Disable the API extensions reported by the server. This will not disable the functionality, but will not report the extensions in the API responses. Use this option to degrade the server to a more basic API."); } }
+        public static string WebserverTokenDurationDescription { get { return LC.L(@"The duration of the refresh tokens issued by the server. This value indicates how much time can pass without activity before the user is asked to log in again. The value must be greater than zero and is capped at 30 days."); } }
+        public static string WebserverEnableFolderStatusServiceDescription { get { return LC.L(@"Enable the folder status service for showing overlay icons in the file explorer. When enabled, the folder status endpoints can be queried without logging in from the local machine, exposing the source folder paths and backup status to local processes"); } }
+        public static string WebserverEnableMcpServerDescription { get { return LC.L(@"Enable the Model Context Protocol (MCP) endpoint at /mcp, which lets an AI agent with a valid access token list backups, run backups, follow tasks and restore files. Turning the endpoint off deletes the access tokens that have been issued"); } }
+        public static string DisabledbencryptionLong { get { return LC.L(@"Use this option to disable database encryption of sensitive fields"); } }
+        public static string DisabledbencryptionShort { get { return LC.L(@"Disable database encryption"); } }
+        public static string DisabledefaultsecretproviderLong { get { return LC.L(@"Use this option to disable the default secret provider"); } }
+        public static string DisabledefaultsecretproviderShort { get { return LC.L(@"Disable the default secret provider"); } }
+        public static string DisabledefaultsecretproviderDeprecated(string optionname, string value) { return LC.L(@"Use --{0}={1} instead", optionname, value); }
+        public static string LogwindowseventlogLong { get { return LC.L(@"Use this option to log to the Windows event log. The provided name is in the format Log:Source. If no log name is provided, ""Duplicati 2"" is used."); } }
+        public static string LogwindowseventlogShort { get { return LC.L(@"Log to the Windows event log"); } }
+        public static string LogwindowseventloglevelLong { get { return LC.L(@"Use this option to set the log level for the Windows event log."); } }
+        public static string LogwindowseventloglevelShort { get { return LC.L(@"Set the log level for the Windows event log"); } }
+        public static string WindowsEventLogSourceNotFound(string source) { return LC.L(@"The Windows event log source {0} was not found. Attempting to create.", source); }
+        public static string WindowsEventLogSourceNotCreated(string source) { return LC.L(@"The Windows Event Log was not created for: {0}, not logging to eventlog.", source); }
+        public static string WindowsEventLogNotSupported { get { return LC.L(@"The Windows event log is not supported on this platform"); } }
+        public static string ServerStarted(string @interface, int port) { return LC.L(@"Server has started and is listening on {0}, port {1}", @interface, port); }
+        public static string ServerStartedSignin(string url) { return LC.L(@"Use the following link to sign in: {0}", url); }
+        public static string ServerCrashed(string message) { return LC.L(@"The server crashed: {0}", message); }
+        public static string ServerStopping { get { return LC.L(@"Server is stopping, tearing down handlers"); } }
+        public static string ServerStopped { get { return LC.L(@"Server has stopped"); } }
+        public static string RequiredbencryptionLong { get { return LC.L(@"Use this option to require a custom provided key for database encryption of sensitive fields and not rely on the serial number."); } }
+        public static string RequiredbencryptionShort { get { return LC.L(@"Require database encryption"); } }
+        public static string DatabaseEncryptionKeyRequired(string envkey, string disableoptionname) { return LC.L(@"Database encryption key is required. Supply an encryption key via the environment variable {0} or disable database encryption with the option --{1}", envkey, disableoptionname); }
+        public static string BlacklistedEncryptionKey(string envkey, string disableoptionname) { return LC.L(@"The database encryption key is blacklisted and cannot be used. The database has been decrypted. Supply a new encryption key via the environment variable {0} or disable database encryption with the option --{1}", envkey, disableoptionname); }
+        public static string NoEncryptionKeySpecified(string envkey, string disableoptionname) { return LC.L(@"No database encryption key was found. The database will be stored unencrypted. Supply an encryption key via the environment variable {0} or disable database encryption with the option --{1}", envkey, disableoptionname); }
+        public static string EncryptionKeyMissing(string envkey) { return LC.L(@"The database appears to be encrypted, but no key was specified. Opening the database will likely fail. Use the environment variable {0} to specify the key.", envkey); }
+        public static string InvalidTimezone(string timezone) { return LC.L(@"The timezone {0} is not valid", timezone); }
+        public static string InvalidUpdateCheckInterval(string interval) { return LC.L(@"The update check interval {0} is not valid", interval); }
+        public static string SettingsencryptionkeyShort { get { return LC.L(@"Set the encryption key for the settings database"); } }
+        public static string SettingsencryptionkeyLong(string envname) { return LC.L(@"Use this option to set the encryption key for the settings database. This option can also be set with the environment variable {0}.", envname); }
+        public static string InvalidPauseResumeState(LiveControls.LiveControlState state) { return LC.L(@"Invalid pause/resume state: {0}", state); }
+        public static string RegisterRemoteControlShort { get { return LC.L(@"Register for remote control"); } }
+        public static string RegisterRemoteControlLong { get { return LC.L(@"Register for remote control using the pre-authenticated url. If the server is already registered, this option has no effect"); } }
+        public static string RegisterRemoteControlReregisterShort { get { return LC.L(@"Force register for remote control"); } }
+        public static string RegisterRemoteControlReregisterLong { get { return LC.L(@"Forces a re-registration if the server is already registered. If the server is not already registered, this option has no effect."); } }
+        public static string RemoteControlAlreadyRegistered { get { return LC.L(@"The server is already registered for remote control, ignoring registration request"); } }
+        public static string RemoteControlRegistrationUrl(string url) { return LC.L(@"The server is registered, use the following link to claim it: {0}", url); }
+        public static string RemoteControlRegistrationFailed(string message) { return LC.L(@"The server registration failed: {0}", message); }
+        public static string AllowedBackendModulesShort { get { return LC.L(@"Set the allowed backends for remote control"); } }
+        public static string AllowedBackendModulesLong { get { return LC.L(@"Set the allowed backends for remote control. The value is a comma-separated list of backend names. If this option is not set, all backends are allowed. Use this option to restrict the backends that can be used to store data."); } }
+        public static string AllowedEncryptionModulesShort { get { return LC.L(@"Set the allowed encryption modules for remote control"); } }
+        public static string AllowedEncryptionModulesLong { get { return LC.L(@"Set the allowed encryption modules for remote control. The value is a comma-separated list of encryption module names. If this option is not set, all encryption modules are allowed. Use this option to restrict the encryption modules that can be used to encrypt data."); } }
+        public static string AllowedCompressionModulesShort { get { return LC.L(@"Set the allowed compression modules for remote control"); } }
+        public static string AllowedCompressionModulesLong { get { return LC.L(@"Set the allowed compression modules for remote control. The value is a comma-separated list of compression module names. If this option is not set, all compression modules are allowed. Use this option to restrict the compression modules that can be used to compress data."); } }
+        public static string SecretProviderFailedToGetEncryptionKey { get { return LC.L(@"Failed to get encryption key from secret provider"); } }
+        public static string SecretProviderFailedToSetEncryptionKey { get { return LC.L(@"Failed to set encryption key in secret provider"); } }
+        public static string ConfigureHttpsShort { get { return LC.L(@"Configure HTTPS certificates"); } }
+        public static string ConfigureHttpsLong { get { return LC.L(@"Automatically generate and configure HTTPS certificates for the server"); } }
+        public static string ConfigureHttpsHostnamesShort { get { return LC.L(@"HTTPS hostnames"); } }
+        public static string ConfigureHttpsHostnamesLong { get { return LC.L(@"Comma-separated list of hostnames to include in the HTTPS certificate (used with --configure-https)"); } }
+        public static string SuppressWelcomePageShort { get { return LC.L(@"Suppress the initial welcome page"); } }
+        public static string SuppressWelcomePageLong { get { return LC.L(@"Suppress the welcome page that is shown when first using the web interface"); } }
+        public static string StoretaskconfigShort { get { return LC.L(@"Store task configuration with backup"); } }
+        public static string StoretaskconfigLong { get { return LC.L(@$"Controls whether the backup configuration is stored as a control file in the backup. When encryption is enabled, {StoreTaskConfigMode.Auto} is equivalent to {StoreTaskConfigMode.Self} and {StoreTaskConfigMode.None} otherwise. The mode {StoreTaskConfigMode.Self} and {StoreTaskConfigMode.All} store the configuration without secrets (for the current job or all jobs, respectively). The options {StoreTaskConfigMode.SelfWithSecrets} and {StoreTaskConfigMode.AllWithSecrets} include all secrets in the configuration, which makes it easier to recreate, but is less secure. Note that configuration is only uploaded if the backup has changed, and a configuration change alone will not be treated as a new backup version."); } }
+    }
+    internal static class Scheduler
+    {
+        public static string InvalidTimeSetupError(System.DateTime startdate, string interval, string alloweddays) { return LC.L(@"Unable to find a valid date, given the start date {0}, the repetition interval {1} and the allowed days {2}", startdate, interval, alloweddays); }
+    }
+    public static class Server
+    {
+        public static string StartedServer(string ip, int port) { return LC.L(@"Server has started and is listening on {0}, port {1}", ip, port); }
+        public static string WebrootOutsideInstallationFolder(string webroot, string installationFolder) { return LC.L(@"The webroot folder {0} is not inside the installation folder {1} and is ignored", webroot, installationFolder); }
+        public static string SSLCertificateFileMissingOption { get { return LC.L(@"SSL certificate password option has no meaning when provided without SSL certificate file option!"); } }
+        public static string ServerStartFailure(IEnumerable<int> portstried) { return LC.L(@"Unable to open a socket for listening, tried ports: {0}", string.Join(",", from n in (portstried ?? new int[0]) select n.ToString())); }
+    }
+
+}

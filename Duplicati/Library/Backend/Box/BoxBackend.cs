@@ -1,38 +1,43 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Runtime.CompilerServices;
+using System.Text;
 using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
+using Duplicati.Library.Utility;
+using Duplicati.Library.Utility.Options;
 using Newtonsoft.Json;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net;
-using System.Threading;
-using System.Threading.Tasks;
+using Duplicati.StreamUtil;
+
+[assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
 namespace Duplicati.Library.Backend.Box
 {
-    // ReSharper disable once ClassNeverInstantiated.Global
-    // This class is instantiated dynamically in the BackendLoader.
-    public class BoxBackend : IBackend, IStreamingBackend
+    public class BoxBackend : IStreamingBackend, IRenameEnabledBackend, IFolderEnabledBackend
     {
-		private static readonly string LOGTAG = Logging.Log.LogTagFromType<BoxBackend>();
-
-        private const string AUTHID_OPTION = "authid";
+        private static readonly string TOKEN_URL = AuthIdOptionsHelper.GetOAuthLoginUrl("box.com", null);
         private const string REALLY_DELETE_OPTION = "box-delete-from-trash";
 
         private const string BOX_API_URL = "https://api.box.com/2.0";
@@ -40,464 +45,546 @@ namespace Duplicati.Library.Backend.Box
 
         private const int PAGE_SIZE = 200;
 
-        private readonly BoxHelper m_oauth;
-        private readonly string m_path;
-        private readonly bool m_deleteFromTrash;
+        /// <summary>
+        /// The Box.com error code reported when the name is already used by an item
+        /// </summary>
+        private const string NAME_IN_USE_CODE = "item_name_in_use";
+        /// <summary>
+        /// The number of times to look for a folder that Box reports as existing
+        /// </summary>
+        private const int CONFLICT_LOOKUP_ATTEMPTS = 3;
+        /// <summary>
+        /// The delay to use between the lookups for a folder that Box reports as existing
+        /// </summary>
+        private static readonly TimeSpan CONFLICT_LOOKUP_DELAY = TimeSpan.FromSeconds(1);
 
-        private string m_currentfolder;
-        private readonly Dictionary<string, string> m_filecache = new Dictionary<string, string>();
+        private readonly BoxHelper _oAuthHelper;
+        private readonly string _path;
+        private readonly bool _deleteFromTrash;
 
-        private class BoxHelper : OAuthHelper
+        private string? _currentFolder;
+        private readonly Dictionary<string, string> _fileCache = new();
+        private readonly TimeoutOptionsHelper.Timeouts _timeouts;
+
+        private class BoxHelper : OAuthHelperHttpClient
         {
-            public BoxHelper(string authid)
-                : base(authid, "box.com")
+            private readonly TimeoutOptionsHelper.Timeouts _timeouts;
+            public BoxHelper(AuthIdOptionsHelper.AuthIdOptions authId, TimeoutOptionsHelper.Timeouts timeouts, HttpClient? httpClient = null)
+                : base(authId.AuthId, "box.com", authId.OAuthUrl, httpClient)
             {
                 AutoAuthHeader = true;
+                _timeouts = timeouts;
+                _httpClient.Timeout = Timeout.InfiniteTimeSpan;
+            }
+            public override async Task AttemptParseAndThrowExceptionAsync(Exception ex, HttpResponseMessage? responseContext, CancellationToken cancellationToken)
+            {
+                if (ex is not HttpRequestException || responseContext == null)
+                    return;
+
+                if (responseContext is { StatusCode: HttpStatusCode.TooManyRequests })
+                    throw new TooManyRequestException(responseContext.Headers.RetryAfter);
+
+                await using var stream = await responseContext.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                using var reader = new StreamReader(stream);
+                var rawData = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, ct => reader.ReadToEndAsync(ct)).ConfigureAwait(false);
+                ErrorResponse? errorResponse = null;
+                try { errorResponse = JsonConvert.DeserializeObject<ErrorResponse>(rawData); }
+                catch { }
+
+                errorResponse ??= new ErrorResponse { Status = (int)responseContext.StatusCode, Code = "Unknown", Message = rawData };
+                throw new BoxException(errorResponse, ex);
             }
 
-            protected override void ParseException(Exception ex)
+            public async Task<T> PutAndGetJsonDataAsync<T>(string url, object item, CancellationToken cancellationToken)
             {
-                Exception newex = null;
-                try
-                {
-                    if (ex is WebException exception && exception.Response is HttpWebResponse hs)
+                var data = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(item));
+
+                return await GetJsonDataAsync<T>(
+                    url,
+                    cancellationToken,
+                    request =>
                     {
-                        string rawdata = null;
-                        using(var rs = Library.Utility.AsyncHttpRequest.TrySetTimeout(hs.GetResponseStream()))
-                        using(var sr = new System.IO.StreamReader(rs))
-                            rawdata = sr.ReadToEnd();
-
-                        if (string.IsNullOrWhiteSpace(rawdata))
-                            return;
-                        
-                        newex = new Exception("Raw message: " + rawdata);
-
-                        var msg = JsonConvert.DeserializeObject<ErrorResponse>(rawdata);
-                        newex = new Exception(string.Format("{0} - {1}: {2}", msg.Status, msg.Code, msg.Message));
-
-                        /*if (msg.ContextInfo != null && msg.ContextInfo.Length > 0)
-                            newex = new Exception(string.Format("{0} - {1}: {2}{3}{4}", msg.Status, msg.Code, msg.Message, Environment.NewLine, string.Join("; ", from n in msg.ContextInfo select n.Message)));
-                        */
+                        request.Method = HttpMethod.Put;
+                        request.Content = new ByteArrayContent(data);
+                        request.Content.Headers.Add("Content-Length", data.Length.ToString());
+                        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
                     }
-                }
-                catch(Exception ex2)
-                {
-					Library.Logging.Log.WriteWarningMessage(LOGTAG, "BoxErrorParser", ex2, "Failed to parse error from Box");
-                }
-
-                if (newex != null)
-                    throw newex;                
+                ).ConfigureAwait(false);
             }
         }
 
-        // ReSharper disable once UnusedMember.Global
-        // This constructor is needed by the BackendLoader.
         public BoxBackend()
         {
+            _oAuthHelper = null!;
+            _path = null!;
+            _timeouts = null!;
         }
 
-        // ReSharper disable once UnusedMember.Global
-        // This constructor is needed by the BackendLoader.
-        public BoxBackend(string url, Dictionary<string, string> options)
+        public BoxBackend(string url, Dictionary<string, string?> options)
+            : this(url, options, null)
         {
-            var uri = new Utility.Uri(url);
-
-            m_path = Util.AppendDirSeparator(uri.HostAndPath, "/");
-
-            string authid = null;
-            if (options.ContainsKey(AUTHID_OPTION))
-                authid = options[AUTHID_OPTION];
-
-            m_deleteFromTrash = Library.Utility.Utility.ParseBoolOption(options, REALLY_DELETE_OPTION);
-
-            m_oauth = new BoxHelper(authid);
         }
 
-        private string CurrentFolder
+        /// <summary>
+        /// Creates a backend that uses the supplied <see cref="HttpClient"/>,
+        /// so the Box API responses can be stubbed in tests
+        /// </summary>
+        /// <param name="url">The backend url</param>
+        /// <param name="options">The options to use</param>
+        /// <param name="httpClient">The client to use, or null to create one</param>
+        internal BoxBackend(string url, Dictionary<string, string?> options, HttpClient? httpClient)
         {
-            get
-            {
-                if (m_currentfolder == null)
-                    GetCurrentFolder(false);
-                
-                return m_currentfolder;
-            }
+            var uri = new RelaxedUri(url);
+
+            _path = Util.AppendDirSeparator(uri.HostAndPath, "/");
+
+            var authid = AuthIdOptionsHelper.Parse(options)
+                .RequireCredentials(TOKEN_URL);
+
+            _deleteFromTrash = Utility.Utility.ParseBoolOption(options, REALLY_DELETE_OPTION);
+            _timeouts = TimeoutOptionsHelper.Parse(options);
+
+            _oAuthHelper = new BoxHelper(authid, _timeouts, httpClient);
+
         }
 
-        private void GetCurrentFolder(bool create)
+        private async Task<string> GetCurrentFolderWithCacheAsync(CancellationToken cancelToken)
+        {
+            if (_currentFolder == null)
+                return await GetCurrentFolderAsync(false, cancelToken).ConfigureAwait(false);
+
+            return _currentFolder;
+        }
+
+        private async Task<string> GetCurrentFolderAsync(bool create, CancellationToken cancelToken)
+        {
+            var id = await GetFolderIdAsync(_path, create, cancelToken).ConfigureAwait(false);
+            return _currentFolder = id;
+        }
+
+        private async Task<string> GetFolderIdAsync(string path, bool create, CancellationToken cancelToken)
         {
             var parentid = "0";
 
-            foreach(var p in m_path.Split(new string[] {"/"}, StringSplitOptions.RemoveEmptyEntries))
+            foreach (var p in path.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries))
             {
-                var el = (MiniFolder)PagedFileListResponse(parentid, true).FirstOrDefault(x => x.Name == p);
+                var el = await FindFolderAsync(parentid, p, cancelToken).ConfigureAwait(false);
                 if (el == null)
                 {
                     if (!create)
                         throw new FolderMissingException();
 
-                    el = m_oauth.PostAndGetJSONData<ListFolderResponse>(
-                        string.Format("{0}/folders", BOX_API_URL),
-                        new CreateItemRequest() { Name = p, Parent = new IDReference() { ID = parentid } }
-                    );
+                    try
+                    {
+                        el = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, ct => _oAuthHelper.PostAndGetJsonDataAsync<ListFolderResponse>(
+                            $"{BOX_API_URL}/folders",
+                            new CreateItemRequest
+                            {
+                                Name = p,
+                                Parent = new IDReference { ID = parentid }
+                            },
+                            ct
+                        )).ConfigureAwait(false);
+                    }
+                    catch (BoxException bex) when (bex.Error.Status == (int)HttpStatusCode.Conflict && bex.Error.Code == NAME_IN_USE_CODE)
+                    {
+                        // The name is taken, so the folder is there even though the
+                        // listing did not report it
+                        el = await ResolveExistingFolderAsync(parentid, p, bex, cancelToken).ConfigureAwait(false);
+                        if (el == null)
+                            throw;
+                    }
                 }
 
                 parentid = el.ID;
+                if (string.IsNullOrWhiteSpace(parentid))
+                    throw new InvalidDataException($"Invalid folder ID for {p} in {path}");
             }
 
-            m_currentfolder = parentid;
+            return parentid;
         }
 
-        private string GetFileID(string name)
+        /// <summary>
+        /// Finds a folder by name in the given folder
+        /// </summary>
+        /// <param name="parentid">The id of the folder to look in</param>
+        /// <param name="name">The name of the folder to find</param>
+        /// <param name="cancelToken">The cancellation token to use</param>
+        /// <returns>The folder, or null if there is no such folder</returns>
+        private async Task<MiniFolder?> FindFolderAsync(string parentid, string name, CancellationToken cancelToken)
+            // Box.com does not allow two items in a folder to have names that differ
+            // only in casing, and reports the name as used when they do, so the names
+            // are compared the same way here
+            => (MiniFolder?)await PagedFileListResponse(parentid, true, cancelToken)
+                .FirstOrDefaultAsync(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase), cancellationToken: cancelToken)
+                .ConfigureAwait(false);
+
+        /// <summary>
+        /// Finds a folder that Box reports as already using the requested name,
+        /// either from the conflicting items in the error or by listing the parent again
+        /// </summary>
+        /// <param name="parentid">The id of the folder to look in</param>
+        /// <param name="name">The name of the folder to find</param>
+        /// <param name="error">The error reporting the name as taken</param>
+        /// <param name="cancelToken">The cancellation token to use</param>
+        /// <returns>The folder, or null if it could not be found</returns>
+        private async Task<MiniFolder?> ResolveExistingFolderAsync(string parentid, string name, BoxException error, CancellationToken cancelToken)
         {
-            if (m_filecache.ContainsKey(name))
-                return m_filecache[name];
+            // Box reports the canonical name, which can differ in case from the requested one
+            var conflicts = error.Error.GetConflictingItems()
+                .Where(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var conflictingFolder = conflicts.FirstOrDefault(x => x.Type == "folder" && !string.IsNullOrWhiteSpace(x.ID));
+            if (conflictingFolder != null)
+                return conflictingFolder;
+
+            // Something that is not a folder uses the name, so no folder can have
+            // it and listing again will not produce one
+            if (conflicts.Count > 0)
+                return null;
+
+            // Only the name was reported as taken, so look for the folder again,
+            // allowing for the listing to catch up
+            for (var attempt = 1; attempt <= CONFLICT_LOOKUP_ATTEMPTS; attempt++)
+            {
+                if (attempt > 1)
+                    await Task.Delay(Utility.Utility.GetRetryDelay(CONFLICT_LOOKUP_DELAY, attempt - 1, true), cancelToken).ConfigureAwait(false);
+
+                var el = await FindFolderAsync(parentid, name, cancelToken).ConfigureAwait(false);
+                if (el != null)
+                    return el;
+            }
+
+            return null;
+        }
+
+        private IFileEntry ParseEntry(FileEntity n)
+        {
+            var fe = new FileEntry(n.Name);
+            if (n.Type == "folder")
+            {
+                fe.IsFolder = true;
+                if (!fe.Name.EndsWith("/"))
+                    fe.Name += "/";
+            }
+            else
+            {
+                fe.IsFolder = false;
+                fe.Size = n.Size;
+            }
+
+            if (n.ModifiedAt != default)
+                fe.LastModification = fe.LastAccess = n.ModifiedAt.ToUniversalTime();
+
+            return fe;
+        }
+
+        /// <summary>
+        /// Gets the absolute path for a given relative path
+        /// </summary>
+        /// <param name="path">The relative path local path, with backslashes or forward slashes</param>
+        /// <returns>The absolute URL path</returns>
+        private string GetAbsolutePath(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return _path;
+
+            var p = path.Replace(Path.DirectorySeparatorChar, '/').Trim('/');
+            if (string.IsNullOrWhiteSpace(_path) || _path == "/")
+                return "/" + p;
+            else
+                return Util.AppendDirSeparator(_path, "/") + p;
+        }
+
+        public async IAsyncEnumerable<IFileEntry> ListAsync(string? path, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            var fullPath = GetAbsolutePath(path);
+            string folderId;
+            try
+            {
+                folderId = await GetFolderIdAsync(fullPath, false, cancellationToken).ConfigureAwait(false);
+            }
+            catch (FolderMissingException)
+            {
+                yield break;
+            }
+
+            await foreach (var n in PagedFileListResponse(folderId, false, cancellationToken).ConfigureAwait(false))
+            {
+                yield return ParseEntry(n);
+            }
+        }
+
+        public async Task<IFileEntry?> GetEntryAsync(string path, CancellationToken cancellationToken)
+        {
+            var parts = GetAbsolutePath(path).Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0)
+                return new FileEntry(string.Empty) { IsFolder = true };
+
+            var parentPath = string.Join("/", parts.Take(parts.Length - 1));
+            var name = parts.Last();
+
+            string parentId;
+            try
+            {
+                parentId = await GetFolderIdAsync(parentPath, false, cancellationToken).ConfigureAwait(false);
+            }
+            catch (FolderMissingException)
+            {
+                return null;
+            }
+
+            var item = await PagedFileListResponse(parentId, false, cancellationToken)
+                .FirstOrDefaultAsync(x => x.Name == name, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (item == null) return null;
+
+            return ParseEntry(item);
+        }
+
+        private async Task<string> GetFileIdAsync(string name, CancellationToken cancelToken)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new FileMissingException();
+
+            if (name.Contains('/'))
+            {
+                var parts = GetAbsolutePath(name).Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 0)
+                    throw new FileMissingException();
+
+                var fileName = parts.Last();
+                var folderPath = string.Join("/", parts.Take(parts.Length - 1));
+
+                var folderId = await GetFolderIdAsync(folderPath, false, cancelToken).ConfigureAwait(false);
+                var item = await PagedFileListResponse(folderId, false, cancelToken)
+                    .FirstOrDefaultAsync(x => x.Name == fileName, cancelToken)
+                    .ConfigureAwait(false);
+
+                if (item == null || string.IsNullOrWhiteSpace(item.ID))
+                    throw new FileMissingException();
+
+                return item.ID;
+            }
+
+            if (_fileCache.TryGetValue(name, out var async))
+                return async;
 
             // Make sure we enumerate this, otherwise the m_filecache is empty.
-            PagedFileListResponse(CurrentFolder, false).LastOrDefault();
+            var currentFolder = await GetCurrentFolderWithCacheAsync(cancelToken).ConfigureAwait(false);
+            await PagedFileListResponse(currentFolder, false, cancelToken).LastOrDefaultAsync(cancellationToken: cancelToken).ConfigureAwait(false);
 
-            if (m_filecache.ContainsKey(name))
-                return m_filecache[name];
+            if (_fileCache.TryGetValue(name, out var idAsync))
+                return idAsync;
 
             throw new FileMissingException();
         }
 
-        private IEnumerable<FileEntity> PagedFileListResponse(string parentid, bool onlyfolders)
+        private async IAsyncEnumerable<FileEntity> PagedFileListResponse(string parentid, bool onlyfolders, [EnumeratorCancellation] CancellationToken cancelToken)
         {
             var offset = 0;
-            var done = false;
 
             if (!onlyfolders)
-                m_filecache.Clear();
-            
-            do
+                _fileCache.Clear();
+
+            while (true)
             {
-                var resp = m_oauth.GetJSONData<ShortListResponse>(string.Format("{0}/folders/{1}/items?limit={2}&offset={3}&fields=name,size,modified_at", BOX_API_URL, parentid, PAGE_SIZE, offset));
+                var resp = await Utility.Utility.WithTimeout(_timeouts.ListTimeout, cancelToken, ct => _oAuthHelper.GetJsonDataAsync<ShortListResponse>($"{BOX_API_URL}/folders/{parentid}/items?limit={PAGE_SIZE}&offset={offset}&fields=name,size,modified_at", ct)).ConfigureAwait(false);
 
                 if (resp.Entries == null || resp.Entries.Length == 0)
                     break;
 
-                foreach(var f in resp.Entries)
+                foreach (var f in resp.Entries)
                 {
+                    if (string.IsNullOrWhiteSpace(f.Name) || string.IsNullOrWhiteSpace(f.ID))
+                        continue;
+
+                    // No sort order is requested, so a non-folder entry does not
+                    // mean the remaining entries are non-folders as well
                     if (onlyfolders && f.Type != "folder")
-                    {
-                        done = true;
-                        break;
-                    }
-                    else
-                    {
-                        if (!onlyfolders && f.Type == "file")
-                            m_filecache[f.Name] = f.ID;
-                        
-                        yield return f;
-                    }
+                        continue;
+
+                    if (!onlyfolders && f.Type == "file")
+                        _fileCache[f.Name] = f.ID;
+
+                    yield return f;
                 }
 
-                offset = offset + PAGE_SIZE;
+                // Fewer entries than requested may be returned while more remain,
+                // so continue after the entries that were actually received
+                offset += resp.Entries.Length;
 
                 if (offset >= resp.TotalCount)
                     break;
-
-            } while(!done);
+            }
         }
 
-        #region IStreamingBackend implementation
-
-        public async Task PutAsync(string remotename, System.IO.Stream stream, CancellationToken cancelToken)
+        public async Task PutAsync(string remotename, Stream stream, CancellationToken cancelToken)
         {
-            var createreq = new CreateItemRequest() {
+            var currentFolder = await GetCurrentFolderWithCacheAsync(cancelToken).ConfigureAwait(false);
+            var createreq = new CreateItemRequest
+            {
                 Name = remotename,
-                Parent = new IDReference() {
-                    ID = CurrentFolder
+                Parent = new IDReference
+                {
+                    ID = currentFolder
                 }
             };
 
-            if (m_filecache.Count == 0)
-                PagedFileListResponse(CurrentFolder, false);
+            if (_fileCache.Count == 0)
+                await PagedFileListResponse(currentFolder, false, cancelToken).LastOrDefaultAsync(cancelToken).ConfigureAwait(false);
 
-            var existing = m_filecache.ContainsKey(remotename);
+            var existing = _fileCache.ContainsKey(remotename);
+
+            var multipartForm = new MultipartFormDataContent();
 
             try
             {
                 string url;
-                var items = new List<MultipartItem>(2);
 
                 if (existing)
-                    url = $"{BOX_UPLOAD_URL}/{m_filecache[remotename]}/content";
+                    url = $"{BOX_UPLOAD_URL}/{_fileCache[remotename]}/content";
                 else
                 {
                     url = $"{BOX_UPLOAD_URL}/content";
-                    items.Add(new MultipartItem(createreq, "attributes"));
+                    multipartForm.Add(JsonContent.Create(createreq), "attributes");
                 }
 
-                items.Add(new MultipartItem(stream, "file", remotename));
+                using var timeoutStream = stream.ObserveReadTimeout(_timeouts.ReadWriteTimeout, false, TimeoutMode.Gap);
+                multipartForm.Add(new StreamContent(timeoutStream), "file", remotename);
 
-                var res = (await m_oauth.PostMultipartAndGetJSONDataAsync<FileList>(url, null, cancelToken, items.ToArray())).Entries.First();
-                m_filecache[remotename] = res.ID;
+                var res = (await _oAuthHelper.PostMultipartAndGetJsonDataAsync<FileList>(url, cancelToken, multipartForm)).Entries?.FirstOrDefault();
+                if (res == null || string.IsNullOrWhiteSpace(res.ID))
+                    throw new InvalidDataException("No file ID returned after upload");
+                _fileCache[remotename] = res.ID;
             }
             catch
             {
-                m_filecache.Clear();
+                _fileCache.Clear();
                 throw;
             }
         }
 
-        public void Get(string remotename, System.IO.Stream stream)
+        public async Task GetAsync(string remotename, Stream stream, CancellationToken cancelToken)
         {
-            using (var resp = m_oauth.GetResponse(string.Format("{0}/files/{1}/content", BOX_API_URL, GetFileID(remotename))))
-            using(var rs = Duplicati.Library.Utility.AsyncHttpRequest.TrySetTimeout(resp.GetResponseStream()))
-                Library.Utility.Utility.CopyStream(rs, stream);
+            var fileId = await GetFileIdAsync(remotename, cancelToken).ConfigureAwait(false);
+            using var request = await _oAuthHelper.CreateRequestAsync($"{BOX_API_URL}/files/{fileId}/content", HttpMethod.Get, cancelToken).ConfigureAwait(false);
+            using var resp = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, ct => _oAuthHelper.GetResponseAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)).ConfigureAwait(false);
+            await using var responseStream = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, ct => resp.Content.ReadAsStreamAsync(ct)).ConfigureAwait(false);
+            using var ts = responseStream.ObserveReadTimeout(_timeouts.ReadWriteTimeout, false, TimeoutMode.Call);
+            await Utility.Utility.CopyStreamAsync(ts, stream, cancelToken).ConfigureAwait(false);
         }
 
-        #endregion
-
-        #region IBackend implementation
-
-        public System.Collections.Generic.IEnumerable<IFileEntry> List()
+        public async IAsyncEnumerable<IFileEntry> ListAsync([EnumeratorCancellation] CancellationToken cancelToken)
         {
-            return
-                from n in PagedFileListResponse(CurrentFolder, false)
-                select (IFileEntry)new FileEntry(n.Name, n.Size, n.ModifiedAt, n.ModifiedAt) { IsFolder = n.Type == "folder" };
+            var currentFolder = await GetCurrentFolderWithCacheAsync(cancelToken).ConfigureAwait(false);
+            await foreach (var n in PagedFileListResponse(currentFolder, false, cancelToken).ConfigureAwait(false))
+                yield return ParseEntry(n);
         }
 
         public async Task PutAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            using (System.IO.FileStream fs = System.IO.File.OpenRead(filename))
-                await PutAsync(remotename, fs, cancelToken);
+            await using FileStream fs = File.OpenRead(filename);
+            await PutAsync(remotename, fs, cancelToken).ConfigureAwait(false);
         }
 
-        public void Get(string remotename, string filename)
+        public async Task GetAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            using (System.IO.FileStream fs = System.IO.File.Create(filename))
-                Get(remotename, fs);
+            await using FileStream fs = File.Create(filename);
+            await GetAsync(remotename, fs, cancelToken).ConfigureAwait(false);
         }
 
-        public void Delete(string remotename)
+        public async Task DeleteAsync(string remotename, CancellationToken cancelToken)
         {
-            var fileid = GetFileID(remotename);
+            var fileId = await GetFileIdAsync(remotename, cancelToken).ConfigureAwait(false);
             try
             {
-                using(var r = m_oauth.GetResponse(string.Format("{0}/files/{1}", BOX_API_URL, fileid), null, "DELETE"))
+                using (var request = await _oAuthHelper.CreateRequestAsync($"{BOX_API_URL}/files/{fileId}", HttpMethod.Delete, cancelToken).ConfigureAwait(false))
+                using (var r = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, ct => _oAuthHelper.GetResponseAsync(request, HttpCompletionOption.ResponseContentRead, ct)).ConfigureAwait(false))
                 {
                 }
 
-                if (m_deleteFromTrash)
-                    using(var r = m_oauth.GetResponse(string.Format("{0}/files/{1}/trash", BOX_API_URL, fileid), null, "DELETE"))
+                if (_deleteFromTrash)
+                {
+                    using (var request = await _oAuthHelper.CreateRequestAsync($"{BOX_API_URL}/files/{fileId}/trash", HttpMethod.Delete, cancelToken).ConfigureAwait(false))
+                    using (var r = await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancelToken, ct => _oAuthHelper.GetResponseAsync(request, HttpCompletionOption.ResponseContentRead, ct)).ConfigureAwait(false))
                     {
                     }
+                }
             }
             catch
             {
-                m_filecache.Clear();
+                _fileCache.Clear();
                 throw;
             }
         }
 
-        public void Test()
+        public async Task RenameAsync(string oldname, string newname, CancellationToken cancellationToken)
         {
-            this.TestList();
-        }
-
-        public void CreateFolder()
-        {
-            GetCurrentFolder(true);
-        }
-
-        public string DisplayName
-        {
-            get
+            var fileId = await GetFileIdAsync(oldname, cancellationToken).ConfigureAwait(false);
+            try
             {
-                return Strings.Box.DisplayName;
-            }
-        }
+                await Utility.Utility.WithTimeout(_timeouts.ShortTimeout, cancellationToken, ct => _oAuthHelper.PutAndGetJsonDataAsync<FileEntity>(
+                    $"{BOX_API_URL}/files/{fileId}",
+                    new CreateItemRequest { Name = newname },
+                    ct
+                )).ConfigureAwait(false);
 
-        public string ProtocolKey
-        {
-            get
+                _fileCache.Remove(oldname);
+                _fileCache[newname] = fileId;
+            }
+            catch
             {
-                return "box";
+                _fileCache.Clear();
+                throw;
             }
         }
 
-        public IList<ICommandLineArgument> SupportedCommands
+        /// <inheritdoc/>
+        public Task TestAsync(bool alsoWrite, CancellationToken cancelToken)
+            => this.TestBackendAsync(alsoWrite, cancelToken);
+
+        /// <inheritdoc/>
+        public Task CreateFolderAsync(CancellationToken cancellationToken)
         {
-            get {
-                return new List<ICommandLineArgument>(new ICommandLineArgument[] {
-                    new CommandLineArgument(AUTHID_OPTION, CommandLineArgument.ArgumentType.Password, Strings.Box.AuthidShort, Strings.Box.AuthidLong(OAuthHelper.OAUTH_LOGIN_URL("box.com"))),
-                    new CommandLineArgument(REALLY_DELETE_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Box.ReallydeleteShort, Strings.Box.ReallydeleteLong),
-                });
-            }
+            return GetCurrentFolderAsync(true, cancellationToken);
         }
 
-        public string Description
-        {
-            get
-            {
-                return Strings.Box.Description;
-            }
-        }
+        /// <inheritdoc/>
+        public string DisplayName => Strings.Box.DisplayName;
 
-        public string[] DNSName
-        {
-            get { return new string[] { new Uri(BOX_API_URL).Host, new Uri(BOX_UPLOAD_URL).Host }; }
-        }
+        /// <inheritdoc/>
+        public string ProtocolKey => "box";
 
-        #endregion
+        /// <inheritdoc/>
+        // Box does not allow names that differ only by casing
+        public bool HasCaseSensitivePaths => false;
 
-        #region IDisposable implementation
+        /// <inheritdoc/>
+        public bool SupportsStreaming => true;
 
+        /// <inheritdoc/>
+        public IList<ICommandLineArgument> SupportedCommands =>
+        [
+            .. AuthIdOptionsHelper.GetOptions(TOKEN_URL),
+            new CommandLineArgument(REALLY_DELETE_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Box.ReallydeleteShort, Strings.Box.ReallydeleteLong),
+            .. TimeoutOptionsHelper.GetOptions()
+        ];
+
+        /// <inheritdoc/>
+        public string Description => Strings.Box.Description;
+
+        /// <inheritdoc/>
+        public Task<string[]> GetDNSNamesAsync(CancellationToken cancelToken) => Task.FromResult(new[] {
+            new System.Uri(BOX_API_URL).Host,
+            new System.Uri(BOX_UPLOAD_URL).Host
+        }.Distinct().WhereNotNullOrWhiteSpace().ToArray());
+
+        /// <inheritdoc/>
         public void Dispose()
         {
         }
-
-        #endregion
-
-        private class MiniUser : IDReference
-        {
-            [JsonProperty("type")]
-            public string Type { get; set; }
-            [JsonProperty("name")]
-            public string Name { get; set; }
-            [JsonProperty("login")]
-            public string Login { get; set; }
-        }
-
-        private class MiniFolder : IDReference
-        {
-            [JsonProperty("type")]
-            public string Type { get; set; }
-            [JsonProperty("name")]
-            public string Name { get; set; }
-            [JsonProperty("etag")]
-            public string ETag { get; set; }
-            [JsonProperty("sequence_id")]
-            public string SequenceID { get; set; }
-        }
-
-        private class FileEntity : MiniFolder
-        {
-            public FileEntity() { Size = -1; }
-
-            [JsonProperty("sha1")]
-            public string SHA1 { get; set; }
-
-            [JsonProperty("size", NullValueHandling = NullValueHandling.Ignore)]
-            public long Size { get; set; }
-            [JsonProperty("modified_at", NullValueHandling = NullValueHandling.Ignore)]
-            public DateTime ModifiedAt { get; set; }
-        }
-
-        private class FolderList
-        {
-            [JsonProperty("total_count")]
-            public long TotalCount { get; set; }
-            [JsonProperty("entries")]
-            public MiniFolder[] Entries { get; set; }
-        }
-
-        private class FileList
-        {
-            [JsonProperty("total_count")]
-            public long TotalCount { get; set; }
-            [JsonProperty("entries")]
-            public FileEntity[] Entries { get; set; }
-            [JsonProperty("offset")]
-            public long Offset { get; set; }
-            [JsonProperty("limit")]
-            public long Limit { get; set; }
-        }
-
-        private class UploadEmail
-        {
-            [JsonProperty("access")]
-            public string Access { get; set; }
-            [JsonProperty("email")]
-            public string Email { get; set; }
-        }
-
-        private class ListFolderResponse : MiniFolder
-        {
-            [JsonProperty("created_at")]
-            public DateTime CreatedAt { get; set; }
-            [JsonProperty("modified_at")]
-            public DateTime ModifiedAt { get; set; }
-            [JsonProperty("description")]
-            public string Description { get; set; }
-            [JsonProperty("size")]
-            public long Size { get; set; }
-
-            [JsonProperty("path_collection")]
-            public FolderList PathCollection { get; set; }
-
-            [JsonProperty("created_by")]
-            public MiniUser CreatedBy { get; set; }
-            [JsonProperty("modified_by")]
-            public MiniUser ModifiedBy { get; set; }
-            [JsonProperty("owned_by")]
-            public MiniUser OwnedBy { get; set; }
-
-            [JsonProperty("shared_link")]
-            public MiniUser SharedLink { get; set; }
-
-            [JsonProperty("folder_upload_email")]
-            public UploadEmail FolderUploadEmail { get; set; }
-
-            [JsonProperty("parent")]
-            public MiniFolder Parent { get; set; }
-
-            [JsonProperty("item_status")]
-            public string ItemStatus { get; set; }
-
-            [JsonProperty("item_collection")]
-            public FileList ItemCollection { get; set; }
-
-        }
-
-        private class OrderEntry
-        {
-            [JsonProperty("by")]
-            public string By { get; set; }
-            [JsonProperty("direction")]
-            public string Direction { get; set; }
-        }
-
-        private class ShortListResponse : FileList
-        {
-            [JsonProperty("order")]
-            public OrderEntry[] Order { get; set; }
-
-        }
-
-        private class IDReference
-        {
-            [JsonProperty("id")]
-            public string ID { get; set; }
-        }
-
-        private class CreateItemRequest
-        {
-            [JsonProperty("name")]
-            public string Name { get; set; }
-            [JsonProperty("parent")]
-            public IDReference Parent { get; set; }
-        }
-
-        private class ErrorResponse
-        {
-            [JsonProperty("type")]
-            public string Type { get; set; }
-            [JsonProperty("status")]
-            public int Status { get; set; }
-            [JsonProperty("code")]
-            public string Code { get; set; }
-            [JsonProperty("help_url")]
-            public string HelpUrl { get; set; }
-            [JsonProperty("message")]
-            public string Message { get; set; }
-            [JsonProperty("request_id")]
-            public string RequestId { get; set; }
-
-        }
     }
 }
-

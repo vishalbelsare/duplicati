@@ -1,112 +1,177 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
-// 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-// 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
-// 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-#endregion
-using Duplicati.Library.Common;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
 using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
+using Duplicati.Library.Utility;
+using Duplicati.Library.Utility.Options;
+using System.Runtime.CompilerServices;
+using Duplicati.StreamUtil;
 
 namespace Duplicati.Library.Backend
 {
     // ReSharper disable once UnusedMember.Global
     // This class is instantiated dynamically in the BackendLoader.
-    public class File : IBackend, IStreamingBackend, IQuotaEnabledBackend, IRenameEnabledBackend
+    /// <summary>
+    /// The file backend implementation
+    /// </summary>
+    public class File : IBackend, IStreamingBackend, IQuotaEnabledBackend, IRenameEnabledBackend, IFolderEnabledBackend, ILinkEnabledBackend, IFolderDeleteEnabledBackend, IModificationTimeEnabledBackend
     {
+        /// <summary>
+        /// The tag used for logging
+        /// </summary>
+        private static readonly string LOGTAG = Logging.Log.LogTagFromType<File>();
+        /// <summary>
+        /// The option key for the destination marker file
+        /// </summary>
         private const string OPTION_DESTINATION_MARKER = "alternate-destination-marker";
+        /// <summary>
+        /// The option key for the alternate target paths
+        /// </summary>
         private const string OPTION_ALTERNATE_PATHS = "alternate-target-paths";
+        /// <summary>
+        /// The option key for moving files instead of copying them
+        /// </summary>
         private const string OPTION_MOVE_FILE = "use-move-for-put";
+        /// <summary>
+        /// The option key for linking downloaded files instead of copying them
+        /// </summary>
+        private const string OPTION_HARDLINK_GET = "use-hardlink-for-get";
+        /// <summary>
+        /// The option key for forcing reauthentication against the remote share
+        /// </summary>
         private const string OPTION_FORCE_REAUTH = "force-smb-authentication";
+        /// <summary>
+        /// The option key for disabling length verification
+        /// </summary>
         private const string OPTION_DISABLE_LENGTH_VERIFICATION = "disable-length-verification";
+        /// <summary>
+        /// The option key for disabling filename sanitization
+        /// </summary>
+        private const string OPTION_DISABLE_FILENAME_SANITIZATION = "disable-filename-sanitation";
 
+        /// <summary>
+        /// The path to the remote file storage (i.e., the directory where files are stored)
+        /// </summary>
         private readonly string m_path;
-        private string m_username;
-        private string m_password;
+        /// <summary>
+        /// The username for authentication against the remote share
+        /// </summary>
+        private string? m_username;
+        /// <summary>
+        /// The password for authentication against the remote share
+        /// </summary>
+        private string? m_password;
+        /// <summary>
+        /// Flag to indicate if the file should be moved instead of copied
+        /// </summary>
         private readonly bool m_moveFile;
+        /// <summary>
+        /// Flag to indicate if a downloaded file should be a hard link to the stored file instead of a copy
+        /// </summary>
+        private readonly bool m_hardlinkGet;
+        /// <summary>
+        /// Flag to indicate if the backend has already authenticated
+        /// </summary>
         private bool m_hasAutenticated;
+        /// <summary>
+        /// Flag to indicate if the backend should force reauthentication
+        /// </summary>
         private readonly bool m_forceReauth;
+        /// <summary>
+        /// Flag to indicate if the destination file length should be verified against the source file length
+        /// </summary>
         private readonly bool m_verifyDestinationLength;
+        /// <summary>
+        /// Flag to indicate if filename sanitization is disabled
+        /// </summary>
+        private readonly bool m_disableFilenameSanitization;
+        /// <summary>
+        /// The timeout options for the backend operations
+        /// </summary>
+        private readonly TimeoutOptionsHelper.Timeouts m_timeouts;
 
-        private readonly byte[] m_copybuffer = new byte[Utility.Utility.DEFAULT_BUFFER_SIZE];
-
+        /// <summary>
+        /// The system IO abstraction used for file operations
+        /// </summary>
         private static readonly ISystemIO systemIO = SystemIO.IO_OS;
 
+        /// <summary>
+        /// Unused constructor for dynamic loading purposes
+        /// </summary>
         public File()
         {
+            m_path = null!;
+            m_timeouts = null!;
         }
 
-        public File(string url, Dictionary<string, string> options)
+        /// <summary>
+        /// Constructs a file backend with the specified URL and options.
+        /// </summary>
+        /// <param name="url">The url to the remote file storage</param>
+        /// <param name="options">The options for the file backend</param>
+        public File(string url, Dictionary<string, string?> options)
         {
-            var uri = new Utility.Uri(url);
-            m_path = uri.HostAndPath;
+            var uri = new Utility.RelaxedUri(url);
+            var path = uri.HostAndPath;
+            var auth = AuthOptionsHelper.Parse(options, uri.Username, uri.Password);
+            m_timeouts = TimeoutOptionsHelper.Parse(options);
+            m_username = auth.Username;
+            m_password = auth.Password;
 
-            if (options.ContainsKey("auth-username"))
-                m_username = options["auth-username"];
-            if (options.ContainsKey("auth-password"))
-                m_password = options["auth-password"];
-            if (!string.IsNullOrEmpty(uri.Username))
-                m_username = uri.Username;
-            if (!string.IsNullOrEmpty(uri.Password))
-                m_password = uri.Password;
+            if (!Path.IsPathRooted(path))
+                path = systemIO.PathGetFullPath(path);
 
-            if (!System.IO.Path.IsPathRooted(m_path))
-                m_path = systemIO.PathGetFullPath(m_path);
-
-            if (options.ContainsKey(OPTION_ALTERNATE_PATHS))
+            var altPaths = options.GetValueOrDefault(OPTION_ALTERNATE_PATHS);
+            var markerfile = options.GetValueOrDefault(OPTION_DESTINATION_MARKER);
+            // A marker alone guards the one path, such as a mount point that exists while the share is not mounted
+            if (!string.IsNullOrWhiteSpace(altPaths) || !string.IsNullOrWhiteSpace(markerfile))
             {
-                List<string> paths = new List<string>
-                {
-                    m_path
-                };
-                paths.AddRange(options[OPTION_ALTERNATE_PATHS].Split(new string[] { System.IO.Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries));
+                List<string> paths =
+                [
+                    path,
+                    .. (altPaths ?? "").Split(new string[] {Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries),
+                ];
 
                 //On windows we expand the drive letter * to all drives
-                if (!Platform.IsClientPosix)
+                if (OperatingSystem.IsWindows())
                 {
-                    System.IO.DriveInfo[] drives = System.IO.DriveInfo.GetDrives();
-
-                    for (int i = 0; i < paths.Count; i++)
+                    var drives = DriveInfo.GetDrives();
+                    for (var i = 0; i < paths.Count; i++)
                     {
                         if (paths[i].StartsWith("*:", StringComparison.Ordinal))
                         {
-                            string rpl_path = paths[i].Substring(1);
+                            var rpl_path = paths[i].Substring(1);
                             paths.RemoveAt(i);
                             i--;
-                            foreach (System.IO.DriveInfo di in drives)
+                            foreach (var di in drives)
                                 paths.Insert(++i, di.Name[0] + rpl_path);
                         }
                     }
                 }
 
-                string markerfile = null;
-
                 //If there is a marker file, we do not allow the primary target path
                 // to be accepted, unless it contains the marker file
-                if (options.ContainsKey(OPTION_DESTINATION_MARKER))
-                {
-                    markerfile = options[OPTION_DESTINATION_MARKER];
-                    m_path = null;
-                }
+                if (!string.IsNullOrWhiteSpace(markerfile))
+                    path = null;
 
                 foreach (string p in paths)
                 {
@@ -114,7 +179,7 @@ namespace Duplicati.Library.Backend
                     {
                         if (systemIO.DirectoryExists(p) && (markerfile == null || systemIO.FileExists(systemIO.PathCombine(p, markerfile))))
                         {
-                            m_path = p;
+                            path = p;
                             break;
                         }
                     }
@@ -123,18 +188,27 @@ namespace Duplicati.Library.Backend
                     }
                 }
 
-                if (m_path == null)
+                if (string.IsNullOrWhiteSpace(path))
                     throw new UserInformationException(Strings.FileBackend.NoDestinationWithMarkerFileError(markerfile, paths.ToArray()), "NoDestinationWithMarker");
             }
 
+            m_path = path;
             m_moveFile = Utility.Utility.ParseBoolOption(options, OPTION_MOVE_FILE);
+            m_hardlinkGet = Utility.Utility.ParseBoolOption(options, OPTION_HARDLINK_GET);
             m_forceReauth = Utility.Utility.ParseBoolOption(options, OPTION_FORCE_REAUTH);
-            m_verifyDestinationLength = Utility.Utility.ParseBoolOption(options, OPTION_DISABLE_LENGTH_VERIFICATION);
+            m_verifyDestinationLength = !Utility.Utility.ParseBoolOption(options, OPTION_DISABLE_LENGTH_VERIFICATION);
+            m_disableFilenameSanitization = Utility.Utility.ParseBoolOption(options, OPTION_DISABLE_FILENAME_SANITIZATION);
             m_hasAutenticated = false;
         }
 
+        /// <summary>
+        /// Pre-authenticates against the remote share if necessary.
+        /// </summary>
         private void PreAuthenticate()
         {
+            if (!OperatingSystem.IsWindows())
+                return;
+
             try
             {
                 if (!string.IsNullOrEmpty(m_username) && m_password != null && !m_hasAutenticated)
@@ -147,6 +221,25 @@ namespace Duplicati.Library.Backend
             { }
         }
 
+        /// <summary>
+        /// Sanitizes the filenames if filename sanitization is enabled.
+        /// </summary>
+        /// <param name="filename">The filename to sanitize</param>
+        /// <returns>The sanitized filename</returns>
+        private string SanitizeFilename(string filename)
+        {
+            if (m_disableFilenameSanitization)
+                return filename;
+
+            // Trim null characters due to issue with Sharepoint mounted folders
+            return filename.Trim('\0');
+        }
+
+        /// <summary>
+        /// Gets the remote path for the specified file.
+        /// </summary>
+        /// <param name="remotename">The remote filename</param>
+        /// <returns>The remote path for the specified file</returns>
         private string GetRemoteName(string remotename)
         {
             PreAuthenticate();
@@ -154,147 +247,361 @@ namespace Duplicati.Library.Backend
             if (!systemIO.DirectoryExists(m_path))
                 throw new FolderMissingException(Strings.FileBackend.FolderMissingError(m_path));
 
-            return systemIO.PathCombine(m_path, remotename);
+            return systemIO.PathCombine(m_path, SanitizeFilename(remotename));
         }
 
         #region IBackendInterface Members
 
-        public string DisplayName
-        {
-            get { return Strings.FileBackend.DisplayName; }
-        }
+        /// <inheritdoc />
+        public string DisplayName => Strings.FileBackend.DisplayName;
 
-        public string ProtocolKey
-        {
-            get { return "file"; }
-        }
+        /// <inheritdoc />
+        public virtual string ProtocolKey => "file";
 
-        public IEnumerable<IFileEntry> List()
+        /// <inheritdoc/>
+        // The local filesystem follows the operating system, which is the default
+        public bool HasCaseSensitivePaths => false;
+
+        // Moving and linking work on whole files, so both need the file-based transfers
+        public bool SupportsStreaming => !m_moveFile && !m_hardlinkGet;
+
+        /// <inheritdoc />
+        public async IAsyncEnumerable<IFileEntry> ListAsync([EnumeratorCancellation] CancellationToken cancelToken)
         {
             PreAuthenticate();
 
             if (!systemIO.DirectoryExists(m_path))
                 throw new FolderMissingException(Strings.FileBackend.FolderMissingError(m_path));
 
-            foreach (string s in systemIO.EnumerateFiles(m_path))
+            var res = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken, _ =>
+                systemIO.EnumerateFileEntries(m_path)
+                    .Select(entry => new FileEntry(SanitizeFilename(entry.Name), entry.Size, entry.LastAccess, entry.LastModification, entry.IsFolder, entry.IsArchived))
+            ).ConfigureAwait(false);
+
+            foreach (var entry in res)
+                yield return entry;
+        }
+
+        /// <summary>
+        /// Resolves a relative sub-path (using '/' or the OS separator) against the
+        /// backend root <see cref="m_path"/>, returning the canonicalized absolute
+        /// filesystem path. The path is constrained to remain within the backend root:
+        /// segments that would escape it (<c>..</c>, absolute paths, or alternate
+        /// roots) are rejected to prevent directory traversal outside the configured
+        /// destination via backend-supplied or caller-supplied names.
+        /// </summary>
+        /// <param name="subPath">The relative sub-path to resolve; null/empty/whitespace returns the backend root.</param>
+        /// <returns>The canonicalized absolute path under <see cref="m_path"/>.</returns>
+        /// <exception cref="DirectoryNotFoundException">Thrown when <paramref name="subPath"/> would resolve to a path outside the backend root.</exception>
+        private string ResolveContainedPath(string? subPath)
+        {
+            if (string.IsNullOrWhiteSpace(subPath))
+                return m_path;
+
+            // Reject absolute or alternate-rooted paths before joining, since
+            // Path.Combine would replace m_path with them rather than append.
+            // On Windows a path like "C:\x" or "\x" is rooted; on Unix "/x" is.
+            if (System.IO.Path.IsPathRooted(subPath))
+                throw new DirectoryNotFoundException($"Refusing to resolve rooted path outside backend root: {subPath}");
+
+            // Normalize separators and trim leading/trailing separators, then reject
+            // any ".." segment. Path.Combine does not collapse "..", so a segment of
+            // ".." would resolve above m_path; rejecting it (rather than relying on a
+            // post-canonicalization check) keeps the intent explicit and cross-platform.
+            var sep = System.IO.Path.DirectorySeparatorChar;
+            var altSep = System.IO.Path.AltDirectorySeparatorChar;
+            var normalized = subPath.Replace(altSep, sep).Trim(sep);
+            var segments = normalized.Split(sep);
+            foreach (var segment in segments)
+                if (segment == "..")
+                    throw new DirectoryNotFoundException($"Refusing to resolve path containing a parent-directory segment ('..') outside backend root: {subPath}");
+
+            var combined = systemIO.PathCombine(m_path, normalized);
+
+            // Final containment guard: canonicalize both sides and verify the result
+            // remains under the backend root. This catches any remaining edge cases
+            // (e.g. symlinks resolved by the OS, or future path shapes).
+            var fullCombined = systemIO.PathGetFullPath(combined);
+            var fullRoot = systemIO.PathGetFullPath(m_path);
+            if (!fullCombined.StartsWith(fullRoot, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                throw new DirectoryNotFoundException($"Refusing to resolve path outside backend root: {subPath}");
+
+            return combined;
+        }
+
+        /// <inheritdoc />
+        public async IAsyncEnumerable<IFileEntry> ListAsync(string? path, [EnumeratorCancellation] CancellationToken cancelToken)
+        {
+            PreAuthenticate();
+
+            if (!systemIO.DirectoryExists(m_path))
+                throw new FolderMissingException(Strings.FileBackend.FolderMissingError(m_path));
+
+            // Resolve the folder to list: the backend root when path is null/empty,
+            // otherwise the subfolder joined onto the backend root. ResolveContainedPath
+            // constrains the result to remain within the backend root (rejecting ".."
+            // and absolute paths) so a caller-supplied or backend-supplied name cannot
+            // list outside the configured destination.
+            var listPath = ResolveContainedPath(path);
+
+            if (!systemIO.DirectoryExists(listPath))
+                throw new FolderMissingException(Strings.FileBackend.FolderMissingError(listPath));
+
+            var res = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken, _ =>
+                systemIO.EnumerateFileEntries(listPath)
+                    .Select(entry => new FileEntry(SanitizeFilename(entry.Name), entry.Size, entry.LastAccess, entry.LastModification, entry.IsFolder, entry.IsArchived))
+            ).ConfigureAwait(false);
+
+            foreach (var entry in res)
+                yield return entry;
+        }
+
+        /// <inheritdoc />
+        public Task<IFileEntry?> GetEntryAsync(string path, CancellationToken cancellationToken)
+        {
+            PreAuthenticate();
+
+            if (!systemIO.DirectoryExists(m_path))
+                throw new FolderMissingException(Strings.FileBackend.FolderMissingError(m_path));
+
+            // ResolveContainedPath constrains the result to remain within the backend
+            // root (rejecting ".." and absolute paths) so a caller-supplied or
+            // backend-supplied name cannot stat outside the configured destination.
+            var fullPath = ResolveContainedPath(SanitizeFilename(path));
+
+            if (systemIO.FileExists(fullPath))
             {
-                yield return systemIO.FileEntry(s);
+                var fi = new FileInfo(fullPath);
+                return Task.FromResult<IFileEntry?>(new FileEntry(SanitizeFilename(fi.Name), fi.Length, fi.LastAccessTime, fi.LastWriteTime, false, (fi.Attributes & System.IO.FileAttributes.Archive) != 0));
             }
 
-            foreach (string s in systemIO.EnumerateDirectories(m_path))
+            if (systemIO.DirectoryExists(fullPath))
             {
-                yield return systemIO.DirectoryEntry(s);
+                var di = new DirectoryInfo(fullPath);
+                return Task.FromResult<IFileEntry?>(new FileEntry(SanitizeFilename(di.Name), 0, di.LastAccessTime, di.LastWriteTime, true, false));
             }
+
+            return Task.FromResult<IFileEntry?>(null);
         }
 
 #if DEBUG_RETRY
-        private static Random random = new Random();
+        /// <inheritdoc />
         public async Task Put(string remotename, System.IO.Stream stream, CancellationToken cancelToken)
         {
-            using(System.IO.FileStream writestream = systemIO.FileCreate(GetRemoteName(remotename)))
+            try
             {
-                if (random.NextDouble() > 0.6666)
-                    throw new Exception("Random upload failure");
-                await Utility.Utility.CopyStreamAsync(stream, writestream, cancelToken);
+                using(var writestream = systemIO.FileCreate(GetRemoteName(remotename)))
+                {
+                    if (Random.Shared.NextDouble() > 0.6666)
+                        throw new Exception("Random upload failure");
+                    await Utility.Utility.CopyStreamAsync(stream, writestream, cancelToken).ConfigureAwait(false);
+                }
             }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
+
         }
 #else
+        /// <inheritdoc />
         public async Task PutAsync(string targetFilename, Stream sourceStream, CancellationToken cancelToken)
         {
-            string targetFilePath = GetRemoteName(targetFilename);
-            long copiedBytes = 0;
-            using (var targetStream = systemIO.FileCreate(targetFilePath))
-                copiedBytes = await Utility.Utility.CopyStreamAsync(sourceStream, targetStream, true, cancelToken, m_copybuffer);
+            try
+            {
+                string targetFilePath = GetRemoteName(targetFilename);
+                long copiedBytes = 0;
+                using (var targetStream = systemIO.FileCreate(targetFilePath))
+                using (var timeoutStream = targetStream.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
+                    copiedBytes = await Utility.Utility.CopyStreamAsync(sourceStream, timeoutStream, true, cancelToken).ConfigureAwait(false);
 
-            VerifyMatchingSize(targetFilePath, sourceStream, copiedBytes);
+                VerifyMatchingSize(targetFilePath, sourceStream, copiedBytes);
+            }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
+
         }
 #endif
 
-        public void Get(string remotename, System.IO.Stream stream)
+        /// <inheritdoc />
+        public async Task PutAsync(string targetFilename, Stream sourceStream, DateTime lastModifiedUtc, CancellationToken cancelToken)
         {
-            // FileOpenRead has flags System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read
-            using (System.IO.FileStream readstream = systemIO.FileOpenRead(GetRemoteName(remotename)))
-                Utility.Utility.CopyStream(readstream, stream, true, m_copybuffer);
+            await PutAsync(targetFilename, sourceStream, cancelToken).ConfigureAwait(false);
+            try
+            {
+                systemIO.FileSetLastWriteTimeUtc(GetRemoteName(targetFilename), lastModifiedUtc.Kind == DateTimeKind.Local ? lastModifiedUtc.ToUniversalTime() : lastModifiedUtc);
+            }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
         }
 
+        /// <inheritdoc />
+        public async Task GetAsync(string remotename, Stream stream, CancellationToken cancelToken)
+        {
+            try
+            {
+                // FileOpenRead has flags System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read
+                using (var readstream = systemIO.FileOpenRead(GetRemoteName(remotename)))
+                using (var timeoutStream = readstream.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
+                    await Utility.Utility.CopyStreamAsync(timeoutStream, stream, true, cancelToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
+
+        }
+
+        /// <inheritdoc />
         public Task PutAsync(string targetFilename, string sourceFilePath, CancellationToken cancelToken)
         {
-            string targetFilePath = GetRemoteName(targetFilename);
-            if (m_moveFile)
+            try
             {
-                if (systemIO.FileExists(targetFilePath))
-                    systemIO.FileDelete(targetFilePath);
+                string targetFilePath = GetRemoteName(targetFilename);
+                if (m_moveFile)
+                {
+                    if (systemIO.FileExists(targetFilePath))
+                        systemIO.FileDelete(targetFilePath);
 
-                var sourceFileInfo = new FileInfo(sourceFilePath);
-                var sourceFileLength = sourceFileInfo.Exists ? (long?)sourceFileInfo.Length : null;
+                    var sourceFileInfo = new FileInfo(sourceFilePath);
+                    var sourceFileLength = sourceFileInfo.Exists ? (long?)sourceFileInfo.Length : null;
 
-                systemIO.FileMove(sourceFilePath, targetFilePath);
-                if (m_verifyDestinationLength)
-                    VerifyMatchingSize(targetFilePath, null, sourceFileLength);
+                    systemIO.FileMove(sourceFilePath, targetFilePath);
+                    if (m_verifyDestinationLength)
+                        VerifyMatchingSize(targetFilePath, null, sourceFileLength);
+                }
+                else
+                {
+                    systemIO.FileCopy(sourceFilePath, targetFilePath, true);
+                    if (m_verifyDestinationLength)
+                        VerifyMatchingSize(targetFilePath, sourceFilePath);
+                }
+
+                return Task.CompletedTask;
             }
-            else
+            catch (Exception ex)
             {
-                systemIO.FileCopy(sourceFilePath, targetFilePath, true);
-                if (m_verifyDestinationLength)
-                    VerifyMatchingSize(targetFilePath, sourceFilePath);
+                MapException(ex);
+                throw;
             }
 
-            return Task.FromResult(true);
         }
 
-        public void Get(string remotename, string filename)
+        /// <inheritdoc />
+        public Task GetAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            systemIO.FileCopy(GetRemoteName(remotename), filename, true);
+            try
+            {
+                var source = GetRemoteName(remotename);
+                if (!m_hardlinkGet || !TryCreateHardLink(source, filename))
+                    systemIO.FileCopy(source, filename, true);
+                return Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
         }
 
-        public void Delete(string remotename)
+        /// <summary>
+        /// Replaces the target file with a hard link to the source file.
+        /// </summary>
+        /// <param name="source">The stored file</param>
+        /// <param name="target">The file to replace with the link</param>
+        /// <returns>True if the link was created; false if the caller should copy instead</returns>
+        private static bool TryCreateHardLink(string source, string target)
         {
-            systemIO.FileDelete(GetRemoteName(remotename));
+            try
+            {
+                // Neither CreateHardLink nor link() overwrites an existing file
+                if (systemIO.FileExists(target))
+                    systemIO.FileDelete(target);
+
+                var created = OperatingSystem.IsWindows()
+                    ? CreateHardLinkW(target, source, IntPtr.Zero)
+                    : Mono.Unix.Native.Syscall.link(source, target) == 0;
+
+                if (!created)
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "HardLinkFailed", null, "Could not link {0} to {1}, copying it instead", target, source);
+                return created;
+            }
+            catch (Exception ex)
+            {
+                Logging.Log.WriteVerboseMessage(LOGTAG, "HardLinkFailed", ex, "Could not link {0} to {1}, copying it instead", target, source);
+                return false;
+            }
         }
 
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+
+        /// <inheritdoc />
+        public async Task DeleteAsync(string remotename, CancellationToken cancelToken)
+        {
+            await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, _
+                => systemIO.FileDelete(GetRemoteName(remotename))
+            ).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc />
         public IList<ICommandLineArgument> SupportedCommands
         {
             get
             {
-                return new List<ICommandLineArgument>(new ICommandLineArgument[] {
-                    new CommandLineArgument("auth-password", CommandLineArgument.ArgumentType.Password, Strings.FileBackend.DescriptionAuthPasswordShort, Strings.FileBackend.DescriptionAuthPasswordLong),
-                    new CommandLineArgument("auth-username", CommandLineArgument.ArgumentType.String, Strings.FileBackend.DescriptionAuthUsernameShort, Strings.FileBackend.DescriptionAuthUsernameLong),
+                var lst = new List<ICommandLineArgument>();
+                if (OperatingSystem.IsWindows())
+                    lst.AddRange([
+                        .. AuthOptionsHelper.GetOptions(),
+                        new CommandLineArgument(OPTION_FORCE_REAUTH, CommandLineArgument.ArgumentType.Boolean, Strings.FileBackend.ForceReauthShort, Strings.FileBackend.ForceReauthLong)
+                    ]);
+
+                lst.AddRange([
                     new CommandLineArgument(OPTION_DESTINATION_MARKER, CommandLineArgument.ArgumentType.String, Strings.FileBackend.AlternateDestinationMarkerShort, Strings.FileBackend.AlternateDestinationMarkerLong(OPTION_ALTERNATE_PATHS)),
                     new CommandLineArgument(OPTION_ALTERNATE_PATHS, CommandLineArgument.ArgumentType.Path, Strings.FileBackend.AlternateTargetPathsShort, Strings.FileBackend.AlternateTargetPathsLong(OPTION_DESTINATION_MARKER, System.IO.Path.PathSeparator)),
                     new CommandLineArgument(OPTION_MOVE_FILE, CommandLineArgument.ArgumentType.Boolean, Strings.FileBackend.UseMoveForPutShort, Strings.FileBackend.UseMoveForPutLong),
-                    new CommandLineArgument(OPTION_FORCE_REAUTH, CommandLineArgument.ArgumentType.Boolean, Strings.FileBackend.ForceReauthShort, Strings.FileBackend.ForceReauthLong),
-                    new CommandLineArgument(OPTION_DISABLE_LENGTH_VERIFICATION, CommandLineArgument.ArgumentType.Boolean, Strings.FileBackend.DisableLengthVerificationShort, Strings.FileBackend.DisableLengthVerificationShort),
+                    new CommandLineArgument(OPTION_HARDLINK_GET, CommandLineArgument.ArgumentType.Boolean, Strings.FileBackend.UseHardlinkForGetShort, Strings.FileBackend.UseHardlinkForGetLong),
+                    new CommandLineArgument(OPTION_DISABLE_LENGTH_VERIFICATION, CommandLineArgument.ArgumentType.Boolean, Strings.FileBackend.DisableLengthVerificationShort, Strings.FileBackend.DisableLengthVerificationLong),
+                    new CommandLineArgument(OPTION_DISABLE_FILENAME_SANITIZATION, CommandLineArgument.ArgumentType.Boolean, Strings.FileBackend.DisableFilenameSanitizationShort, Strings.FileBackend.DisableFilenameSanitizationLong),
+                    .. TimeoutOptionsHelper.GetOptions()
+                ]);
 
-                });
-
+                return lst;
             }
         }
 
-        public string Description
-        {
-            get
-            {
-                return Strings.FileBackend.Description;
-            }
-        }
+        /// <inheritdoc />
+        public string Description => Strings.FileBackend.Description;
 
-        public void Test()
-        {
-            this.TestList();
-        }
+        /// <inheritdoc />
+        public Task TestAsync(bool alsoWrite, CancellationToken cancelToken)
+            => this.TestBackendAsync(alsoWrite, cancelToken);
 
-        public void CreateFolder()
+        /// <inheritdoc />
+        public async Task CreateFolderAsync(CancellationToken cancelToken)
         {
             if (systemIO.DirectoryExists(m_path))
                 throw new FolderAreadyExistedException();
 
-            systemIO.DirectoryCreate(m_path);
+            await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, _
+                => systemIO.DirectoryCreate(m_path)
+            ).ConfigureAwait(false);
         }
 
         #endregion
 
         #region IDisposable Members
 
+        /// <inheritdoc />
         public void Dispose()
         {
             m_username = null;
@@ -303,109 +610,93 @@ namespace Duplicati.Library.Backend
 
         #endregion
 
-        private System.IO.DriveInfo GetDrive()
+        /// <summary>
+        /// Maps System.IO exceptions to Duplicati specific exceptions.
+        /// </summary>
+        /// <param name="ex">The exception to map.</param>
+        private static void MapException(Exception ex)
         {
-            string root;
-            if (Platform.IsClientPosix)
-            {
-                string path = Util.AppendDirSeparator(systemIO.PathGetFullPath(m_path));
-                root = "/";
-
-                //Find longest common prefix from mounted devices
-                //TODO: Can trick this with symlinks, where the symlink is on one mounted volume,
-                // and the actual storage is on another
-                foreach (System.IO.DriveInfo di in System.IO.DriveInfo.GetDrives())
-                    if (path.StartsWith(Util.AppendDirSeparator(di.Name), StringComparison.Ordinal) && di.Name.Length > root.Length)
-                        root = di.Name;
-            }
-            else
-            {
-                root = systemIO.GetPathRoot(m_path);
-            }
-
-            // On Windows, DriveInfo is only valid for lettered drives. (e.g., not for UNC paths and shares)
-            // So only attempt to get it if we aren't on Windows or if the root starts with a letter.
-            if (!Platform.IsClientWindows || (root.Length > 0 && char.IsLetter(root[0])))
-            {
-                try
-                {
-                    return new System.IO.DriveInfo(root);
-                }
-                catch (ArgumentException)
-                {
-                    // If there was a problem, fall back to returning null
-                }
-            }
-
-            return null;
+            if (ex is DirectoryNotFoundException)
+                throw new FolderMissingException(Strings.FileBackend.FolderMissingError(ex.Message), ex);
+            if (ex is FileNotFoundException)
+                throw new FileMissingException(Strings.FileBackend.FileNotFoundError(ex.Message), ex);
         }
 
-        public IQuotaInfo Quota
+        /// <inheritdoc />
+        public virtual Task<IQuotaInfo?> GetQuotaInfoAsync(CancellationToken cancelToken)
         {
-            get
-            {
-                System.IO.DriveInfo driveInfo = this.GetDrive();
-                if (driveInfo != null)
-                {
-                    return new QuotaInfo(driveInfo.TotalSize, driveInfo.AvailableFreeSpace);
-                }
+            var spaceInfo = Utility.Utility.GetFreeSpaceForPath(m_path);
+            if (spaceInfo != null)
+                return Task.FromResult<IQuotaInfo?>(new QuotaInfo(spaceInfo.Value.TotalSpace, spaceInfo.Value.FreeSpace));
 
-                if (Platform.IsClientWindows)
-                {
-                    // If we can't get the DriveInfo on Windows, fallback to GetFreeDiskSpaceEx
-                    // https://stackoverflow.com/questions/2050343/programmatically-determining-space-available-from-unc-path
-                    return GetDiskFreeSpace(m_path);
-                }
-
-                return null;
-            }
+            return Task.FromResult<IQuotaInfo?>(null);
         }
 
-        public string[] DNSName
-        {
-            get { return null; }
-        }
+        /// <inheritdoc />
+        public Task<string[]> GetDNSNamesAsync(CancellationToken cancelToken) => Task.FromResult(Array.Empty<string>());
 
-        public void Rename(string oldname, string newname)
+        /// <inheritdoc />
+        public Task RenameAsync(string oldname, string newname, CancellationToken cancellationToken)
         {
             var source = GetRemoteName(oldname);
             var target = GetRemoteName(newname);
             if (systemIO.FileExists(target))
                 systemIO.FileDelete(target);
             systemIO.FileMove(source, target);
+
+            return Task.CompletedTask;
+        }
+
+        /// <inheritdoc />
+        public async Task CreateHardLinkAsync(string existingName, string targetName, CancellationToken cancellationToken)
+        {
+            PreAuthenticate();
+
+            if (!systemIO.DirectoryExists(m_path))
+                throw new FolderMissingException(Strings.FileBackend.FolderMissingError(m_path));
+
+            // Both names come from the caller and are resolved under the backend root, so
+            // a link can neither read from nor write to a place outside the destination.
+            var source = ResolveContainedPath(SanitizeFilename(existingName));
+            var target = ResolveContainedPath(SanitizeFilename(targetName));
+
+            try
+            {
+                await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, _
+                    => systemIO.FileCreateHardLink(source, target)
+                ).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                MapException(ex);
+                throw;
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task DeleteFolderRecursiveAsync(string path, CancellationToken cancellationToken)
+        {
+            PreAuthenticate();
+
+            if (string.IsNullOrWhiteSpace(path))
+                throw new ArgumentException("Refusing to delete the backend root folder", nameof(path));
+
+            var folder = ResolveContainedPath(SanitizeFilename(path));
+            if (string.Equals(systemIO.PathGetFullPath(folder).TrimEnd(System.IO.Path.DirectorySeparatorChar), systemIO.PathGetFullPath(m_path).TrimEnd(System.IO.Path.DirectorySeparatorChar), OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                throw new ArgumentException("Refusing to delete the backend root folder", nameof(path));
+            if (!systemIO.DirectoryExists(folder))
+                return;
+
+            await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancellationToken, _
+                => systemIO.DirectoryDelete(folder, true)
+            ).ConfigureAwait(false);
         }
 
         /// <summary>
-        /// Get the disk free space using the Win32 API's GetDiskFreeSpaceEx function.
+        /// Verifies that the target file size matches the source file size.
         /// </summary>
-        /// <param name="directory">Directory</param>
-        /// <returns>Quota info</returns>
-        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-        public static QuotaInfo GetDiskFreeSpace(string directory)
-        {
-            ulong available;
-            ulong total;
-            if (WindowsDriveHelper.GetDiskFreeSpaceEx(directory, out available, out total, out _))
-            {
-                return new QuotaInfo((long)total, (long)available);
-            }
-            else
-            {
-                return null;
-            }
-        }
-
-        private static class WindowsDriveHelper
-        {
-            [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-            [return: MarshalAs(UnmanagedType.Bool)]
-            public static extern bool GetDiskFreeSpaceEx(
-                string lpDirectoryName,
-                out ulong lpFreeBytesAvailable,
-                out ulong lpTotalNumberOfBytes,
-                out ulong lpTotalNumberOfFreeBytes);
-        }
-
+        /// <param name="targetFilePath">The path to the target file</param>
+        /// <param name="sourceFilePath"> The path to the source file</param>
         private static void VerifyMatchingSize(string targetFilePath, string sourceFilePath)
         {
             try
@@ -428,7 +719,13 @@ namespace Duplicati.Library.Backend
             }
         }
 
-        private static void VerifyMatchingSize(string targetFilePath, Stream sourceStream, long? expectedLength)
+        /// <summary>
+        /// Verifies that the target file size matches the source stream length or expected length.
+        /// </summary>
+        /// <param name="targetFilePath">The path to the target file</param>
+        /// <param name="sourceStream">The source stream to check the length against</param>
+        /// <param name="expectedLength">The expected length of the file</param>
+        private static void VerifyMatchingSize(string targetFilePath, Stream? sourceStream, long? expectedLength)
         {
             try
             {
@@ -440,14 +737,15 @@ namespace Duplicati.Library.Backend
                 long? sourceStreamLength = sourceStream == null ? null : Utility.Utility.GetStreamLength(sourceStream, out isStreamPostion);
 
                 if (sourceStreamLength.HasValue && targetFileInfo.Length != sourceStreamLength.Value)
-                    throw new FileMissingException($"Target file size ({targetFileInfo.Length:n0}) is different from the source length ({sourceStreamLength.Value:n0}){(isStreamPostion ? " - ending stream position)" : "")}. Target: {targetFilePath}");
+                    throw new FileMissingException($"Target file size ({targetFileInfo.Length:n0}) is different from the source length ({sourceStreamLength.Value:n0}){(isStreamPostion ? " - ending stream position" : "")}. Target: {targetFilePath}");
 
                 if (expectedLength.HasValue && targetFileInfo.Length != expectedLength.Value)
                     throw new FileMissingException($"Target file size ({targetFileInfo.Length:n0}) is different from the expected length ({expectedLength.Value:n0}). Target: {targetFilePath}");
             }
             catch
             {
-                try { System.IO.File.Delete(targetFilePath); } catch { }
+                try { System.IO.File.Delete(targetFilePath); }
+                catch { }
                 throw;
             }
         }

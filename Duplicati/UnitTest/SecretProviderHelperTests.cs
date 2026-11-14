@@ -1,0 +1,665 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Logging;
+using Duplicati.Library.Main;
+using Duplicati.Library.Utility;
+using NUnit.Framework;
+using Assert = NUnit.Framework.Legacy.ClassicAssert;
+
+namespace Duplicati.UnitTest;
+
+public class SecretProviderHelperTests : BasicSetupHelper
+{
+    private class MockedSecretProvider : ISecretProvider
+    {
+        public string Key => "mock";
+
+        public string DisplayName => "";
+
+        public string Description => "";
+
+        public Dictionary<string, string> Secrets { get; set; } = new();
+
+        public IList<ICommandLineArgument> SupportedCommands => [];
+
+        public Task<bool> IsSupported(CancellationToken cancellationToken) => Task.FromResult(true);
+
+        public bool IsSetSupported => true;
+
+        public bool ThrowOnInit { get; set; }
+
+        public Task InitializeAsync(System.Uri config, CancellationToken cancellationToken)
+        {
+            if (ThrowOnInit)
+                throw new InvalidOperationException("Initialization failed");
+
+            return Task.CompletedTask;
+        }
+
+        public Task<Dictionary<string, string>> ResolveSecretsAsync(IEnumerable<string> keys, CancellationToken cancellationToken)
+        {
+            var result = new Dictionary<string, string>();
+            foreach (var key in keys)
+            {
+                if (!Secrets.TryGetValue(key, out var value))
+                    throw new UserInformationException($"The key '{key}' was not found", "KeyNotFound");
+
+                result[key] = value;
+            }
+
+            return Task.FromResult(result);
+        }
+
+        public Task SetSecretAsync(string key, string value, bool overwrite, CancellationToken cancellationToken)
+        {
+            if (!overwrite && Secrets.ContainsKey(key))
+                throw new UserInformationException($"The key '{key}' already exists", "KeyAlreadyExists");
+            Secrets[key] = value;
+            return Task.CompletedTask;
+        }
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceSecretsWithDefaultSettingsAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key2"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "value1"},
+            {"key2", "$key2"},
+            {"key3", "value3$key"},
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host/?pass=$key2&user=$key1&other=123")
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=$key2&user=$key1&other=123")
+        };
+
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreEqual("value1", settings["key1"]);
+        Assert.AreEqual("secret2", settings["key2"]);
+        Assert.AreEqual("value3$key", settings["key3"]);
+        Assert.AreEqual("test://host/?pass=secret2&user=secret1&other=123", argsSys[0].ToString());
+        Assert.AreEqual("test://host?pass=secret2&user=secret1&other=123", argsInternal[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceSecretsInHostlessSystemUriAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+
+        var settings = new Dictionary<string, string>();
+
+        // System.UriBuilder collapses host-less urls with schemes it does not
+        // know ("test://?..." becomes "test:/?..."); the replacement must keep
+        // the '//' intact
+        var argsSys = new[] {
+            new System.Uri("test://?pass=$key1&other=123")
+        };
+
+        var argsInternal = Array.Empty<Library.Utility.RelaxedUri>();
+
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreEqual("test:///?pass=secret1&other=123", argsSys[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceSecretsWithIpv6HostAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+
+        var settings = new Dictionary<string, string>();
+
+        // The brackets of an IPv6 literal host must survive the round-trip
+        // through the relaxed parser, or the re-import into System.Uri fails
+        var argsSys = new[] {
+            new System.Uri("http://[::1]:8080/path?pass=$key1&other=123")
+        };
+
+        var argsInternal = Array.Empty<Library.Utility.RelaxedUri>();
+
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreEqual("http://[::1]:8080/path?pass=secret1&other=123", argsSys[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceSecretsWithSlashKeysAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key/with/slash"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "value1"},
+            {"key2", "$key/with/slash"},
+            {"key3", "value3$key"},
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host/?pass=$key/with/slash&user=$key1&other=123")
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=$key/with/slash&user=$key1&other=123")
+        };
+
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreEqual("value1", settings["key1"]);
+        Assert.AreEqual("secret2", settings["key2"]);
+        Assert.AreEqual("value3$key", settings["key3"]);
+        Assert.AreEqual("test://host/?pass=secret2&user=secret1&other=123", argsSys[0].ToString());
+        Assert.AreEqual("test://host?pass=secret2&user=secret1&other=123", argsInternal[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceSecretsWithDashKeysAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key-with-dash"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "value1"},
+            {"key2", "$key-with-dash"},
+            {"key3", "value3$key"},
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host/?pass=$key-with-dash&user=$key1&other=123")
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=$key-with-dash&user=$key1&other=123")
+        };
+
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreEqual("value1", settings["key1"]);
+        Assert.AreEqual("secret2", settings["key2"]);
+        Assert.AreEqual("value3$key", settings["key3"]);
+        Assert.AreEqual("test://host/?pass=secret2&user=secret1&other=123", argsSys[0].ToString());
+        Assert.AreEqual("test://host?pass=secret2&user=secret1&other=123", argsInternal[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplacesSecretsWithUrlEscapingAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret 1%&+abc";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "$key1"}
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host/?pass=$key1&user=user")
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=$key1&user=user")
+        };
+
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        // Check no escaping is done for options
+        Assert.AreEqual("secret 1%&+abc", settings["key1"]);
+
+        // Check escaping is done for the URL
+        Assert.AreEqual("test://host/?pass=secret+1%25%26%2Babc&user=user".ToLowerInvariant(), argsSys[0].ToString().ToLowerInvariant());
+        Assert.AreEqual("test://host?pass=secret+1%25%26%2Babc&user=user", argsInternal[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceSecretsWithExtendedPatternAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key2"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "value1"},
+            {"key2", "${key2}"},
+            {"key3", "value3${key}"},
+            {"secret-provider-pattern", "${}"},
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host/?pass=${key2}&user=${key1}&other=123"),
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=${key2}&user=${key1}&other=123"),
+        };
+
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreEqual("value1", settings["key1"]);
+        Assert.AreEqual("secret2", settings["key2"]);
+        Assert.AreEqual("value3${key}", settings["key3"]);
+        Assert.AreEqual("test://host/?pass=secret2&user=secret1&other=123", argsSys[0].ToString());
+        Assert.AreEqual("test://host?pass=secret2&user=secret1&other=123", argsInternal[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceSecretsWithExtendedLongPatternAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key2"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "value1"},
+            {"key2", ":sec{key2}"},
+            {"key3", "value3:sec{key}"},
+            {"secret-provider-pattern", ":sec{}"},
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host/?pass=:sec{key2}&user=:sec{key1}&other=123"),
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=:sec{key2}&user=:sec{key1}&other=123"),
+        };
+
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreEqual("value1", settings["key1"]);
+        Assert.AreEqual("secret2", settings["key2"]);
+        Assert.AreEqual("value3:sec{key}", settings["key3"]);
+        Assert.AreEqual("test://host/?pass=secret2&user=secret1&other=123", argsSys[0].ToString());
+        Assert.AreEqual("test://host?pass=secret2&user=secret1&other=123", argsInternal[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task DisableRegularSkipsReplacementAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "$key1"},
+            {SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, "regular"}
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=$key1")
+        };
+
+        var result = await SecretProviderHelper.ApplySecretProviderAsync([], argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.IsNull(result);
+        Assert.AreEqual("$key1", settings["key1"]);
+        Assert.AreEqual("test://host?pass=$key1", argsInternal[0].ToString());
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task DisableAllSkipsReplacementAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "$key1"},
+            {SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, "All"}
+        };
+
+        var result = await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, secretProvider, CancellationToken.None);
+
+        Assert.IsNull(result);
+        Assert.AreEqual("$key1", settings["key1"]);
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task DisableDefaultStillReplacesAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "$key1"},
+            {SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, "Default"}
+        };
+
+        var result = await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreSame(secretProvider, result);
+        Assert.AreEqual("secret1", settings["key1"]);
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task DisableDefaultReturnsNoDefaultProviderAsync()
+    {
+        foreach (var mode in new[] { "Default", "All" })
+        {
+            var settings = new Dictionary<string, string>
+            {
+                {SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, mode}
+            };
+
+            Assert.IsNull(await SecretProviderHelper.GetDefaultSecretProviderAsync(settings, CancellationToken.None), mode);
+        }
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public void GetDisableModeMapsLegacyOption()
+    {
+        Assert.AreEqual(SecretProviderHelper.DisableSecretProviderMode.None,
+            SecretProviderHelper.GetDisableMode(new Dictionary<string, string>()));
+
+        Assert.AreEqual(SecretProviderHelper.DisableSecretProviderMode.Regular,
+            SecretProviderHelper.GetDisableMode(new Dictionary<string, string> { { SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, "regular" } }));
+
+        Assert.AreEqual(SecretProviderHelper.DisableSecretProviderMode.Default,
+            SecretProviderHelper.GetDisableMode(new Dictionary<string, string> { { SecretProviderHelper.DISABLE_DEFAULT_SECRET_PROVIDER_OPTION, "true" } }));
+
+        Assert.AreEqual(SecretProviderHelper.DisableSecretProviderMode.All,
+            SecretProviderHelper.GetDisableMode(new Dictionary<string, string> {
+                { SecretProviderHelper.DISABLE_DEFAULT_SECRET_PROVIDER_OPTION, "true" },
+                { SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, "regular" } }));
+
+        Assert.AreEqual(SecretProviderHelper.DisableSecretProviderMode.All,
+            SecretProviderHelper.GetDisableMode(new Dictionary<string, string> {
+                { SecretProviderHelper.DISABLE_DEFAULT_SECRET_PROVIDER_OPTION, "false" },
+                { SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, "all" } }));
+
+        Assert.AreEqual(SecretProviderHelper.DisableSecretProviderMode.Default,
+            SecretProviderHelper.GetDisableMode(new Dictionary<string, string> {
+                { SecretProviderHelper.DISABLE_DEFAULT_SECRET_PROVIDER_OPTION, "true" },
+                { SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, "default" } }));
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task CachedProviderRetainsPatternAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["sec1"] = "secret1";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "!ext{sec1}"}
+        };
+
+        var cachedProvider = SecretProviderHelper.WrapWithCache("", secretProvider, SecretProviderHelper.CachingLevel.InMemory, null, "salt", "!ext{}");
+        await cachedProvider.InitializeAsync(new System.Uri("mock://"), CancellationToken.None);
+
+        await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, cachedProvider, CancellationToken.None);
+
+        Assert.AreEqual("secret1", settings["key1"]);
+
+        settings["key1"] = "!ext{sec1}";
+
+        await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, cachedProvider, CancellationToken.None);
+
+        Assert.AreEqual("secret1", settings["key1"]);
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public void ReplaceFailsIfKeyIsMissing()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "value1"},
+            {"key2", "$key2"},
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host?pass=$key2&user=$key1&other=123"),
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=$key2&user=$key1&other=123"),
+        };
+
+        Assert.ThrowsAsync<UserInformationException>(() => SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None));
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public void ReplaceFailsIfValueIsEmpty()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key2"] = "";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "value1"},
+            {"key2", "$key2"},
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host?pass=$key2&user=$key1&other=123"),
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=$key2&user=$key1&other=123"),
+        };
+
+        Assert.ThrowsAsync<InvalidOperationException>(() => SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None));
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceUsesInMemoryCacheAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key2"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "$key1"},
+            {"key2", "$key2"}
+        };
+
+        var cachedProvider = SecretProviderHelper.WrapWithCache("", secretProvider, SecretProviderHelper.CachingLevel.InMemory, null, "salt", null);
+        await cachedProvider.InitializeAsync(new System.Uri("mock://"), CancellationToken.None);
+
+        await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, cachedProvider, CancellationToken.None);
+
+        secretProvider.Secrets = null;
+
+        settings["key1"] = "$key1";
+        settings["key2"] = "$key2";
+
+        await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, cachedProvider, CancellationToken.None);
+
+        Assert.AreEqual("secret1", settings["key1"]);
+        Assert.AreEqual("secret2", settings["key2"]);
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceUsesPersistedCacheAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key2"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "$key1"},
+            {"key2", "$key2"}
+        };
+
+        using var tempFolder = new TempFolder();
+        var cachedProvider = SecretProviderHelper.WrapWithCache("", secretProvider, SecretProviderHelper.CachingLevel.Persistent, tempFolder, "salt", null);
+        await cachedProvider.InitializeAsync(new System.Uri("mock://"), CancellationToken.None);
+
+        await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, cachedProvider, CancellationToken.None);
+
+        secretProvider.Secrets = null;
+
+        settings["key1"] = "$key1";
+        settings["key2"] = "$key2";
+
+        await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, cachedProvider, CancellationToken.None);
+
+        Assert.AreEqual("secret1", settings["key1"]);
+        Assert.AreEqual("secret2", settings["key2"]);
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceUsesPersistedCacheOnRestartAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key2"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "$key1"},
+            {"key2", "$key2"}
+        };
+
+        using var tempFolder = new TempFolder();
+        var cachedProvider = SecretProviderHelper.WrapWithCache("", secretProvider, SecretProviderHelper.CachingLevel.Persistent, tempFolder, "salt", null);
+        await cachedProvider.InitializeAsync(new System.Uri("mock://"), CancellationToken.None);
+
+        await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, cachedProvider, CancellationToken.None);
+
+        settings["key1"] = "$key1";
+        settings["key2"] = "$key2";
+
+        // Create a new instance of the provider that is unavailable
+        cachedProvider = SecretProviderHelper.WrapWithCache("", secretProvider, SecretProviderHelper.CachingLevel.Persistent, tempFolder, "salt", null);
+        secretProvider.Secrets = null;
+        secretProvider.ThrowOnInit = true;
+
+        await cachedProvider.InitializeAsync(new System.Uri("mock://"), CancellationToken.None);
+
+        await SecretProviderHelper.ApplySecretProviderAsync([], [], settings, null, cachedProvider, CancellationToken.None);
+
+        Assert.AreEqual("secret1", settings["key1"]);
+        Assert.AreEqual("secret2", settings["key2"]);
+    }
+
+    private class LogCapture : ILogDestination
+    {
+        public List<string> Messages { get; } = new();
+
+        public void WriteMessage(LogEntry entry)
+        {
+            Messages.Add(entry.AsString(true));
+        }
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public async Task ReplaceWarnsOnPartialMatchesAsync()
+    {
+        var secretProvider = new MockedSecretProvider();
+        secretProvider.Secrets["key1"] = "secret1";
+        secretProvider.Secrets["key2"] = "secret2";
+
+        var settings = new Dictionary<string, string>
+        {
+            {"key1", "value1"},
+            {"key2", "$key)3"},
+        };
+
+        var argsSys = new[] {
+            new System.Uri("test://host?pass=$key2&user=$key)4&other=123"),
+        };
+
+        var argsInternal = new[] {
+            new Library.Utility.RelaxedUri("test://host?pass=$key2&user=$key)5&other=123"),
+        };
+
+        var logCapture = new LogCapture();
+        using var _ = Log.StartScope(logCapture, LogMessageType.Warning);
+        await SecretProviderHelper.ApplySecretProviderAsync(argsSys, argsInternal, settings, null, secretProvider, CancellationToken.None);
+
+        Assert.AreEqual("value1", settings["key1"]);
+        Assert.AreEqual(logCapture.Messages.Count, 1);
+        Assert.That(logCapture.Messages[0].Contains("Found 3 partial"));
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public void GetProviderSettingsReportsDefaultsForUnwrappedProvider()
+    {
+        var (cachingLevel, pattern) = SecretProviderHelper.GetProviderSettings(new MockedSecretProvider());
+
+        Assert.AreEqual(SecretProviderHelper.CachingLevel.None, cachingLevel);
+        Assert.AreEqual(SecretProviderHelper.DEFAULT_PATTERN, pattern);
+    }
+
+    [Test]
+    [Category("SecretHelper")]
+    public void GetProviderSettingsReportsWrappedProviderSettings()
+    {
+        var wrapped = SecretProviderHelper.WrapWithCache("mock://", new MockedSecretProvider(), SecretProviderHelper.CachingLevel.InMemory, BASEFOLDER, "salt", "%");
+
+        var (cachingLevel, pattern) = SecretProviderHelper.GetProviderSettings(wrapped);
+
+        Assert.AreEqual("mock", wrapped.Key);
+        Assert.AreEqual(SecretProviderHelper.CachingLevel.InMemory, cachingLevel);
+        Assert.AreEqual("%", pattern);
+    }
+
+}

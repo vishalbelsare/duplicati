@@ -1,142 +1,280 @@
-﻿using System;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+#nullable enable
+
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using CoCoL;
 using Duplicati.Library.Common.IO;
 using Duplicati.Server.Serialization;
 using Duplicati.Server.Serialization.Interface;
-using Newtonsoft.Json;
+using Duplicati.WebserverCore;
+using Duplicati.WebserverCore.Abstractions;
+using Duplicati.WebserverCore.Middlewares;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Duplicati.GUI.TrayIcon
 {
     public class HttpServerConnection : IDisposable
     {
-		private static readonly string LOGTAG = Library.Logging.Log.LogTagFromType<HttpServerConnection>();
-        private const string LOGIN_SCRIPT = "login.cgi";
-        private const string STATUS_WINDOW = "index.html";
+        private static readonly string LOGTAG = Library.Logging.Log.LogTagFromType<HttpServerConnection>();
+        private const string LONGPOLL_TIMEOUT = "5m";
+        private readonly HttpClient HTTPCLIENT;
 
-        private const string XSRF_COOKIE = "xsrf-token";
-        private const string XSRF_HEADER = "X-XSRF-Token";
-        private const string AUTH_COOKIE = "session-auth";
+        private record ServerStatusImpl(
+            LiveControlState ProgramState,
+            SuggestedStatusIcon SuggestedStatusIcon,
+            long LastEventID,
+            long LastDataUpdateID,
+            long LastNotificationUpdateID
+        ) : IServerStatus;
 
-        private const string TRAYICONPASSWORDSOURCE_HEADER = "X-TrayIcon-PasswordSource";
+        private record NotificationImpl(
+            long ID,
+            Server.Serialization.NotificationType Type,
+            string Title,
+            string Message,
+            string Exception,
+            string BackupID,
+            string Action,
+            DateTime Timestamp,
+            string LogEntryID,
+            string MessageID,
+            string MessageLogTag
+        ) : INotification;
 
-        private class BackgroundRequest
+        private readonly JsonSerializerOptions serializerOptions = new()
         {
-            public readonly string Method;
-            public readonly string Endpoint;
-            public readonly Dictionary<string, string> Query;
-
-            public BackgroundRequest(string method, string endpoint, Dictionary<string, string> query)
+            PropertyNamingPolicy = null,
+            Converters =
             {
-                this.Method = method;
-                this.Endpoint = endpoint;
-                this.Query = query;
+                new JsonStringEnumConverter(),
+                new DayOfWeekStringEnumConverter()
             }
-        }
+        };
 
-        private readonly string m_apiUri;
-        private readonly string m_baseUri;
-        private string m_password;
-        private readonly bool m_saltedpassword;
-        private string m_authtoken;
-        private string m_xsrftoken;
-        private static readonly System.Text.Encoding ENCODING = System.Text.Encoding.GetEncoding("utf-8");
+        private const string STATUS_WINDOW = "index.html";
+        private const string SIGNIN_WINDOW = "signin.html";
 
-        public delegate void StatusUpdateDelegate(IServerStatus status);
-        public event StatusUpdateDelegate OnStatusUpdated;
+        private record BackgroundRequest(string Method, string Endpoint, string? Body, TimeSpan? Timeout = null);
 
+        private string? m_accesstoken;
+        /// <summary>
+        /// Lets one request at a time get an access token
+        /// </summary>
+        private readonly SemaphoreSlim m_accessTokenLock = new SemaphoreSlim(1, 1);
+        private bool m_isTryingWithPassword;
+        private string ApiUri => BaseUri + "api/v1";
+        private string BaseUri => Util.AppendDirSeparator(_passwordStorageHelper.HostUrl ?? "", "/");
+
+        public Func<IServerStatus, Task>? OnStatusUpdated;
+        public Action? ConnectionClosed;
+        private int _connectionClosedInvoked;
         public long m_lastNotificationId = -1;
         public DateTime m_firstNotificationTime;
-        public delegate void NewNotificationDelegate(INotification notification);
-        public event NewNotificationDelegate OnNotification;
 
+        public delegate void NewNotificationDelegate(INotification notification);
+
+        public event NewNotificationDelegate? OnNotification;
+
+        private long m_lastEventId = 0;
+        /// <summary>
+        /// The number of times a status was taken, to tell whether one came in during a request
+        /// </summary>
+        private long m_statusUpdates;
+        /// <summary>
+        /// Guards taking a status
+        /// </summary>
+        private readonly object m_statusLock = new object();
         private long m_lastDataUpdateId = -1;
         private bool m_disableTrayIconLogin;
 
-        private volatile IServerStatus m_status;
+        private volatile IServerStatus m_status =
+            new ServerStatusImpl(LiveControlState.Paused, SuggestedStatusIcon.Disconnected, 0, 0, 0);
 
-        private volatile bool m_shutdown = false;
-        private volatile System.Threading.Thread m_requestThread;
-        private volatile System.Threading.Thread m_pollThread;
-        private readonly System.Threading.AutoResetEvent m_waitLock;
+        private Task m_requestHandlerTask;
+        private Task m_pollThread;
+        private readonly CancellationTokenSource m_stopToken = new CancellationTokenSource();
 
-        private readonly Dictionary<string, string> m_updateRequest;
-        private readonly Dictionary<string, string> m_options;
         private readonly Program.PasswordSource m_passwordSource;
-        private string m_TrayIconHeaderValue => (m_passwordSource == Program.PasswordSource.Database) ? "database" : "user";
 
-        public IServerStatus Status { get { return m_status; } }
-
-        private readonly object m_lock = new object();
-        private readonly Queue<BackgroundRequest> m_workQueue = new Queue<BackgroundRequest>();
-
-        public HttpServerConnection(Uri server, string password, bool saltedpassword, Program.PasswordSource passwordSource, bool disableTrayIconLogin, Dictionary<string, string> options)
+        public IServerStatus Status
         {
-            m_baseUri = Util.AppendDirSeparator(server.ToString(), "/");
+            get { return m_status; }
+        }
 
-            m_apiUri = m_baseUri + "api/v1";
+        private void UpdateServerUri()
+        {
+            // Reset state to ensure clean reconnection to the new server
+            m_lastEventId = 0;
+            m_lastDataUpdateId = -1;
+            m_lastNotificationId = -1;
+        }
 
+        // Not a named channel: a named channel is shared by the whole process, so closing
+        // one connection would retire the queue of any connection made after it
+        private readonly IChannel<BackgroundRequest> m_workQueue =
+            Channel.Create<BackgroundRequest>();
+
+        private readonly CancellationToken _applicationExitEvent;
+        private readonly PasswordStorageHelper _passwordStorageHelper;
+
+        public Program.PasswordSource PasswordSource => m_passwordSource;
+
+        public HttpServerConnection(IApplicationSettings? applicationSettings,
+            Program.PasswordSource passwordSource, bool disableTrayIconLogin, string acceptedHostCertificate,
+            bool ignoreRevocationFailure,
+            Dictionary<string, string> options,
+            PasswordStorageHelper passwordStorageHelper)
+        {
+            _applicationExitEvent = applicationSettings?.ApplicationExit
+                ?? CancellationToken.None;
+
+            _passwordStorageHelper = passwordStorageHelper;
+            _passwordStorageHelper.OnPasswordChanged += (sender, e) => UpdateServerUri();
             m_disableTrayIconLogin = disableTrayIconLogin;
 
             m_firstNotificationTime = DateTime.Now;
 
-            m_password = password;
-            m_saltedpassword = saltedpassword;
-            m_options = options;
             m_passwordSource = passwordSource;
 
-            m_updateRequest = new Dictionary<string, string>();
-            m_updateRequest["longpoll"] = "false";
-            m_updateRequest["lasteventid"] = "0";
+            var acceptedCertificates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(acceptedHostCertificate))
+                acceptedCertificates.UnionWith(acceptedHostCertificate.Split(new char[] { ',', ';' },
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 
-            UpdateStatus();
+            // Configure the certificate validator using the shared helper, which handles
+            // accept-all, specific hashes and the ignore-revocation-failure option in a
+            // single place instead of replicating the logic here.
+            var httpHandler = new HttpClientHandler();
+            var acceptAll = acceptedCertificates.Contains("*");
+            if (acceptAll || acceptedCertificates.Count > 0 || ignoreRevocationFailure)
+                Duplicati.Library.Utility.HttpClientHelper.ConfigureHandlerCertificateValidator(
+                    httpHandler,
+                    acceptAll,
+                    acceptAll ? null : [.. acceptedCertificates],
+                    ignoreRevocationFailure);
 
-            //We do the first request without long poll,
-            // and all the rest with longpoll
-            m_updateRequest["longpoll"] = "true";
-            m_updateRequest["duration"] = "5m";
-            
-            m_waitLock = new System.Threading.AutoResetEvent(false);
-            m_requestThread = new System.Threading.Thread(ThreadRunner);
-            m_pollThread = new System.Threading.Thread(LongPollRunner);
+            HTTPCLIENT = new HttpClient(httpHandler)
+            {
+                // Max time a request can be pending, actual requests can set a lower limit
+                Timeout = Library.Utility.Timeparser.ParseTimeSpan(LONGPOLL_TIMEOUT) + TimeSpan.FromSeconds(10),
+                DefaultRequestHeaders =
+                {
+                    UserAgent =
+                    {
+                        new ProductInfoHeaderValue("Duplicati-TrayIcon-Monitor",
+                            System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0.0")
+                    }
+                }
+            };
 
-            m_requestThread.Name = "TrayIcon Request Thread";
-            m_pollThread.Name = "TrayIcon Longpoll Thread";
+            m_requestHandlerTask = ThreadRunnerAsync();
+            m_pollThread = LongPollRunnerAsync();
 
-            m_requestThread.Start();
-            m_pollThread.Start();
+            m_requestHandlerTask.ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                    Library.Logging.Log.WriteWarningMessage(LOGTAG, "TrayIconRequestError", t.Exception,
+                        "Crashed request handler");
+                if (Interlocked.CompareExchange(ref _connectionClosedInvoked, 1, 0) == 0)
+                    ConnectionClosed?.Invoke();
+            });
+
+            m_pollThread.ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                    Library.Logging.Log.WriteWarningMessage(LOGTAG, "TrayIconRequestError", t.Exception,
+                        "Crashed poll thread");
+                if (Interlocked.CompareExchange(ref _connectionClosedInvoked, 1, 0) == 0)
+                    ConnectionClosed?.Invoke();
+            });
         }
 
-        private void UpdateStatus()
+        public async Task UpdateStatusAsync()
         {
-            m_status = PerformRequest<IServerStatus>("GET", "/serverstate", m_updateRequest);
-            m_updateRequest["lasteventid"] = m_status.LastEventID.ToString();
+            await PasswordAvailableIfNeededAsync().ConfigureAwait(false);
+            await UpdateStatusAsync(false).ConfigureAwait(false);
+        }
+
+        private async Task UpdateStatusAsync(bool longpoll)
+        {
+            var query = longpoll ? $"?longpoll=true&lastEventId={m_lastEventId}&duration={LONGPOLL_TIMEOUT}" : "";
+            var updatesBefore = Interlocked.Read(ref m_statusUpdates);
+
+            var status = await PerformRequestAsync<ServerStatusImpl>("GET", $"/serverstate{query}", null,
+                longpoll ? Library.Utility.Timeparser.ParseTimeSpan(LONGPOLL_TIMEOUT) : null);
+
+            lock (m_statusLock)
+            {
+                // A plain request runs next to the long poll. If the long poll has taken a state
+                // since this request was sent, that state may be newer than this answer, and
+                // taking this one would put an old state back until the next event, which can
+                // be minutes away. If this answer was the newer one, the next long poll brings
+                // the change at once, as it waits from the event it has seen.
+                if (!longpoll && m_statusUpdates != updatesBefore)
+                {
+                    Library.Logging.Log.WriteVerboseMessage(LOGTAG, "TrayIconStaleStatus", null,
+                        "Ignoring the status from event {0}, as a newer status came in meanwhile", status.LastEventID);
+                    return;
+                }
+
+                m_statusUpdates++;
+                m_status = status;
+                m_lastEventId = status.LastEventID;
+            }
 
             if (OnStatusUpdated != null)
-                OnStatusUpdated(m_status);
+                await OnStatusUpdated(m_status).ConfigureAwait(false);
 
             if (m_lastNotificationId != m_status.LastNotificationUpdateID)
             {
                 m_lastNotificationId = m_status.LastNotificationUpdateID;
-                UpdateNotifications();
+                await UpdateNotificationsAsync().ConfigureAwait(false);
             }
 
             if (m_lastDataUpdateId != m_status.LastDataUpdateID)
             {
                 m_lastDataUpdateId = m_status.LastDataUpdateID;
-                UpdateApplicationSettings();
+                await UpdateApplicationSettingsAsync().ConfigureAwait(false);
             }
         }
 
-        private void UpdateNotifications()
+        private async Task UpdateNotificationsAsync()
         {
-            var req = new Dictionary<string, string>();
-            var notifications = PerformRequest<INotification[]>("GET", "/notifications", req);
+            var notifications = await PerformRequestAsync<NotificationImpl[]>("GET", "/notifications", null, null)
+                .ConfigureAwait(false);
             if (notifications != null)
             {
-                foreach(var n in notifications.Where(x => x.Timestamp > m_firstNotificationTime))
+                foreach (var n in notifications.Where(x => x.Timestamp > m_firstNotificationTime))
                     if (OnNotification != null)
                         OnNotification(n);
 
@@ -145,399 +283,316 @@ namespace Duplicati.GUI.TrayIcon
             }
         }
 
-        private void UpdateApplicationSettings()
+        private async Task UpdateApplicationSettingsAsync()
         {
-            var req = new Dictionary<string, string>();
-            var settings = PerformRequest<Dictionary<string, string>>("GET", "/serversettings", req);
-            if (settings != null && settings.TryGetValue("disable-tray-icon-login", out var str))
+            var settings = await PerformRequestAsync<Dictionary<string, string>>("GET", "/serversettings", null, null)
+                .ConfigureAwait(false);
+            if (settings != null && settings.TryGetValue(Server.Database.ServerSettings.CONST.DISABLE_TRAY_ICON_LOGIN, out var str))
                 m_disableTrayIconLogin = Library.Utility.Utility.ParseBool(str, false);
         }
 
-        private void LongPollRunner()
+        private async Task PasswordAvailableIfNeededAsync()
         {
-            while (!m_shutdown)
+            if (m_passwordSource == Program.PasswordSource.SuppliedPassword && string.IsNullOrWhiteSpace(_passwordStorageHelper.Password))
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(m_stopToken.Token, _applicationExitEvent);
+                await _passwordStorageHelper.WaitForPasswordUpdateAsync(cts.Token).ConfigureAwait(false);
+            }
+        }
+
+        private async Task LongPollRunnerAsync()
+        {
+            var started = DateTime.Now;
+            var errorCount = 0;
+            var hasConnected = false;
+
+            while (!m_stopToken.IsCancellationRequested && !_applicationExitEvent.IsCancellationRequested)
             {
                 try
                 {
-                    UpdateStatus();
+                    var waitTime = TimeSpan.FromSeconds(Math.Min(10, errorCount * 2)) - (DateTime.Now - started);
+                    if (waitTime.TotalSeconds > 0)
+                    {
+                        // Wait for the specified time or until stop or exit is requested
+                        using var cts = CancellationTokenSource.CreateLinkedTokenSource(m_stopToken.Token, _applicationExitEvent);
+                        await Task.Delay(waitTime, cts.Token).ConfigureAwait(false);
+                    }
+
+                    await PasswordAvailableIfNeededAsync().ConfigureAwait(false);
+
+                    started = DateTime.Now;
+                    await UpdateStatusAsync(true).ConfigureAwait(false);
+                    errorCount = 0;
+                    hasConnected = true;
+                }
+                catch (Exception ex) when (ex.IsRetiredException() || m_stopToken.IsCancellationRequested || _applicationExitEvent.IsCancellationRequested)
+                {
+                    Library.Logging.Log.WriteVerboseMessage(LOGTAG, "TrayIconPollRequestError", ex,
+                        "Failed to get response");
+                    return;
                 }
                 catch (Exception ex)
                 {
+                    errorCount++;
+                    // More than 1 error, and we are disconnected
+                    if (errorCount >= 2 && OnStatusUpdated != null || !hasConnected)
+                    {
+                        if (OnStatusUpdated != null)
+                            await OnStatusUpdated.Invoke(new ServerStatusImpl(
+                                LiveControlState.Paused,
+                                SuggestedStatusIcon.Disconnected,
+                                m_lastEventId,
+                                m_lastDataUpdateId,
+                                m_lastNotificationId)).ConfigureAwait(false);
+                    }
+
                     System.Diagnostics.Trace.WriteLine("Request error: " + ex.Message);
-					Library.Logging.Log.WriteWarningMessage(LOGTAG, "TrayIconRequestError", ex, "Failed to get response");
+                    Library.Logging.Log.WriteWarningMessage(LOGTAG, "TrayIconPollRequestError", ex,
+                        "Failed to get response");
                 }
             }
         }
 
-        private void ThreadRunner()
+        private async Task ThreadRunnerAsync()
         {
-            while (!m_shutdown)
+            while (true)
             {
                 try
                 {
-                    BackgroundRequest req;
-                    bool any = false;
-                    do
-                    {
-                        req = null;
-
-                        lock (m_lock)
-                            if (m_workQueue.Count > 0)
-                                req = m_workQueue.Dequeue();
-
-                        if (m_shutdown)
-                            break;
-
-                        if (req != null)
-                        {
-                            any = true;
-                            PerformRequest<string>(req.Method, req.Endpoint, req.Query);
-                        }
-                    
-                    } while (req != null);
-                    
-                    if (!(any || m_shutdown))
-                        m_waitLock.WaitOne(TimeSpan.FromMinutes(1), true);
+                    var req = await m_workQueue.ReadAsync().ConfigureAwait(false);
+                    await PerformRequestAsync<string>(req.Method, req.Endpoint, req.Body, req.Timeout)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex.IsRetiredException() || m_stopToken.IsCancellationRequested)
+                {
+                    Library.Logging.Log.WriteVerboseMessage(LOGTAG, "TrayIconRequestError", ex,
+                        "Failed to get response");
+                    return;
                 }
                 catch (Exception ex)
                 {
                     System.Diagnostics.Trace.WriteLine("Request error: " + ex.Message);
-					Library.Logging.Log.WriteWarningMessage(LOGTAG, "TrayIconRequestError", ex, "Failed to get response");
+                    Library.Logging.Log.WriteWarningMessage(LOGTAG, "TrayIconRequestError", ex,
+                        "Failed to get response");
                 }
             }
         }
 
         public void Close()
         {
-            m_shutdown = true;
-            m_waitLock.Set();
-            m_pollThread.Abort();
-            m_pollThread.Join(TimeSpan.FromSeconds(10));
-            if (!m_requestThread.Join(TimeSpan.FromSeconds(10)))
-            {
-                m_requestThread.Abort();
-                m_requestThread.Join(TimeSpan.FromSeconds(10));
-            }
+            m_stopToken.Cancel();
+            m_workQueue.Retire();
+            if (Interlocked.CompareExchange(ref _connectionClosedInvoked, 1, 0) == 0)
+                ConnectionClosed?.Invoke();
         }
 
-        private static string EncodeQueryString(Dictionary<string, string> dict)
+        private sealed record SigninResponse(string AccessToken);
+
+        private async Task<T> PerformRequestAsync<T>(string method, string urlfragment, string? body, TimeSpan? timeout)
         {
-            return string.Join("&", Array.ConvertAll(dict.Keys.ToArray(), key => string.Format("{0}={1}", Uri.EscapeUriString(key), Uri.EscapeUriString(dict[key]))));
-        }
+            if (string.IsNullOrWhiteSpace(m_accesstoken) && !urlfragment.StartsWith("/auth/"))
+                await ObtainAccessTokenOnceAsync(null).ConfigureAwait(false);
 
-        private class SaltAndNonce
-        {
-            // The JsonProperty attribute allows the Serializer.Deserialize method to
-            // set these readonly fields.
-            [JsonProperty]
-            public readonly string Salt = null;
-
-            [JsonProperty]
-            public readonly string Nonce = null;
-        }
-
-        private SaltAndNonce GetSaltAndNonce()
-        {
-            var httpOptions = new Duplicati.Library.Modules.Builtin.HttpOptions();
-            httpOptions.Configure(m_options);
-
-            using (httpOptions)
-            {
-                var req = (System.Net.HttpWebRequest) System.Net.WebRequest.Create(m_baseUri + LOGIN_SCRIPT);
-                req.Method = "POST";
-                req.UserAgent = "Duplicati TrayIcon Monitor, v" +
-                                System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
-                req.Headers.Add(TRAYICONPASSWORDSOURCE_HEADER, m_TrayIconHeaderValue);
-                req.ContentType = "application/x-www-form-urlencoded";
-
-                Duplicati.Library.Utility.AsyncHttpRequest areq = new Library.Utility.AsyncHttpRequest(req);
-                var body = System.Text.Encoding.ASCII.GetBytes("get-nonce=1");
-                using (var f = areq.GetRequestStream(body.Length))
-                    f.Write(body, 0, body.Length);
-
-                using (var r = (System.Net.HttpWebResponse) areq.GetResponse())
-                using (var s = areq.GetResponseStream())
-                using (var sr = new System.IO.StreamReader(s, ENCODING, true))
-                    return Serializer.Deserialize<SaltAndNonce>(sr);
-            }
-        }
-
-        private string PerformLogin(string password, string nonce)
-        {
-            var httpOptions = new Duplicati.Library.Modules.Builtin.HttpOptions();
-            httpOptions.Configure(m_options);
-
-            using (httpOptions)
-            {
-                System.Net.HttpWebRequest req =
-                    (System.Net.HttpWebRequest) System.Net.WebRequest.Create(m_baseUri + LOGIN_SCRIPT);
-                req.Method = "POST";
-                req.UserAgent = "Duplicati TrayIcon Monitor, v" +
-                                System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
-                req.Headers.Add(TRAYICONPASSWORDSOURCE_HEADER, m_TrayIconHeaderValue);
-                req.ContentType = "application/x-www-form-urlencoded";
-                if (req.CookieContainer == null)
-                    req.CookieContainer = new System.Net.CookieContainer();
-                req.CookieContainer.Add(new System.Net.Cookie("session-nonce", nonce, "/", req.RequestUri.Host));
-
-                //Wrap it all in async stuff
-                Duplicati.Library.Utility.AsyncHttpRequest areq = new Library.Utility.AsyncHttpRequest(req);
-                var body = System.Text.Encoding.ASCII.GetBytes("password=" +
-                                                               Duplicati.Library.Utility.Uri.UrlEncode(password));
-                using (var f = areq.GetRequestStream(body.Length))
-                    f.Write(body, 0, body.Length);
-
-                using (var r = (System.Net.HttpWebResponse) areq.GetResponse())
-                    if (r.StatusCode == System.Net.HttpStatusCode.OK)
-                        return (r.Cookies[AUTH_COOKIE] ?? r.Cookies[Library.Utility.Uri.UrlEncode(AUTH_COOKIE)]).Value;
-
-                return null;
-            }
-        }
-
-        private string GetAuthToken()
-        {
-            var salt_nonce = GetSaltAndNonce();
-            var sha256 = System.Security.Cryptography.SHA256.Create();
-            var password = m_password;
-
-            if (string.IsNullOrWhiteSpace(m_password))
-                return "";
-
-            if (!m_saltedpassword)
-            {
-                var str = System.Text.Encoding.UTF8.GetBytes(m_password);
-                var buf = Convert.FromBase64String(salt_nonce.Salt);
-                sha256.TransformBlock(str, 0, str.Length, str, 0);
-                sha256.TransformFinalBlock(buf, 0, buf.Length);
-                password = Convert.ToBase64String(sha256.Hash);
-                sha256.Initialize();
-            }
-
-            var nonce = Convert.FromBase64String(salt_nonce.Nonce);
-            sha256.TransformBlock(nonce, 0, nonce.Length, nonce, 0);
-            var pwdbuf = Convert.FromBase64String(password);
-            sha256.TransformFinalBlock(pwdbuf, 0, pwdbuf.Length);
-            var pwd = Convert.ToBase64String(sha256.Hash);
-
-            return PerformLogin(pwd, salt_nonce.Nonce);
-        }
-
-        private string GetXSRFToken()
-        {
-            var httpOptions = new Duplicati.Library.Modules.Builtin.HttpOptions();
-            httpOptions.Configure(m_options);
-
-            using (httpOptions)
-            {
-                System.Net.HttpWebRequest req =
-                    (System.Net.HttpWebRequest) System.Net.WebRequest.Create(m_baseUri + STATUS_WINDOW);
-                req.Method = "GET";
-                req.UserAgent = "Duplicati TrayIcon Monitor, v" +
-                                System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
-                req.Headers.Add(TRAYICONPASSWORDSOURCE_HEADER, m_TrayIconHeaderValue);
-                if (req.CookieContainer == null)
-                    req.CookieContainer = new System.Net.CookieContainer();
-
-                //Wrap it all in async stuff
-                Duplicati.Library.Utility.AsyncHttpRequest areq = new Library.Utility.AsyncHttpRequest(req);
-                using (var r = (System.Net.HttpWebResponse) areq.GetResponse())
-                    if (r.StatusCode == System.Net.HttpStatusCode.OK)
-                        return (r.Cookies[XSRF_COOKIE] ?? r.Cookies[Library.Utility.Uri.UrlEncode(XSRF_COOKIE)]).Value;
-
-                return null;
-            }
-        }
-
-        private T PerformRequest<T>(string method, string urlfragment, Dictionary<string, string> queryparams)
-        {
-            var hasTriedXSRF = false;
-            var hasTriedPassword = false;
+            var hasTriedPassword = m_isTryingWithPassword;
 
             while (true)
             {
+                var usedToken = m_accesstoken;
                 try
                 {
-                    return PerformRequestInternal<T>(method, urlfragment, queryparams);
+                    return await PerformRequestInternalAsync<T>(method, urlfragment, body, timeout)
+                        .ConfigureAwait(false);
                 }
-                catch (System.Net.WebException wex)
+                catch (Exception ex)
+                    when (ex is HttpRequestException hex && (hex.StatusCode == HttpStatusCode.Unauthorized ||
+                                                             hex.StatusCode == HttpStatusCode.Forbidden)
+                          || ex is AggregateException aex && aex.InnerExceptions.Any(x =>
+                              x is HttpRequestException hex && (hex.StatusCode == HttpStatusCode.Unauthorized ||
+                                                                hex.StatusCode == HttpStatusCode.Forbidden))
+                         )
                 {
-                    var httpex = wex.Response as HttpWebResponse;
-                    if (httpex == null)
+                    if (hasTriedPassword)
                         throw;
 
-                    if (
-                        !hasTriedXSRF &&
-                        wex.Status == System.Net.WebExceptionStatus.ProtocolError &&
-                        httpex.StatusCode == System.Net.HttpStatusCode.BadRequest &&
-                        httpex.StatusDescription.IndexOf("XSRF", StringComparison.OrdinalIgnoreCase) >= 0)
+                    // TODO: This error handling is error prone and can end up in infinite recursion
+                    // Should rewrite the entire class and use websockets instead
+
+                    // Only try once, and get a new token for the next try
+                    hasTriedPassword = true;
+                    try
                     {
-                        hasTriedXSRF = true;
-                        var t = httpex.Cookies[XSRF_COOKIE]?.Value;
-
-                        if (string.IsNullOrWhiteSpace(t))
-                            t = GetXSRFToken();
-
-                        m_xsrftoken = Duplicati.Library.Utility.Uri.UrlDecode(t);
+                        m_isTryingWithPassword = true;
+                        await ObtainAccessTokenOnceAsync(usedToken).ConfigureAwait(false);
                     }
-                    else if (
-                        !hasTriedPassword &&
-                        wex.Status == System.Net.WebExceptionStatus.ProtocolError &&
-                        httpex.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                    finally
                     {
-                        //Can survive if server password is changed via web ui
-                        switch (m_passwordSource)
-                        {
-                            case Program.PasswordSource.Database:
-                                if (Program.databaseConnection != null)
-                                    Program.databaseConnection.ApplicationSettings.ReloadSettings();
-                                
-                                if (Program.databaseConnection != null && Program.databaseConnection.ApplicationSettings.WebserverPasswordTrayIcon != m_password)
-                                    m_password = Program.databaseConnection.ApplicationSettings.WebserverPasswordTrayIcon;
-                                else
-                                    hasTriedPassword = true;
-                                break;
-                            case Program.PasswordSource.HostedServer:
-                                if (Server.Program.DataConnection != null && Server.Program.DataConnection.ApplicationSettings.WebserverPassword != m_password)
-                                    m_password = Server.Program.DataConnection.ApplicationSettings.WebserverPassword;
-                                else
-                                    hasTriedPassword = true;
-                                break;
-                            default:
-                                throw new ArgumentOutOfRangeException();
-                        }
-
-                        m_authtoken = GetAuthToken();
+                        m_isTryingWithPassword = false;
                     }
-                    else
-                        throw;
                 }
             }
         }
 
-        private T PerformRequestInternal<T>(string method, string endpoint, Dictionary<string, string> queryparams)
+        /// <summary>
+        /// Gets an access token, one request at a time. Requests running at the same time, such
+        /// as the long poll and a status request at start, each logged in otherwise.
+        /// </summary>
+        /// <param name="refusedToken">The token a request was refused with, or <c>null</c> if it had none</param>
+        private async Task ObtainAccessTokenOnceAsync(string? refusedToken)
         {
-            queryparams["format"] = "json";
-
-            string query = EncodeQueryString(queryparams);
-
-            // TODO: This can interfere with running backups, 
-            // as the System.Net.ServicePointManager is shared with
-            // all connections doing ftp/http requests
-            using (var httpOptions = new Duplicati.Library.Modules.Builtin.HttpOptions())
+            await m_accessTokenLock.WaitAsync().ConfigureAwait(false);
+            try
             {
-                httpOptions.Configure(m_options);
+                // Another request got a token while this one waited, so that is the one to use
+                if (!string.IsNullOrWhiteSpace(m_accesstoken) && m_accesstoken != refusedToken)
+                    return;
 
-                var req =
-                    (System.Net.HttpWebRequest) System.Net.WebRequest.Create(
-                        new Uri(m_apiUri + endpoint + '?' + query));
-                req.Method = method;
-                req.Headers.Add("Accept-Charset", ENCODING.BodyName);
-                if (m_xsrftoken != null)
-                    req.Headers.Add(XSRF_HEADER, m_xsrftoken);
-                req.UserAgent = "Duplicati TrayIcon Monitor, v" +
-                                System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
-                req.Headers.Add(TRAYICONPASSWORDSOURCE_HEADER, m_TrayIconHeaderValue);
-                if (req.CookieContainer == null)
-                    req.CookieContainer = new System.Net.CookieContainer();
-
-                if (m_authtoken != null)
-                    req.CookieContainer.Add(new System.Net.Cookie(AUTH_COOKIE, m_authtoken, "/", req.RequestUri.Host));
-                if (m_xsrftoken != null)
-                    req.CookieContainer.Add(new System.Net.Cookie(XSRF_COOKIE, m_xsrftoken, "/", req.RequestUri.Host));
-
-                //Wrap it all in async stuff
-                var areq = new Library.Utility.AsyncHttpRequest(req);
-                req.AllowWriteStreamBuffering = true;
-
-                //Assign the timeout, and add a little processing time as well
-                if (endpoint.Equals("/serverstate", StringComparison.OrdinalIgnoreCase) &&
-                    queryparams.ContainsKey("duration"))
-                    areq.Timeout = (int) (Duplicati.Library.Utility.Timeparser.ParseTimeSpan(queryparams["duration"]) +
-                                          TimeSpan.FromSeconds(5)).TotalMilliseconds;
-
-                using (var r = (System.Net.HttpWebResponse) areq.GetResponse())
-                using (var s = areq.GetResponseStream())
-                    if (typeof(T) == typeof(string))
-                    {
-                        using (System.IO.MemoryStream ms = new System.IO.MemoryStream())
-                        {
-                            s.CopyTo(ms);
-                            return (T) (object) ENCODING.GetString(ms.ToArray());
-                        }
-                    }
-                    else
-                    {
-                        using (var sr = new System.IO.StreamReader(s, ENCODING, true))
-                            return Serializer.Deserialize<T>(sr);
-                    }
+                m_accesstoken = null;
+                await ObtainAccessTokenAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                m_accessTokenLock.Release();
             }
         }
 
-        private void ExecuteAndNotify(string method, string urifragment, Dictionary<string, string> req)
+        private async Task ObtainAccessTokenAsync()
         {
-            lock (m_lock)
+            // If we host the server, issue the access token from the service
+            var sp = Server.Program.DuplicatiWebserver?.Provider;
+            if (sp != null && m_passwordSource == Program.PasswordSource.HostedServer)
             {
-                m_workQueue.Enqueue(new BackgroundRequest(method, urifragment, req));
-                m_waitLock.Set();
+                var provider = sp.GetRequiredService<IJWTTokenProvider>();
+                m_accesstoken = provider.CreateAccessToken("trayicon", provider.TemporaryFamilyId);
+                return;
             }
+
+            // If we know the password, issue a token from the API
+            if (!string.IsNullOrWhiteSpace(_passwordStorageHelper.Password))
+            {
+                m_accesstoken = (await PerformRequestInternalAsync<SigninResponse>("POST", "/auth/login",
+                    JsonSerializer.Serialize(new { Password = _passwordStorageHelper.Password }), null).ConfigureAwait(false)).AccessToken;
+                return;
+            }
+
+            // Otherwise, try to get a signin token
+            var token = await ObtainSignInTokenAsync().ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(token))
+                return;
+
+            // Use the signin token to get an access token
+            m_accesstoken =
+                (await PerformRequestInternalAsync<SigninResponse>("POST", "/auth/signin",
+                    JsonSerializer.Serialize(new { SigninToken = token }), null).ConfigureAwait(false)).AccessToken;
         }
 
-        public void Pause(string duration = null)
+        private async Task<T> PerformRequestInternalAsync<T>(string method, string endpoint, string? body,
+            TimeSpan? timeout)
         {
-            var req = new Dictionary<string, string>();
-            if (!string.IsNullOrWhiteSpace(duration))
-                req.Add("duration", duration);
+            var request = new HttpRequestMessage(new HttpMethod(method), new Uri(ApiUri + endpoint));
+            if (!string.IsNullOrWhiteSpace(m_accesstoken))
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", m_accesstoken);
 
-            ExecuteAndNotify("POST", "/serverstate/pause", req);
+            if (!string.IsNullOrWhiteSpace(body))
+                request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+
+            // Set up response timeout, use 100s which is the .NET default
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(m_stopToken.Token, _applicationExitEvent);
+            cts.CancelAfter(timeout.HasValue
+                ? timeout.Value + TimeSpan.FromSeconds(5)
+                : TimeSpan.FromSeconds(100));
+
+            var response = await HTTPCLIENT.SendAsync(request, cts.Token).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+
+            if (typeof(T) == typeof(string))
+                return (T)(object)await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
+
+            await using var stream = await response.Content.ReadAsStreamAsync(cts.Token).ConfigureAwait(false);
+            return await JsonSerializer.DeserializeAsync<T>(stream, serializerOptions, cts.Token).ConfigureAwait(false)
+                ?? throw new JsonException("Failed to deserialize response.");
+        }
+
+        private void ExecuteAndNotify(string method, string urifragment, string? body)
+        {
+            m_workQueue.WriteNoWait(new BackgroundRequest(method, urifragment, body, null));
+        }
+
+        public void Pause(string? duration = null)
+        {
+            ExecuteAndNotify("POST",
+                $"/serverstate/pause{(string.IsNullOrWhiteSpace(duration) ? "" : $"?duration={duration}")}", null);
         }
 
         public void Resume()
         {
-            var req = new Dictionary<string, string>();
-            ExecuteAndNotify("POST", "/serverstate/resume", req);
+            ExecuteAndNotify("POST", "/serverstate/resume", null);
         }
 
-        public void StopTask(long id)
-        {
-            var req = new Dictionary<string, string>();
-            ExecuteAndNotify("POST", string.Format("/task/{0}/stop", Library.Utility.Uri.UrlPathEncode(id.ToString())), req);
-        }
-
-        public void AbortTask(long id)
-        {
-            var req = new Dictionary<string, string>();
-            ExecuteAndNotify("POST", string.Format("/task/{0}/abort", Library.Utility.Uri.UrlPathEncode(id.ToString())), req);
-        }
-
-        public void RunBackup(long id, bool forcefull = false)
-        {
-            var req = new Dictionary<string, string>();
-            if (forcefull)
-                req.Add("full", "true");
-            ExecuteAndNotify("POST", string.Format("/backup/{0}/start", Library.Utility.Uri.UrlPathEncode(id.ToString())), req);
-        }
-  
-        public void DismissNotification(long id)
-        {
-            var req = new Dictionary<string, string>();
-            ExecuteAndNotify("DELETE", string.Format("/notification/{0}", Library.Utility.Uri.UrlPathEncode(id.ToString())), req);
-        }
 
         public void Dispose()
         {
             Close();
         }
-        
-        public string StatusWindowURL
+
+        private sealed record SigninTokenResponse(string Token);
+
+        private async Task<string> IssueSigninTokenAsync(string password)
+            => (await PerformRequestInternalAsync<SigninTokenResponse>("POST", "/auth/issuesignintoken",
+                JsonSerializer.Serialize(new { Password = password }), null).ConfigureAwait(false)).Token;
+
+        private async Task<string?> ObtainSignInTokenAsync()
         {
-            get 
-            { 
-                if (m_authtoken != null)
-                    return m_baseUri + STATUS_WINDOW + (m_disableTrayIconLogin ? string.Empty : "?auth-token=" + GetAuthToken());
-                
-                return m_baseUri + STATUS_WINDOW; 
+            string? signinjwt = null;
+
+            // If we host the server, issue the token from the service
+            var sp = Server.Program.DuplicatiWebserver?.Provider;
+            if (sp != null && m_passwordSource == Program.PasswordSource.HostedServer)
+            {
+                if (sp.GetRequiredService<Server.Database.Connection>().ApplicationSettings.DisableSigninTokens)
+                    return null;
+
+                signinjwt = sp.GetRequiredService<IJWTTokenProvider>().CreateSigninToken("trayicon");
             }
+
+            // If we have database access, grab the issuer key from the db and issue a token
+            if (string.IsNullOrWhiteSpace(signinjwt) && m_passwordSource == Program.PasswordSource.Database)
+            {
+                Program.databaseConnection.ApplicationSettings.ReloadSettings();
+                if (Program.databaseConnection.ApplicationSettings.DisableSigninTokens)
+                    return null;
+
+                var cfg = Program.databaseConnection.ApplicationSettings.JWTConfig;
+                if (!string.IsNullOrWhiteSpace(cfg))
+                {
+                    var jwtConfig = JsonSerializer.Deserialize<JWTConfig>(cfg) ?? throw new JsonException("Failed to deserialize JWT config");
+                    signinjwt = new JWTTokenProvider(() => jwtConfig).CreateSigninToken("trayicon");
+                }
+            }
+
+            // If we know the password, issue a token from the API
+            if (string.IsNullOrWhiteSpace(signinjwt) && !string.IsNullOrWhiteSpace(_passwordStorageHelper.Password))
+                signinjwt = await IssueSigninTokenAsync(_passwordStorageHelper.Password);
+
+            return signinjwt;
+        }
+
+        public async Task<string> GetStatusWindowURLAsync()
+        {
+            string? signinjwt = null;
+            if (!m_disableTrayIconLogin)
+            {
+                try
+                {
+                    signinjwt = await ObtainSignInTokenAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+            }
+
+            return string.IsNullOrWhiteSpace(signinjwt)
+                ? BaseUri + STATUS_WINDOW
+                : BaseUri + SIGNIN_WINDOW + $"?token={signinjwt}";
         }
     }
 }

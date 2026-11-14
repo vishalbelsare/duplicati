@@ -1,5 +1,34 @@
 <div class="home">
-    <div class="tasks" ng-controller="HomeController">
+
+    
+     <div class="tasks" ng-controller="HomeController">
+
+        <div ng-if="orderBy != null" class="orderbox">
+            <label for="orderby" translate>Order by</label>
+            <select  id="orderby" name="orderby" ng-model="orderBy" 
+                    ng-change="doApplyOrder(orderBy)"
+                    ng-init="orderBy = orderByFromState()">
+                <option value="id" translate>Create Order</option>
+                <option value="backend" translate>Destination Type</option>
+                <option value="lastrun" translate>Last Run</option>
+                <option value="nextrun" translate>Next Scheduled Run</option>
+                <option value="name" translate>Name</option>
+                <option value="schedule" translate>Has Scheduled</option>
+                <option value="sourcesize" translate>Source size</option>
+                <option value="destinationsize" translate>Destination size</option>
+                <option value="duration" translate>Duration</option>
+
+                <option value="-id" translate>Create Order (descending)</option>
+                <option value="-backend" translate>Destination Type (descending)</option>
+                <option value="-lastrun" translate>Last Run (descending)</option>
+                <option value="-nextrun" translate>Next Scheduled Run (descending)</option>
+                <option value="-name" translate>Name (descending)</option>
+                <option value="-schedule" translate>Has Scheduled (descending)</option>
+                <option value="-sourcesize" translate>Source size (descending)</option>
+                <option value="-destinationsize" translate>Destination size (descending)</option>
+                <option value="-duration" translate>Duration (descending)</option>
+            </select>
+       </div>
         <div class="tasklist">
             <div ng-repeat="item in backups" class="task">
                 <a href ng-click="$parent.TaskMenuID == item.Backup.ID ? $parent.TaskMenuID = null : $parent.TaskMenuID = item.Backup.ID">
@@ -15,9 +44,7 @@
                 <dl class="taskmenu" ng-show="$parent.TaskMenuID == item.Backup.ID">
                     <span ng-show="item.Backup.Description">
                         <dt translate>Description:</dt>
-                        <dd>
-                            {{item.Backup.Description}}
-                        </dd>
+                        <dd class="prewrapped-text">{{item.Backup.Description}}</dd>
                     </span>
 
                     <dt translate>Operations:</dt>
@@ -50,14 +77,22 @@
                 </dl>
 
                 <dl>
-                    <dt translate>Last successful backup:</dt>
-                    <dd ng-hide="item.Backup.Metadata == null || item.Backup.Metadata.LastBackupFinished == null"
+                    <dt ng-if="item.Backup.OperationType != 'Sync'" translate>Last successful backup:</dt>
+                    <dt ng-if="item.Backup.OperationType == 'Sync'" translate>Last successful sync:</dt>
+                    <dd ng-if="item.Backup.OperationType != 'Sync'"
+                        ng-hide="item.Backup.Metadata == null || item.Backup.Metadata.LastBackupFinished == null"
                         title="{{item.Backup.Metadata.LastBackupFinished | parsetimestamp }}"
                         translate translate-params-time="item.Backup.Metadata.LastBackupFinished | parseDate:forceActualDate"
                         translate-params-duration="formatDuration(item.Backup.Metadata.LastBackupDuration || item.Backup.Metadata.LastDuration)">{{time}} (took {{duration}})
                     </dd>
+                    <dd ng-if="item.Backup.OperationType == 'Sync'"
+                        ng-hide="item.Backup.Metadata == null || item.Backup.Metadata.LastSyncFinished == null"
+                        title="{{item.Backup.Metadata.LastSyncFinished | parsetimestamp }}"
+                        translate translate-params-time="item.Backup.Metadata.LastSyncFinished | parseDate:forceActualDate"
+                        translate-params-duration="formatDuration(item.Backup.Metadata.LastSyncDuration)">{{time}} (took {{duration}})
+                    </dd>
                     <dd>
-                        <span ng-show="item.Backup.Metadata == null || item.Backup.Metadata.LastBackupFinished == null">{{'Never' | translate}} - </span><a href class="action-link" ng-click="doRun(item.Backup.ID)" translate>Run now</a>
+                        <span ng-show="item.Backup.Metadata == null || (item.Backup.OperationType == 'Sync' ? item.Backup.Metadata.LastSyncFinished : item.Backup.Metadata.LastBackupFinished) == null">{{'Never' | translate}} - </span><a href class="action-link" ng-click="doRun(item.Backup.ID)" translate>Run now</a>
                     </dd>
 
                     <div ng-hide="item.Backup.Metadata == null || item.Backup.Metadata.NextScheduledRun == null">
@@ -80,8 +115,8 @@
                         <dt translate>Progress:</dt>
                         <dd>
                             <div class="progress-small-bg">
-                                <div class="progress-small" style="width: {{(1 - (state.lastPgEvent.CurrentFilesize - state.lastPgEvent.CurrentFileoffset) / state.lastPgEvent.CurrentFilesize) * 200}}px">
-                                    {{(1 - (state.lastPgEvent.CurrentFilesize - state.lastPgEvent.CurrentFileoffset) / state.lastPgEvent.CurrentFilesize) * 100 | number:2}}%
+                                <div class="progress-small" style="width: {{(state.lastPgEvent.CurrentFilesize > 0 ? 1 - (state.lastPgEvent.CurrentFilesize - state.lastPgEvent.CurrentFileoffset) / state.lastPgEvent.CurrentFilesize : 1) * 200}}px">
+                                    {{(state.lastPgEvent.CurrentFilesize > 0 ? 1 - (state.lastPgEvent.CurrentFilesize - state.lastPgEvent.CurrentFileoffset) / state.lastPgEvent.CurrentFilesize : 1) * 100 | number:2}}%
                                 </div>
                             </div>
                         </dd>

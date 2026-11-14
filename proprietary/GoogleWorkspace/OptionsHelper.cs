@@ -1,0 +1,206 @@
+// Copyright (c) 2026 Duplicati Inc. All rights reserved.
+
+using Duplicati.Library.Interface;
+using Duplicati.Library.Utility.Options;
+
+namespace Duplicati.Proprietary.GoogleWorkspace;
+
+[Flags]
+public enum GoogleRootType
+{
+    Users = 1,
+    Groups = 2,
+    SharedDrives = 4,
+    Sites = 8,
+    OrganizationalUnits = 16
+}
+
+[Flags]
+public enum GoogleUserType
+{
+    Gmail = 1,
+    Drive = 2,
+    Calendar = 4,
+    Contacts = 8,
+    Tasks = 16,
+    Keep = 32,
+    Chat = 64
+}
+
+public static class OptionsHelper
+{
+    public const string ModuleKey = "googleworkspace";
+
+    public const string GOOGLE_CLIENT_ID_OPTION = "google-client-id";
+    public const string GOOGLE_CLIENT_SECRET_OPTION = "google-client-secret";
+    public const string GOOGLE_REFRESH_TOKEN_OPTION = "google-refresh-token";
+    public const string GOOGLE_SERVICE_ACCOUNT_JSON_OPTION = "google-service-account-json";
+    public const string GOOGLE_SERVICE_ACCOUNT_FILE_OPTION = "google-service-account-file";
+    public const string GOOGLE_ADMIN_EMAIL_OPTION = "google-admin-email";
+    public const string GOOGLE_INCLUDED_ROOT_TYPES_OPTION = "google-included-root-types";
+    public const string GOOGLE_INCLUDED_USER_TYPES_OPTION = "google-included-user-types";
+    public const string GOOGLE_IGNORE_EXISTING_OPTION = "google-ignore-existing";
+    public const string GOOGLE_AVOID_CALENDAR_ACL_OPTION = "google-ignore-calendar-acl";
+    public const string GOOGLE_EXCLUDE_ARCHIVED_USERS_OPTION = "google-exclude-archived-users";
+    public const string GOOGLE_EXCLUDE_SUSPENDED_USERS_OPTION = "google-exclude-suspended-users";
+    public const string GOOGLE_USE_USER_IDS_IN_PATHS_OPTION = "google-use-user-ids-in-paths";
+    public const string GOOGLE_USE_OU_PATHS_OPTION = "google-use-ou-paths";
+    public const string GOOGLE_DISABLE_GMAIL_DELTA_OPTION = "google-disable-gmail-delta";
+    public const string GOOGLE_DISABLE_DRIVE_DELTA_OPTION = "google-disable-drive-delta";
+    public const string GOOGLE_DISABLE_CALENDAR_DELTA_OPTION = "google-disable-calendar-delta";
+    public const string GOOGLE_DISABLE_CONTACTS_DELTA_OPTION = "google-disable-contacts-delta";
+    public const string GOOGLE_DRIVE_DELTA_MAX_ITEMS_OPTION = "google-drive-delta-max-items";
+
+    /// <summary>
+    /// The default number of changes a drive may report before the backup gives up on the
+    /// incremental walk and lists the drive in full
+    /// </summary>
+    internal const int DEFAULT_DRIVE_DELTA_MAX_ITEMS = 100000;
+
+    private static readonly ICommandLineArgument[] SupportedCommands =
+    [
+        new CommandLineArgument(GOOGLE_CLIENT_ID_OPTION, CommandLineArgument.ArgumentType.String, Strings.Options.GoogleClientIdShort, Strings.Options.GoogleClientIdLong, null, [AuthOptionsHelper.AuthUsernameOption]),
+        new CommandLineArgument(GOOGLE_CLIENT_SECRET_OPTION, CommandLineArgument.ArgumentType.Password, Strings.Options.GoogleClientSecretShort, Strings.Options.GoogleClientSecretLong, null, [AuthOptionsHelper.AuthPasswordOption]),
+        new CommandLineArgument(GOOGLE_REFRESH_TOKEN_OPTION, CommandLineArgument.ArgumentType.Password, Strings.Options.GoogleRefreshTokenShort, Strings.Options.GoogleRefreshTokenLong),
+        new CommandLineArgument(GOOGLE_SERVICE_ACCOUNT_JSON_OPTION, CommandLineArgument.ArgumentType.Password, Strings.Options.GoogleServiceAccountJsonShort, Strings.Options.GoogleServiceAccountJsonLong),
+        new CommandLineArgument(GOOGLE_SERVICE_ACCOUNT_FILE_OPTION, CommandLineArgument.ArgumentType.Path, Strings.Options.GoogleServiceAccountFileShort, Strings.Options.GoogleServiceAccountFileLong),
+        new CommandLineArgument(GOOGLE_ADMIN_EMAIL_OPTION, CommandLineArgument.ArgumentType.String, Strings.Options.GoogleAdminEmailShort, Strings.Options.GoogleAdminEmailLong),
+        ..TimeoutOptionsHelper.GetOptions(),
+    ];
+
+    public static readonly ICommandLineArgument[] RestoreSupportedCommands =
+    [
+        ..SupportedCommands,
+        new CommandLineArgument(GOOGLE_IGNORE_EXISTING_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleIgnoreExistingOptionShort, Strings.Options.GoogleIgnoreExistingOptionLong),
+    ];
+
+    public static readonly ICommandLineArgument[] SourceProviderSupportedCommands =
+    [
+        ..SupportedCommands,
+        new CommandLineArgument(GOOGLE_INCLUDED_ROOT_TYPES_OPTION, CommandLineArgument.ArgumentType.Flags, Strings.Options.GoogleIncludedRootTypesShort, Strings.Options.GoogleIncludedRootTypesLong, string.Join(",", Enum.GetValues<GoogleRootType>().Select(n => n.ToString())), null, Enum.GetNames(typeof(GoogleRootType))),
+        new CommandLineArgument(GOOGLE_INCLUDED_USER_TYPES_OPTION, CommandLineArgument.ArgumentType.Flags, Strings.Options.GoogleIncludedUserTypesShort, Strings.Options.GoogleIncludedUserTypesLong, string.Join(",", Enum.GetValues<GoogleUserType>().Select(n => n.ToString())), null, Enum.GetNames(typeof(GoogleUserType))),
+        new CommandLineArgument(GOOGLE_AVOID_CALENDAR_ACL_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleAvoidCalendarAclOptionShort, Strings.Options.GoogleAvoidCalendarAclOptionLong),
+        new CommandLineArgument(GOOGLE_EXCLUDE_ARCHIVED_USERS_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleExcludeArchivedUsersShort, Strings.Options.GoogleExcludeArchivedUsersLong, "false"),
+        new CommandLineArgument(GOOGLE_EXCLUDE_SUSPENDED_USERS_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleExcludeSuspendedUsersShort, Strings.Options.GoogleExcludeSuspendedUsersLong, "false"),
+        new CommandLineArgument(GOOGLE_USE_USER_IDS_IN_PATHS_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleUseUserIdsInPathsShort, Strings.Options.GoogleUseUserIdsInPathsLong, "false"),
+        new CommandLineArgument(GOOGLE_USE_OU_PATHS_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleUseOuPathsShort, Strings.Options.GoogleUseOuPathsLong, "false"),
+        new CommandLineArgument(GOOGLE_DISABLE_GMAIL_DELTA_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleDisableGmailDeltaShort, Strings.Options.GoogleDisableGmailDeltaLong, "false"),
+        new CommandLineArgument(GOOGLE_DISABLE_DRIVE_DELTA_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleDisableDriveDeltaShort, Strings.Options.GoogleDisableDriveDeltaLong, "false"),
+        new CommandLineArgument(GOOGLE_DISABLE_CALENDAR_DELTA_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleDisableCalendarDeltaShort, Strings.Options.GoogleDisableCalendarDeltaLong, "false"),
+        new CommandLineArgument(GOOGLE_DISABLE_CONTACTS_DELTA_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Options.GoogleDisableContactsDeltaShort, Strings.Options.GoogleDisableContactsDeltaLong, "false"),
+        new CommandLineArgument(GOOGLE_DRIVE_DELTA_MAX_ITEMS_OPTION, CommandLineArgument.ArgumentType.Integer, Strings.Options.GoogleDriveDeltaMaxItemsShort, Strings.Options.GoogleDriveDeltaMaxItemsLong, DEFAULT_DRIVE_DELTA_MAX_ITEMS.ToString()),
+    ];
+
+    public class GoogleWorkspaceOptions
+    {
+        public string? ClientId { get; set; }
+        public string? ClientSecret { get; set; }
+        public string? RefreshToken { get; set; }
+        public string? ServiceAccountJson { get; set; }
+        public string? AdminEmail { get; set; }
+        public string MachineId { get; set; } = "";
+        public GoogleRootType[] IncludedRootTypes { get; set; } = Enum.GetValues<GoogleRootType>().ToArray();
+        public GoogleUserType[] IncludedUserTypes { get; set; } = Enum.GetValues<GoogleUserType>().ToArray();
+        /// <summary>
+        /// Whether archived user accounts are left out of the backup. Off by default: their
+        /// Gmail and Drive data remain readable and they do not consume a seat.
+        /// </summary>
+        public bool ExcludeArchivedUsers { get; set; }
+        /// <summary>
+        /// Whether suspended user accounts are left out of the backup. Off by default: they
+        /// do not consume a seat.
+        /// </summary>
+        public bool ExcludeSuspendedUsers { get; set; }
+        /// <summary>
+        /// Whether the folder of a user is named by the user id instead of the primary email
+        /// address. Off by default: it changes the path of every item of every user. Always on
+        /// when <see cref="UseOuPaths"/> is on.
+        /// </summary>
+        public bool UseUserIdsInPaths { get; set; }
+        /// <summary>
+        /// Whether the user folders are placed in a folder per organizational unit. Off by
+        /// default: it changes the path of every item of every user.
+        /// </summary>
+        public bool UseOuPaths { get; set; }
+        /// <summary>
+        /// Whether mailboxes are walked from the Gmail history when the provider is used for a backup
+        /// </summary>
+        public bool GmailDelta { get; set; } = true;
+        /// <summary>
+        /// Whether drives are walked from the Drive changes feed when the provider is used for a backup
+        /// </summary>
+        public bool DriveDelta { get; set; } = true;
+        /// <summary>
+        /// Whether calendars are walked with sync tokens when the provider is used for a backup
+        /// </summary>
+        public bool CalendarDelta { get; set; } = true;
+        /// <summary>
+        /// Whether contacts are walked with sync tokens when the provider is used for a backup
+        /// </summary>
+        public bool ContactsDelta { get; set; } = true;
+        /// <summary>
+        /// The number of changes a drive may report before the incremental walk is abandoned
+        /// and the drive is listed in full
+        /// </summary>
+        public int DriveDeltaMaxItems { get; set; } = DEFAULT_DRIVE_DELTA_MAX_ITEMS;
+        /// <summary>
+        /// The standard timeouts. The read-write timeout bounds how long a read of file content
+        /// may wait for bytes before the connection is taken as stalled and the download resumed.
+        /// </summary>
+        public TimeoutOptionsHelper.Timeouts Timeouts { get; set; } = TimeoutOptionsHelper.Parse(new Dictionary<string, string?>());
+    }
+
+    public static GoogleWorkspaceOptions ParseOptions(Dictionary<string, string?> options)
+    {
+        var result = new GoogleWorkspaceOptions();
+
+        if (options.ContainsKey(GOOGLE_CLIENT_ID_OPTION))
+            result.ClientId = options[GOOGLE_CLIENT_ID_OPTION];
+        if (options.ContainsKey(GOOGLE_CLIENT_SECRET_OPTION))
+            result.ClientSecret = options[GOOGLE_CLIENT_SECRET_OPTION];
+        if (options.ContainsKey(GOOGLE_REFRESH_TOKEN_OPTION))
+            result.RefreshToken = options[GOOGLE_REFRESH_TOKEN_OPTION];
+
+        if (options.ContainsKey(GOOGLE_SERVICE_ACCOUNT_JSON_OPTION))
+            result.ServiceAccountJson = options[GOOGLE_SERVICE_ACCOUNT_JSON_OPTION];
+
+        if (string.IsNullOrEmpty(result.ServiceAccountJson) && options.ContainsKey(GOOGLE_SERVICE_ACCOUNT_FILE_OPTION))
+        {
+            var path = options[GOOGLE_SERVICE_ACCOUNT_FILE_OPTION];
+            if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path))
+            {
+                result.ServiceAccountJson = System.IO.File.ReadAllText(path);
+            }
+        }
+
+        if (options.ContainsKey(GOOGLE_ADMIN_EMAIL_OPTION))
+            result.AdminEmail = options[GOOGLE_ADMIN_EMAIL_OPTION];
+
+        // Honor the global "machine-id" option, falling back to the AutoUpdater machine id
+        result.MachineId = options.TryGetValue("machine-id", out var machineId) && !string.IsNullOrWhiteSpace(machineId)
+            ? machineId
+            : Library.AutoUpdater.DataFolderManager.GetMachineID();
+
+        var includedRootTypes = Library.Utility.Utility.ParseFlagsOption(options, GOOGLE_INCLUDED_ROOT_TYPES_OPTION, (GoogleRootType)Enum.GetValues<GoogleRootType>().Cast<int>().Aggregate(0, (acc, type) => acc | type));
+        var includedUserTypes = Library.Utility.Utility.ParseFlagsOption(options, GOOGLE_INCLUDED_USER_TYPES_OPTION, (GoogleUserType)Enum.GetValues<GoogleUserType>().Cast<int>().Aggregate(0, (acc, type) => acc | type));
+
+        result.IncludedRootTypes = Enum.GetValues<GoogleRootType>().Where(n => includedRootTypes.HasFlag(n)).ToArray();
+        result.IncludedUserTypes = Enum.GetValues<GoogleUserType>().Where(n => includedUserTypes.HasFlag(n)).ToArray();
+        result.ExcludeArchivedUsers = Library.Utility.Utility.ParseBoolOption(options, GOOGLE_EXCLUDE_ARCHIVED_USERS_OPTION);
+        result.ExcludeSuspendedUsers = Library.Utility.Utility.ParseBoolOption(options, GOOGLE_EXCLUDE_SUSPENDED_USERS_OPTION);
+        result.UseOuPaths = Library.Utility.Utility.ParseBoolOption(options, GOOGLE_USE_OU_PATHS_OPTION);
+        // Force userIdsInPaths on if the setup is using OU paths
+        result.UseUserIdsInPaths = result.UseOuPaths || Library.Utility.Utility.ParseBoolOption(options, GOOGLE_USE_USER_IDS_IN_PATHS_OPTION);
+        result.GmailDelta = !Library.Utility.Utility.ParseBoolOption(options, GOOGLE_DISABLE_GMAIL_DELTA_OPTION);
+        result.DriveDelta = !Library.Utility.Utility.ParseBoolOption(options, GOOGLE_DISABLE_DRIVE_DELTA_OPTION);
+        result.CalendarDelta = !Library.Utility.Utility.ParseBoolOption(options, GOOGLE_DISABLE_CALENDAR_DELTA_OPTION);
+        result.ContactsDelta = !Library.Utility.Utility.ParseBoolOption(options, GOOGLE_DISABLE_CONTACTS_DELTA_OPTION);
+        result.DriveDeltaMaxItems = Library.Utility.Utility.ParseIntOption(options, GOOGLE_DRIVE_DELTA_MAX_ITEMS_OPTION, DEFAULT_DRIVE_DELTA_MAX_ITEMS);
+        if (result.DriveDeltaMaxItems < 1)
+            throw new UserInformationException($"The option --{GOOGLE_DRIVE_DELTA_MAX_ITEMS_OPTION} must be a positive number", "InvalidDriveDeltaMaxItems");
+
+        result.Timeouts = TimeoutOptionsHelper.Parse(options);
+
+        return result;
+    }
+}

@@ -1,19 +1,24 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using System.Collections.Generic;
 using Newtonsoft.Json;
@@ -62,24 +67,24 @@ namespace Duplicati.Library
             ContentLength = content.Length;
         }
 
-        public string ContentType 
-        { 
-            get 
-            { 
-                return Headers.ContainsKey("Content-Type") ? Headers["Content-Type"] : null; 
-            } 
-            set 
-            { 
+        public string ContentType
+        {
+            get
+            {
+                return Headers.ContainsKey("Content-Type") ? Headers["Content-Type"] : null;
+            }
+            set
+            {
                 if (string.IsNullOrWhiteSpace(value))
                     Headers.Remove("Content-Type");
                 else
-                    Headers["Content-Type"] = value; 
-            } 
+                    Headers["Content-Type"] = value;
+            }
         }
 
         public Stream ContentData { get; set; }
         public Dictionary<string, string> Headers { get; set; }
-        public string ContentTypeName 
+        public string ContentTypeName
         {
             get
             {
@@ -87,16 +92,16 @@ namespace Duplicati.Library
                 Headers.TryGetValue("Content-Disposition", out v);
                 if (string.IsNullOrWhiteSpace(v))
                     return null;
-                
+
                 var m = new System.Text.RegularExpressions.Regex("name=\"(?<name>[^\"]+)\"").Match(v);
                 return m.Success ? m.Groups["name"].Value : null;
             }
-            set 
-            { 
+            set
+            {
                 if (string.IsNullOrWhiteSpace(value))
                     Headers.Remove("Content-Disposition");
                 else
-                    Headers["Content-Disposition"] = string.Format("form-data; name=\"{0}\"", Library.Utility.Uri.UrlEncode(value)); 
+                    Headers["Content-Disposition"] = string.Format("form-data; name=\"{0}\"", Library.Utility.UrlEncoding.UrlEncode(value));
             }
         }
 
@@ -127,7 +132,7 @@ namespace Duplicati.Library
         }
         public MultipartItem SetHeader(string key, string value)
         {
-            return SetHeaderRaw(key, Library.Utility.Uri.UrlEncode(value));
+            return SetHeaderRaw(key, Library.Utility.UrlEncoding.UrlEncode(value));
         }
         public MultipartItem SetContentDisposition(string name, string filename = null)
         {
@@ -136,9 +141,10 @@ namespace Duplicati.Library
                 this.ContentTypeName = name;
                 return this;
             }
-                
-            return SetHeaderRaw("Content-Disposition", string.Format("form-data; name=\"{0}\"; filename=\"{1}\"", Library.Utility.Uri.UrlEncode(name), Library.Utility.Uri.UrlEncode(filename)));
+
+            return SetHeaderRaw("Content-Disposition", string.Format("form-data; name=\"{0}\"; filename=\"{1}\"", Library.Utility.UrlEncoding.UrlEncode(name), Library.Utility.UrlEncoding.UrlEncode(filename)));
         }
 
-    }}
+    }
+}
 

@@ -1,20 +1,38 @@
-﻿using Duplicati.Library.Common.IO;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
+using Duplicati.Library.Utility;
+using Duplicati.Library.Utility.Options;
+using System.Runtime.CompilerServices;
+
+[assembly: InternalsVisibleTo("Duplicati.UnitTest")]
 
 namespace Duplicati.Library.Backend
 {
     // ReSharper disable once UnusedMember.Global
     // This class is instantiated dynamically in the BackendLoader.
-    public class Dropbox : IBackend, IStreamingBackend
+    public class Dropbox : IBackend, IStreamingBackend, IRenameEnabledBackend, IFolderEnabledBackend
     {
-        private const string AUTHID_OPTION = "authid";
-
-        private readonly string m_accesToken;
+        private static readonly string TOKEN_URL = AuthIdOptionsHelper.GetOAuthLoginUrl("dropbox", null);
         private readonly string m_path;
         private readonly DropboxHelper dbx;
 
@@ -22,45 +40,70 @@ namespace Duplicati.Library.Backend
         // This constructor is needed by the BackendLoader.
         public Dropbox()
         {
+            m_path = null!;
+            dbx = null!;
         }
 
         // ReSharper disable once UnusedMember.Global
         // This constructor is needed by the BackendLoader.
-        public Dropbox(string url, Dictionary<string, string> options)
+        public Dropbox(string url, Dictionary<string, string?> options)
+            : this(url, options, null)
         {
-            var uri = new Utility.Uri(url);
+        }
 
-            m_path = Library.Utility.Uri.UrlDecode(uri.HostAndPath);
+        /// <summary>
+        /// Creates a backend that uses the supplied <see cref="HttpClient"/>,
+        /// so the Dropbox API responses can be stubbed in tests
+        /// </summary>
+        /// <param name="url">The backend url</param>
+        /// <param name="options">The options to use</param>
+        /// <param name="httpClient">The client to use, or null to create one</param>
+        internal Dropbox(string url, Dictionary<string, string?> options, HttpClient? httpClient)
+        {
+            var uri = new Utility.RelaxedUri(url);
+
+            // RelaxedUri decodes both the host and the path as it parses, so HostAndPath is
+            // already decoded and decoding it again loses whatever was spelled with a percent
+            // sign: a folder named "a%20b", written as "a%2520b", arrived here as "a b".
+            m_path = uri.HostAndPath;
             if (m_path.Length != 0 && !m_path.StartsWith("/", StringComparison.Ordinal))
                 m_path = "/" + m_path;
 
             if (m_path.EndsWith("/", StringComparison.Ordinal))
                 m_path = m_path.Substring(0, m_path.Length - 1);
 
-            if (options.ContainsKey(AUTHID_OPTION))
-                m_accesToken = options[AUTHID_OPTION];
+            var authId = AuthIdOptionsHelper.Parse(options);
+            authId.RequireCredentials(TOKEN_URL);
 
-            dbx = new DropboxHelper(m_accesToken);
+            dbx = new DropboxHelper(authId, TimeoutOptionsHelper.Parse(options), httpClient);
         }
 
+        /// <inheritdoc/>
         public void Dispose()
         {
             // do nothing
         }
 
-        public string DisplayName
-        {
-            get { return Strings.Dropbox.DisplayName; }
-        }
+        /// <inheritdoc/>
+        public string DisplayName => Strings.Dropbox.DisplayName;
 
-        public string ProtocolKey
-        {
-            get { return "dropbox"; }
-        }
+        /// <inheritdoc/>
+        public string ProtocolKey => "dropbox";
+
+        /// <inheritdoc/>
+        // Dropbox paths are case-insensitive
+        public bool HasCaseSensitivePaths => false;
+
+        /// <inheritdoc/>
+        public bool SupportsStreaming => true;
 
         private IFileEntry ParseEntry(MetaData md)
         {
-            var ife = new FileEntry(md.name);
+            var name = md.name;
+            if (!md.IsFile && !string.IsNullOrEmpty(name) && !name.EndsWith("/"))
+                name += "/";
+
+            var ife = new FileEntry(name);
             if (md.IsFile)
             {
                 ife.IsFolder = false;
@@ -71,100 +114,140 @@ namespace Duplicati.Library.Backend
                 ife.IsFolder = true;
             }
 
-            try { ife.LastModification = ife.LastAccess = DateTime.Parse(md.server_modified).ToUniversalTime(); }
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(md.server_modified))
+                    ife.LastModification = ife.LastAccess = DateTime.Parse(md.server_modified).ToUniversalTime();
+            }
             catch { }
 
             return ife;
         }
 
-        private T HandleListExceptions<T>(Func<T> func)
+        private void ThrowFolderMissingException(DropboxException de)
+        {
+            if (de.errorJSON?["error"]?[".tag"]?.ToString() == "path" && de.errorJSON?["error"]?["path"]?[".tag"]?.ToString() == "not_found")
+                throw new FolderMissingException();
+        }
+
+        private async Task<T> HandleListExceptions<T>(Func<Task<T>> func)
         {
             try
             {
-                return func();
+                return await func().ConfigureAwait(false);
             }
             catch (DropboxException de)
             {
-                if (de.errorJSON["error"][".tag"].ToString() == "path" && de.errorJSON["error"]["path"][".tag"].ToString() == "not_found")
-                    throw new FolderMissingException();
-
+                ThrowFolderMissingException(de);
                 throw;
             }
         }
 
-        public IEnumerable<IFileEntry> List()
+        public IAsyncEnumerable<IFileEntry> ListAsync(CancellationToken cancelToken)
+            => ListAsync(null, cancelToken);
+
+
+        private string GetAbsolutePath(string? path)
         {
-            var lfr = HandleListExceptions(() => dbx.ListFiles(m_path));
-              
-            foreach (var md in lfr.entries)
+            if (string.IsNullOrWhiteSpace(path))
+                return m_path;
+
+            var p = path.Replace(Path.DirectorySeparatorChar, '/').Trim('/');
+            if (string.IsNullOrWhiteSpace(m_path) || m_path == "/")
+                p = "/" + p;
+            else
+                p = Util.AppendDirSeparator(m_path, "/") + p;
+
+            if (p == "/")
+                p = "";
+
+            return p;
+        }
+
+        public async IAsyncEnumerable<IFileEntry> ListAsync(string? path, [EnumeratorCancellation] CancellationToken cancelToken)
+        {
+            var fullPath = GetAbsolutePath(path);
+            var lfr = await HandleListExceptions(() => dbx.ListFiles(fullPath, cancelToken)).ConfigureAwait(false);
+
+            foreach (var md in lfr.entries ?? [])
                 yield return ParseEntry(md);
 
             while (lfr.has_more)
             {
-                lfr = HandleListExceptions(() => dbx.ListFilesContinue(lfr.cursor));
-                foreach (var md in lfr.entries)
+                lfr = await HandleListExceptions(() => dbx.ListFilesContinue(lfr.cursor!, cancelToken)).ConfigureAwait(false);
+                foreach (var md in lfr.entries ?? [])
                     yield return ParseEntry(md);
+            }
+        }
+
+        public async Task<IFileEntry?> GetEntryAsync(string path, CancellationToken cancellationToken)
+        {
+            var fullPath = GetAbsolutePath(path);
+            if (string.IsNullOrEmpty(fullPath))
+                return new FileEntry(string.Empty) { IsFolder = true };
+
+            try
+            {
+                var md = await dbx.GetMetadataAsync(fullPath, cancellationToken).ConfigureAwait(false);
+                if (md == null)
+                    return null;
+                return ParseEntry(md);
+            }
+            catch (Exception ex) when (ex is FolderMissingException || ex is DropboxException)
+            {
+                return null;
             }
         }
 
         public async Task PutAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            using(FileStream fs = File.OpenRead(filename))
-                await PutAsync(remotename, fs, cancelToken);
+            using (var fs = File.OpenRead(filename))
+                await PutAsync(remotename, fs, cancelToken).ConfigureAwait(false);
         }
 
-        public void Get(string remotename, string filename)
+        public async Task GetAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            using(FileStream fs = File.Create(filename))
-                Get(remotename, fs);
+            using (var fs = File.Create(filename))
+                await GetAsync(remotename, fs, cancelToken).ConfigureAwait(false);
         }
 
-        public void Delete(string remotename)
+        public async Task DeleteAsync(string remotename, CancellationToken cancelToken)
         {
             try
             {
-                string path = String.Format("{0}/{1}", m_path, remotename);
-                dbx.Delete(path);
+                var path = $"{m_path}/{remotename}";
+                await dbx.DeleteAsync(path, cancelToken).ConfigureAwait(false);
             }
-            catch (DropboxException)
+            catch (DropboxException de)
             {
-                // we can catch some events here and convert them to Duplicati exceptions
+                ThrowFolderMissingException(de);
                 throw;
             }
         }
 
-        public IList<ICommandLineArgument> SupportedCommands
-        {
-            get
-            {
-                return new List<ICommandLineArgument>(new ICommandLineArgument[] {
-                    new CommandLineArgument(AUTHID_OPTION, CommandLineArgument.ArgumentType.Password, Strings.Dropbox.AuthidShort, Strings.Dropbox.AuthidLong(OAuthHelper.OAUTH_LOGIN_URL("dropbox"))),
-                });
-            }
-        }
+        public IList<ICommandLineArgument> SupportedCommands =>
+        [
+            .. AuthIdOptionsHelper.GetOptions(TOKEN_URL),
+            .. TimeoutOptionsHelper.GetOptions(),
+        ];
 
         public string Description { get { return Strings.Dropbox.Description; } }
 
-        public string[] DNSName
-        {
-            get { return WebApi.Dropbox.Hosts(); }
-        }
+        public Task<string[]> GetDNSNamesAsync(CancellationToken cancelToken) => Task.FromResult(WebApi.Dropbox.Hosts());
 
-        public void Test()
-        {
-            this.TestList();
-        }
+        public Task TestAsync(bool alsoWrite, CancellationToken cancelToken)
+            => this.TestBackendAsync(alsoWrite, cancelToken);
 
-        public void CreateFolder()
+        public async Task CreateFolderAsync(CancellationToken cancelToken)
         {
             try
             {
-                dbx.CreateFolder(m_path);
+                await dbx.CreateFolderAsync(m_path, cancelToken).ConfigureAwait(false);
             }
             catch (DropboxException de)
             {
 
-                if (de.errorJSON["error"][".tag"].ToString() == "path" && de.errorJSON["error"]["path"][".tag"].ToString() == "conflict")
+                if (de.errorJSON?["error"]?[".tag"]?.ToString() == "path" && de.errorJSON["error"]?["path"]?[".tag"]?.ToString() == "conflict")
                     throw new FolderAreadyExistedException();
                 throw;
             }
@@ -177,23 +260,38 @@ namespace Duplicati.Library.Backend
                 string path = $"{m_path}/{remotename}";
                 await dbx.UploadFileAsync(path, stream, cancelToken);
             }
-            catch (DropboxException)
+            catch (DropboxException de)
             {
-                // we can catch some events here and convert them to Duplicati exceptions
+                ThrowFolderMissingException(de);
                 throw;
             }
         }
 
-        public void Get(string remotename, Stream stream)
+        public async Task GetAsync(string remotename, Stream stream, CancellationToken cancelToken)
         {
             try
             {
                 string path = string.Format("{0}/{1}", m_path, remotename);
-                dbx.DownloadFile(path, stream);
+                await dbx.DownloadFileAsync(path, stream, cancelToken).ConfigureAwait(false);
             }
-            catch (DropboxException)
+            catch (DropboxException de)
             {
-                // we can catch some events here and convert them to Duplicati exceptions
+                ThrowFolderMissingException(de);
+                throw;
+            }
+        }
+
+        public async Task RenameAsync(string oldname, string newname, CancellationToken cancellationToken)
+        {
+            try
+            {
+                string oldPath = $"{m_path}/{oldname}";
+                string newPath = $"{m_path}/{newname}";
+                await dbx.MoveAsync(oldPath, newPath, cancellationToken).ConfigureAwait(false);
+            }
+            catch (DropboxException de)
+            {
+                ThrowFolderMissingException(de);
                 throw;
             }
         }

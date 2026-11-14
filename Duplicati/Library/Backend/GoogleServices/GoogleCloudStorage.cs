@@ -1,127 +1,246 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using Duplicati.Library.Backend.GoogleServices;
 using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Utility;
-using Newtonsoft.Json;
-using System;
-using System.Collections.Generic;
+using Duplicati.Library.Utility.Options;
+using Google.Apis.Auth.OAuth2;
 using System.Net;
+using System.Net.Http.Json;
+using System.Runtime.CompilerServices;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
+using Duplicati.StreamUtil;
 
 namespace Duplicati.Library.Backend.GoogleCloudStorage
 {
     // ReSharper disable once UnusedMember.Global
     // This class is instantiated dynamically in the BackendLoader.
-    public class GoogleCloudStorage : IBackend, IStreamingBackend, IRenameEnabledBackend
+    public class GoogleCloudStorage : IBackend, IStreamingBackend, ILockingBackend, IRenameEnabledBackend
     {
-        private const string AUTHID_OPTION = "authid";
+        private static readonly string TOKEN_URL = AuthIdOptionsHelper.GetOAuthLoginUrl("gcs", null);
         private const string PROJECT_OPTION = "gcs-project";
 
         private const string LOCATION_OPTION = "gcs-location";
         private const string STORAGECLASS_OPTION = "gcs-storage-class";
+        private const string SERVICE_ACCOUNT_JSON_OPTION = "gcs-service-account-json";
+        private const string SERVICE_ACCOUNT_FILE_OPTION = "gcs-service-account-file";
+        private const string RETENTION_POLICY_MODE_OPTION = "gcs-retention-policy-mode";
+
+        private const RetentionPolicyMode DEFAULT_RETENTION_POLICY_MODE = RetentionPolicyMode.Unlocked;
+
+        /// <summary>
+        /// The scope used to request access to Google Cloud Storage.
+        /// </summary>
+        private const string CREDENTIAL_SCOPE = "https://www.googleapis.com/auth/devstorage.read_write";
+        /// <summary>
+        /// The scope used to request full control access to Google Cloud Storage, needed for setting object retention.
+        /// </summary>
+        private const string CREDENTIAL_SCOPE_FULL_CONTROL = "https://www.googleapis.com/auth/devstorage.full_control";
 
         private readonly string m_bucket;
         private readonly string m_prefix;
-        private readonly string m_project;
-        private readonly OAuthHelper m_oauth;
+        private readonly string? m_project;
+        private readonly JsonWebHelperHttpClient m_oauth;
 
-        private readonly string m_location;
-        private readonly string m_storage_class;
+        /// <summary>
+        /// Cached instance of the full control OAuth client.
+        /// </summary>
+        private JsonWebHelperHttpClient? m_oauth_fullcontrol;
+        /// <summary>
+        /// Only create the full control client when needed, but capture all parameters in the constructor.
+        /// </summary>
+        private readonly Func<JsonWebHelperHttpClient?> m_create_oauth_fullcontrol;
+
+        private readonly string? m_location;
+        private readonly string? m_storage_class;
+        private readonly RetentionPolicyMode m_retention_policy_mode;
+        private readonly TimeoutOptionsHelper.Timeouts m_timeouts;
 
         public GoogleCloudStorage()
         {
+            m_bucket = null!;
+            m_prefix = null!;
+            m_oauth = null!;
+            m_timeouts = null!;
+            m_create_oauth_fullcontrol = null!;
+            m_retention_policy_mode = RetentionPolicyMode.Locked;
         }
 
-        public GoogleCloudStorage(string url, Dictionary<string, string> options)
+        public GoogleCloudStorage(string url, Dictionary<string, string?> options)
         {
-            var uri = new Utility.Uri(url);
+            var uri = new Utility.RelaxedUri(url);
 
-            m_bucket = uri.Host;
+            m_bucket = uri.Host ?? "";
             m_prefix = Util.AppendDirSeparator("/" + uri.Path, "/");
 
             // For GCS we do not use a leading slash
             if (m_prefix.StartsWith("/", StringComparison.Ordinal))
                 m_prefix = m_prefix.Substring(1);
 
-            string authid;
-            options.TryGetValue(AUTHID_OPTION, out authid);
-            options.TryGetValue(PROJECT_OPTION, out m_project);
-            options.TryGetValue(LOCATION_OPTION, out m_location);
-            options.TryGetValue(STORAGECLASS_OPTION, out m_storage_class);
 
-            if (string.IsNullOrEmpty(authid))
-                throw new UserInformationException(Strings.GoogleCloudStorage.MissingAuthID(AUTHID_OPTION), "GoogleCloudStorageMissingAuthID");
+            var serviceAccountFile = options.GetValueOrDefault(SERVICE_ACCOUNT_FILE_OPTION);
+            var serviceAccountJson = options.GetValueOrDefault(SERVICE_ACCOUNT_JSON_OPTION);
+            m_timeouts = TimeoutOptionsHelper.Parse(options);
+            m_project = options.GetValueOrDefault(PROJECT_OPTION);
+            m_location = options.GetValueOrDefault(LOCATION_OPTION);
+            m_storage_class = options.GetValueOrDefault(STORAGECLASS_OPTION);
 
-            m_oauth = new OAuthHelper(authid, this.ProtocolKey);
-            m_oauth.AutoAuthHeader = true;
+            m_retention_policy_mode = Utility.Utility.ParseEnumOption(options, RETENTION_POLICY_MODE_OPTION, DEFAULT_RETENTION_POLICY_MODE);
+            // Read as a service account and nothing else. Both options are documented as taking
+            // the JSON key of a service account, and the loader that takes any kind of credential
+            // would read whatever arrived -- including an external account configuration, which
+            // names the endpoint it fetches tokens from.
+            if (!string.IsNullOrWhiteSpace(serviceAccountJson))
+            {
+                m_oauth = new ServiceAccountHttpClient(CredentialFactory.FromJson<ServiceAccountCredential>(serviceAccountJson).ToGoogleCredential().CreateScoped(CREDENTIAL_SCOPE));
+                m_create_oauth_fullcontrol = () => new ServiceAccountHttpClient(CredentialFactory.FromJson<ServiceAccountCredential>(serviceAccountJson).ToGoogleCredential().CreateScoped(CREDENTIAL_SCOPE_FULL_CONTROL));
+            }
+            else if (!string.IsNullOrWhiteSpace(serviceAccountFile))
+            {
+                m_oauth = new ServiceAccountHttpClient(CredentialFactory.FromFile<ServiceAccountCredential>(serviceAccountFile).ToGoogleCredential().CreateScoped(CREDENTIAL_SCOPE));
+                m_create_oauth_fullcontrol = () => new ServiceAccountHttpClient(CredentialFactory.FromFile<ServiceAccountCredential>(serviceAccountFile).ToGoogleCredential().CreateScoped(CREDENTIAL_SCOPE_FULL_CONTROL));
+            }
+            else
+            {
+                var authId = AuthIdOptionsHelper.Parse(options)
+                    .RequireCredentials(TOKEN_URL);
+                m_oauth = new GoogleOAuthHelperHttpClient(authId.AuthId!, this.ProtocolKey, authId.OAuthUrl)
+                {
+                    AutoAuthHeader = true
+                };
+
+                // This does not work with the current OAuth server as it only grants read/write access.
+                m_create_oauth_fullcontrol = () => null;
+            }
         }
 
+        /// <summary>
+        /// Creates a backend that talks through the supplied <see cref="HttpClient"/>,
+        /// so the Cloud Storage API responses can be decided by a test
+        /// </summary>
+        /// <param name="url">The backend url</param>
+        /// <param name="options">The options to use</param>
+        /// <param name="httpClient">The client to send the requests through</param>
+        internal GoogleCloudStorage(string url, Dictionary<string, string?> options, HttpClient httpClient)
+            : this(url, options)
+        {
+            var authId = AuthIdOptionsHelper.Parse(options)
+                .RequireCredentials(TOKEN_URL);
+
+            m_oauth = new GoogleOAuthHelperHttpClient(authId.AuthId!, this.ProtocolKey, authId.OAuthUrl, httpClient)
+            {
+                AutoAuthHeader = true
+            };
+        }
 
         private class ListBucketResponse
         {
-            public string nextPageToken { get; set; }
-            public BucketResourceItem[] items { get; set; }
+            public string? nextPageToken { get; set; }
+            public BucketResourceItem[]? items { get; set; }
         }
 
         private class BucketResourceItem
         {
-            public string name { get; set; }
+            public string? name { get; set; }
             public DateTime? updated { get; set; }
             public long? size { get; set; }
+            /// <summary>
+            /// The base64 encoded big-endian CRC32C checksum of the object content.
+            /// When supplied on upload, the server validates the received data against it and rejects the upload on mismatch.
+            /// </summary>
+            public string? crc32c { get; set; }
         }
 
         private class CreateBucketRequest
         {
-            public string name { get; set; }
-            public string location { get; set; }
-            public string storageClass { get; set; }
+            public string? name { get; set; }
+            public string? location { get; set; }
+            public string? storageClass { get; set; }
         }
 
-        private T HandleListExceptions<T>(Func<T> func)
+        private class ObjectMetadata
+        {
+            public Retention? retention { get; set; }
+        }
+
+        private class BucketMetadata
+        {
+            public BucketObjectRetention? objectRetention { get; set; }
+        }
+
+        private class BucketObjectRetention
+        {
+            public string? mode { get; set; }
+        }
+
+        private class Retention
+        {
+            public string? mode { get; set; }
+            public DateTime? retainUntilTime { get; set; }
+        }
+
+        private enum RetentionPolicyMode
+        {
+            Locked,
+            Unlocked
+        }
+
+        private async Task<T> HandleListExceptions<T>(Func<Task<T>> func)
         {
             try
             {
-                return func();
+                return await func().ConfigureAwait(false);
             }
-            catch (WebException wex)
+            catch (HttpRequestException wex)
             {
-                if (wex.Response is HttpWebResponse response && response.StatusCode == HttpStatusCode.NotFound)
+                if (wex.StatusCode == HttpStatusCode.Forbidden && !GoogleCommon.IsRateLimited(wex))
                     throw new FolderMissingException();
-                else
-                    throw;
+                throw;
             }
         }
 
         #region IBackend implementation
-        public IEnumerable<IFileEntry> List()
+        /// <inheritdoc />
+        public async IAsyncEnumerable<IFileEntry> ListAsync([EnumeratorCancellation] CancellationToken cancelToken)
         {
-            var url = WebApi.GoogleCloudStorage.ListUrl(m_bucket, Utility.Uri.UrlEncode(m_prefix));
+            var url = WebApi.GoogleCloudStorage.ListUrl(m_bucket, m_prefix);
             while (true)
             {
-                var resp = HandleListExceptions(() => m_oauth.ReadJSONResponse<ListBucketResponse>(url));
+                var resp = await HandleListExceptions(() =>
+                        Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken, async ct =>
+                        {
+                            using var req = await m_oauth.CreateRequestAsync(url, HttpMethod.Get, ct).ConfigureAwait(false);
+                            req.Headers.Add("Accept", "application/json");
+
+                            using var resp = await m_oauth.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+                            return await resp.Content.ReadFromJsonAsync<ListBucketResponse>(ct).ConfigureAwait(false)
+                                   ?? throw new Exception("Failed to parse response");
+                        })).ConfigureAwait(false);
 
                 if (resp.items != null)
                     foreach (var f in resp.items)
                     {
-                        var name = f.name;
+                        var name = f.name ?? "";
                         if (name.StartsWith(m_prefix, StringComparison.OrdinalIgnoreCase))
                             name = name.Substring(m_prefix.Length);
                         if (f.size == null)
@@ -135,70 +254,159 @@ namespace Duplicati.Library.Backend.GoogleCloudStorage
                 var token = resp.nextPageToken;
                 if (string.IsNullOrWhiteSpace(token))
                     break;
-                url = WebApi.GoogleCloudStorage.ListUrl(m_bucket, Utility.Uri.UrlEncode(m_prefix), token);
+                url = WebApi.GoogleCloudStorage.ListUrl(m_bucket, m_prefix, token);
             }
         }
 
         public async Task PutAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            using (System.IO.FileStream fs = System.IO.File.OpenRead(filename))
-                await PutAsync(remotename, fs, cancelToken);
+            using (var fs = File.OpenRead(filename))
+                await PutAsync(remotename, fs, cancelToken).ConfigureAwait(false);
         }
 
-        public void Get(string remotename, string filename)
+        public async Task GetAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            using (System.IO.FileStream fs = System.IO.File.Create(filename))
-                Get(remotename, fs);
+            using (var fs = File.Create(filename))
+                await GetAsync(remotename, fs, cancelToken).ConfigureAwait(false);
         }
-        public void Delete(string remotename)
+        public async Task DeleteAsync(string remotename, CancellationToken cancelToken)
         {
+            using var req = await m_oauth.CreateRequestAsync(WebApi.GoogleCloudStorage.DeleteUrl(m_bucket, m_prefix + remotename), HttpMethod.Delete, cancelToken);
 
-            var req = m_oauth.CreateRequest(WebApi.GoogleCloudStorage.DeleteUrl(m_bucket, Library.Utility.Uri.UrlPathEncode(m_prefix + remotename)));
-            req.Method = "DELETE";
-
-            m_oauth.ReadJSONResponse<object>(req);
+            await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, async ct
+                =>
+            {
+                try
+                {
+                    using var resp = await m_oauth.GetResponseAsync(req, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
+                }
+                catch (HttpRequestException hrex) when (hrex.StatusCode == HttpStatusCode.NotFound)
+                {
+                    throw new FileMissingException($"File '{remotename}' not found.");
+                }
+            }).ConfigureAwait(false);
         }
 
-        public void Test()
+        public async Task<DateTime?> GetObjectLockUntilAsync(string remotename, CancellationToken cancellationToken)
         {
-            this.TestList();
+            var url = WebApi.GoogleCloudStorage.MetadataUrl(m_bucket, m_prefix + remotename);
+
+            try
+            {
+                using var req = await m_oauth.CreateRequestAsync(url, HttpMethod.Get, cancellationToken).ConfigureAwait(false);
+                req.Headers.Add("Accept", "application/json");
+
+                using var resp = await m_oauth.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                var metadata = await resp.Content.ReadFromJsonAsync<ObjectMetadata>(cancellationToken).ConfigureAwait(false);
+
+                return metadata?.retention?.retainUntilTime;
+            }
+            catch (HttpRequestException hrex)
+            {
+                if (hrex.StatusCode == HttpStatusCode.NotFound)
+                    throw new FileMissingException();
+                throw;
+            }
         }
 
-        public void CreateFolder()
+        public async Task SetObjectLockUntilAsync(string remotename, DateTime lockUntilUtc, CancellationToken cancellationToken)
+        {
+            var url = WebApi.GoogleCloudStorage.MetadataUrl(m_bucket, m_prefix + remotename);
+
+            var metadata = new ObjectMetadata
+            {
+                retention = new Retention
+                {
+                    mode = m_retention_policy_mode.ToString(),
+                    retainUntilTime = lockUntilUtc
+                }
+            };
+
+            try
+            {
+                if (m_oauth_fullcontrol == null)
+                    m_oauth_fullcontrol = m_create_oauth_fullcontrol();
+
+                if (m_oauth_fullcontrol == null)
+                    throw new UserInformationException(Strings.GoogleCloudStorage.MissingFullControlScopeError, "GoogleCloudStorageMissingFullControlScope");
+
+                using var req = await m_oauth_fullcontrol.CreateRequestAsync(url, new HttpMethod("PATCH"), cancellationToken).ConfigureAwait(false);
+                req.Content = JsonContent.Create(metadata);
+                req.Headers.Add("Accept", "application/json");
+
+                using var resp = await m_oauth_fullcontrol.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException hrex)
+            {
+                if (hrex.StatusCode == HttpStatusCode.NotFound)
+                    throw new FileMissingException();
+
+                // Google reports a bucket without object retention as a plain bad request,
+                // so check the bucket configuration before reporting the failure
+                if (hrex.StatusCode == HttpStatusCode.BadRequest && await IsObjectRetentionDisabledAsync(cancellationToken).ConfigureAwait(false))
+                    throw new ObjectLockNotSupportedException($"Object retention is not enabled for bucket {m_bucket}: {hrex.Message}", hrex);
+
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Checks if the bucket reports that object retention is disabled
+        /// </summary>
+        /// <param name="cancellationToken">The cancellation token</param>
+        /// <returns><c>true</c> if the bucket reports object retention as disabled, <c>false</c> if it is enabled or the state cannot be determined</returns>
+        private async Task<bool> IsObjectRetentionDisabledAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var url = WebApi.GoogleCloudStorage.BucketRetentionUrl(m_bucket);
+                using var req = await m_oauth.CreateRequestAsync(url, HttpMethod.Get, cancellationToken).ConfigureAwait(false);
+                req.Headers.Add("Accept", "application/json");
+
+                using var resp = await m_oauth.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                var metadata = await resp.Content.ReadFromJsonAsync<BucketMetadata>(cancellationToken).ConfigureAwait(false);
+
+                return !string.Equals(metadata?.objectRetention?.mode, "Enabled", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                // Unable to determine the state, report the original error
+                return false;
+            }
+        }
+
+        public Task TestAsync(bool alsoWrite, CancellationToken cancelToken)
+            => this.TestBackendAsync(alsoWrite, cancelToken);
+
+        public async Task CreateFolderAsync(CancellationToken cancelToken)
         {
             if (string.IsNullOrEmpty(m_project))
                 throw new UserInformationException(Strings.GoogleCloudStorage.ProjectIDMissingError(PROJECT_OPTION), "GoogleCloudStorageMissingProjectID");
 
-            var data = System.Text.Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new CreateBucketRequest
+            using var req = await m_oauth.CreateRequestAsync(WebApi.GoogleCloudStorage.CreateFolderUrl(m_project), HttpMethod.Post, cancelToken);
+            req.Content = JsonContent.Create(new CreateBucketRequest
             {
                 name = m_bucket,
                 location = m_location,
                 storageClass = m_storage_class
-            }));
+            });
 
-            var req = m_oauth.CreateRequest(WebApi.GoogleCloudStorage.CreateFolderUrl(m_project));
-            req.Method = "POST";
-            req.ContentLength = data.Length;
-            req.ContentType = "application/json; charset=UTF-8";
-
-            var areq = new AsyncHttpRequest(req);
-
-            using (var rs = areq.GetRequestStream())
-                rs.Write(data, 0, data.Length);
-
-            m_oauth.ReadJSONResponse<BucketResourceItem>(areq);
+            await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, async ct =>
+            {
+                using var resp = await m_oauth.GetResponseAsync(req, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
+                var res = await resp.Content.ReadFromJsonAsync<BucketResourceItem>(ct).ConfigureAwait(false);
+                if (res == null)
+                    throw new Exception("Create folder succeeded, but no data was returned");
+            }).ConfigureAwait(false);
         }
 
-        public string DisplayName
-        {
-            get { return Strings.GoogleCloudStorage.DisplayName; }
-        }
+        /// <inheritdoc/>
+        public string DisplayName => Strings.GoogleCloudStorage.DisplayName;
 
-        public string ProtocolKey
-        {
-            get { return "gcs"; }
-        }
+        /// <inheritdoc/>
+        public string ProtocolKey => "gcs";
 
+        /// <inheritdoc/>
         public IList<ICommandLineArgument> SupportedCommands
         {
             get
@@ -206,91 +414,112 @@ namespace Duplicati.Library.Backend.GoogleCloudStorage
                 StringBuilder locations = new StringBuilder();
                 StringBuilder storageClasses = new StringBuilder();
 
-                foreach (KeyValuePair<string, string> s in WebApi.GoogleCloudStorage.KNOWN_GCS_LOCATIONS)
+                foreach (var s in WebApi.GoogleCloudStorage.KNOWN_GCS_LOCATIONS)
                     locations.AppendLine(string.Format("{0}: {1}", s.Key, s.Value));
-                foreach (KeyValuePair<string, string> s in WebApi.GoogleCloudStorage.KNOWN_GCS_STORAGE_CLASSES)
+                foreach (var s in WebApi.GoogleCloudStorage.KNOWN_GCS_STORAGE_CLASSES)
                     storageClasses.AppendLine(string.Format("{0}: {1}", s.Key, s.Value));
 
-                return new List<ICommandLineArgument>(new ICommandLineArgument[] {
+                return [
                     new CommandLineArgument(LOCATION_OPTION, CommandLineArgument.ArgumentType.String, Strings.GoogleCloudStorage.LocationDescriptionShort, Strings.GoogleCloudStorage.LocationDescriptionLong(locations.ToString())),
                     new CommandLineArgument(STORAGECLASS_OPTION, CommandLineArgument.ArgumentType.String, Strings.GoogleCloudStorage.StorageclassDescriptionShort, Strings.GoogleCloudStorage.StorageclassDescriptionLong(storageClasses.ToString())),
-                    new CommandLineArgument(AUTHID_OPTION, CommandLineArgument.ArgumentType.Password, Strings.GoogleCloudStorage.AuthidShort, Strings.GoogleCloudStorage.AuthidLong(OAuthHelper.OAUTH_LOGIN_URL("gcs"))),
+                    .. AuthIdOptionsHelper.GetOptions(TOKEN_URL),
+                    new CommandLineArgument(SERVICE_ACCOUNT_JSON_OPTION, CommandLineArgument.ArgumentType.Password, Strings.GoogleCloudStorage.ServiceAccountJsonDescriptionShort, Strings.GoogleCloudStorage.ServiceAccountJsonDescriptionLong),
+                    new CommandLineArgument(SERVICE_ACCOUNT_FILE_OPTION, CommandLineArgument.ArgumentType.String, Strings.GoogleCloudStorage.ServiceAccountFileDescriptionShort, Strings.GoogleCloudStorage.ServiceAccountFileDescriptionLong),
+                    new CommandLineArgument(RETENTION_POLICY_MODE_OPTION, CommandLineArgument.ArgumentType.Enumeration, Strings.GoogleCloudStorage.RetentionPolicyModeDescriptionShort, Strings.GoogleCloudStorage.RetentionPolicyModeDescriptionLong, DEFAULT_RETENTION_POLICY_MODE.ToString(), null, Enum.GetNames(typeof(RetentionPolicyMode))),
                     new CommandLineArgument(PROJECT_OPTION, CommandLineArgument.ArgumentType.String, Strings.GoogleCloudStorage.ProjectDescriptionShort, Strings.GoogleCloudStorage.ProjectDescriptionLong),
-                });
+                    .. TimeoutOptionsHelper.GetOptions(),
+                ];
             }
-        }
-        public string Description
-        {
-            get { return Strings.GoogleCloudStorage.Description; }
         }
 
-        public string[] DNSName
-        {
-            get
-            {
-                return WebApi.GoogleCloudStorage.Hosts();
-            }
-        }
+        /// <inheritdoc/>
+        public string Description => Strings.GoogleCloudStorage.Description;
+
+        /// <inheritdoc/>
+        public Task<string[]> GetDNSNamesAsync(CancellationToken cancelToken) => Task.FromResult(WebApi.GoogleCloudStorage.Hosts());
 
         #endregion
 
-        public async Task PutAsync(string remotename, System.IO.Stream stream, CancellationToken cancelToken)
+        /// <inheritdoc/>
+        public bool SupportsStreaming => true;
+
+        /// <inheritdoc/>
+        public async Task PutAsync(string remotename, Stream stream, CancellationToken cancelToken)
         {
-            var item = new BucketResourceItem { name = m_prefix + remotename };
+            // Precalculate the hash so the server can validate the uploaded content end-to-end.
+            // This is done up front to avoid hashing in the chunked upload where the stream could be throttled.
+            (var content, var hashes, var tmp) = await Utility.Utility.CalculateThrottledStreamHash(stream, [HashFactory.CRC32C], cancelToken).ConfigureAwait(false);
+            using var _ = tmp;
+            using var tmpContent = tmp == null ? null : content;
+
+            var crc32c = Convert.ToBase64String(Utility.Utility.HexStringAsByteArray(hashes[0]));
+            var item = new BucketResourceItem { name = m_prefix + remotename, crc32c = crc32c };
 
             var url = WebApi.GoogleCloudStorage.PutUrl(m_bucket);
-            var res = await GoogleCommon.ChunkedUploadWithResumeAsync<BucketResourceItem, BucketResourceItem>(m_oauth, item, url, stream, cancelToken);
+            var res = await GoogleCommon.ChunkedUploadWithResumeAsync<BucketResourceItem, BucketResourceItem>(m_oauth, item, url, content, m_timeouts.ShortTimeout, m_timeouts.ReadWriteTimeout, cancelToken, HttpMethod.Post).ConfigureAwait(false);
 
             if (res == null)
                 throw new Exception("Upload succeeded, but no data was returned");
+
+            if (!string.IsNullOrWhiteSpace(res.crc32c) && !string.Equals(res.crc32c, crc32c, StringComparison.Ordinal))
+                throw new Exception($"Upload succeeded, but the server reported a different CRC32C checksum. Expected: {crc32c}, actual: {res.crc32c}");
         }
 
-        public void Get(string remotename, System.IO.Stream stream)
+        public async Task GetAsync(string remotename, Stream stream, CancellationToken cancelToken)
         {
             try
             {
-                var url = WebApi.GoogleCloudStorage.GetUrl(m_bucket, Library.Utility.Uri.UrlPathEncode(m_prefix + remotename)); 
-                var req = m_oauth.CreateRequest(url);
-                var areq = new AsyncHttpRequest(req);
+                var url = WebApi.GoogleCloudStorage.GetUrl(m_bucket, m_prefix + remotename);
+                using var req = await m_oauth.CreateRequestAsync(url, HttpMethod.Get, cancelToken);
+                using var resp = await Library.Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => m_oauth.GetResponseAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)).ConfigureAwait(false);
+                using var source = await Library.Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => resp.Content.ReadAsStreamAsync(cancelToken)).ConfigureAwait(false);
 
-                using (var resp = areq.GetResponse())
-                using (var rs = areq.GetResponseStream())
-                    Library.Utility.Utility.CopyStream(rs, stream);
+                using (var ts = source.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false, TimeoutMode.Call))
+                    await Utility.Utility.CopyStreamAsync(ts, stream, cancelToken).ConfigureAwait(false);
             }
-            catch (WebException wex)
+            catch (HttpRequestException hrex)
             {
-                if (wex.Response is HttpWebResponse response && response.StatusCode == HttpStatusCode.NotFound)
+                if (hrex.StatusCode == HttpStatusCode.NotFound)
                     throw new FileMissingException();
-                else
-                    throw;
+                throw;
             }
         }
 
-        public void Rename(string oldname, string newname)
+        public async Task RenameAsync(string oldname, string newname, CancellationToken cancellationToken)
         {
-            var data = System.Text.Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new BucketResourceItem
+            var url = WebApi.GoogleCloudStorage.RewriteUrl(m_bucket, m_prefix + oldname, m_bucket, m_prefix + newname);
+
+            // Perform rewrite (copy)
+            await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, async ct =>
             {
-                name = m_prefix + newname,
-            }));
+                using var req = await m_oauth.CreateRequestAsync(url, HttpMethod.Post, ct).ConfigureAwait(false);
+                req.Content = new StringContent("", Encoding.UTF8, "application/json"); // Empty body
+                using var resp = await m_oauth.GetResponseAsync(req, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
 
-            var req = m_oauth.CreateRequest(WebApi.GoogleCloudStorage.RenameUrl(m_bucket, Utility.Uri.UrlPathEncode(m_prefix + oldname)));
-            req.Method = "PATCH";
-            req.ContentLength = data.Length;
-            req.ContentType = "application/json; charset=UTF-8";
+                var res = await resp.Content.ReadFromJsonAsync<RewriteResponse>(ct).ConfigureAwait(false);
+                while (res != null && res.done == false)
+                {
+                    var token = res.rewriteToken;
+                    var nextUrl = url + "?rewriteToken=" + token;
+                    using var nextReq = await m_oauth.CreateRequestAsync(nextUrl, HttpMethod.Post, ct).ConfigureAwait(false);
+                    nextReq.Content = new StringContent("", Encoding.UTF8, "application/json");
+                    using var nextResp = await m_oauth.GetResponseAsync(nextReq, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
+                    res = await nextResp.Content.ReadFromJsonAsync<RewriteResponse>(ct).ConfigureAwait(false);
+                }
+            }).ConfigureAwait(false);
 
-            var areq = new AsyncHttpRequest(req);
-            using (var rs = areq.GetRequestStream())
-                rs.Write(data, 0, data.Length);
-
-            m_oauth.ReadJSONResponse<BucketResourceItem>(req);
+            // Delete old file
+            await DeleteAsync(oldname, cancellationToken).ConfigureAwait(false);
         }
 
-        #region IDisposable implementation
+        private class RewriteResponse
+        {
+            public bool done { get; set; }
+            public string? rewriteToken { get; set; }
+        }
         public void Dispose()
         {
-
         }
-        #endregion
     }
 }
 

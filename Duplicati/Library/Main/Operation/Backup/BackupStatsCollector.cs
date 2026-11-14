@@ -1,21 +1,26 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using System;
-using Duplicati.Library.Main.Operation.Common;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Duplicati.Library.Main.Operation.Backup
@@ -24,45 +29,84 @@ namespace Duplicati.Library.Main.Operation.Backup
     /// Asynchronous interface that ensures all stat requests
     /// are performed in a sequential manner
     /// </summary>
-    internal class BackupStatsCollector : StatsCollector
+    internal class BackupStatsCollector
     {
         private readonly BackupResults m_res;
+        private readonly SemaphoreSlim semaphoreSlim = new SemaphoreSlim(1, 1);
 
         public BackupStatsCollector(BackupResults res)
-            : base(res.BackendWriter)
         {
             m_res = res;
         }
 
-        public Task AddOpenedFile(long size)
+        private async Task WithLockAsync(Action action)
         {
-            return RunOnMain(() => {
+            await semaphoreSlim.WaitAsync();
+            try
+            {
+                action();
+            }
+            finally
+            {
+                semaphoreSlim.Release();
+            }
+        }
+
+        public Task AddOpenedFileAsync(long size)
+        {
+            return WithLockAsync(() =>
+            {
                 m_res.SizeOfOpenedFiles += size;
                 m_res.OpenedFiles++;
             });
         }
 
-        public Task AddAddedFile(long size)
+        public Task AddTimestampChangedFileAsync()
         {
-            return RunOnMain(() => {
+            return WithLockAsync(() =>
+            {
+                m_res.TimestampChangedFiles++;
+            });
+        }
+
+        public Task AddAddedFileAsync(long size)
+        {
+            return WithLockAsync(() =>
+            {
                 m_res.SizeOfAddedFiles += size;
                 m_res.AddedFiles++;
             });
         }
 
-        public Task AddModifiedFile(long size)
+        public Task AddModifiedFileAsync(long size)
         {
-            return RunOnMain(() => {
+            return WithLockAsync(() =>
+            {
                 m_res.SizeOfModifiedFiles += size;
                 m_res.ModifiedFiles++;
             });
         }
 
-        public Task AddExaminedFile(long size)
+        public Task AddExaminedFileAsync(long size)
         {
-            return RunOnMain(() => {
+            return WithLockAsync(() =>
+            {
                 m_res.SizeOfExaminedFiles += size;
                 m_res.ExaminedFiles++;
+            });
+        }
+
+        /// <summary>
+        /// Records a number of examined files at once, as when they are copied from the previous fileset
+        /// </summary>
+        /// <param name="count">The number of files</param>
+        /// <param name="size">The combined size of the files</param>
+        public Task AddExaminedFilesAsync(long count, long size)
+        {
+            return WithLockAsync(() =>
+            {
+                m_res.SizeOfExaminedFiles += size;
+                m_res.ExaminedFiles += count;
             });
         }
     }

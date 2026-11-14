@@ -1,24 +1,30 @@
-//  Copyright (C) 2013, The Duplicati Team
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
 
-//  http://www.duplicati.com, opensource@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 using System;
 using System.IO;
+using System.Threading.Tasks;
 using Duplicati.Library.Interface;
-using Duplicati.Library.Main.Database;
+using Duplicati.Library.Main.Database.Local;
+using Duplicati.Library.Utility;
 
 namespace Duplicati.Library.Main.Operation
 {
@@ -39,18 +45,23 @@ namespace Duplicati.Library.Main.Operation
             m_result = result;
         }
 
-        public void Run()
+        public async Task RunAsync()
         {
-            var ext = System.IO.Path.GetExtension(m_targetpath);
+            // The bug report archive carries remote operation logs, restore test paths, metadata content and
+            // the machine name, which the scrubbing does not cover, so it is not produced under reduced reporting
+            if (m_options.ReducedReporting)
+                throw new UserInformationException("Bug reports cannot be created while reduced reporting is active", "BugReportDisabledByReducedReporting");
+
+            var ext = Path.GetExtension(m_targetpath);
             var module = m_options.CompressionModule;
 
             if (ext == "" || string.Compare(ext, 1, module, 0, module.Length, StringComparison.OrdinalIgnoreCase) != 0)
                 m_targetpath = m_targetpath + "." + module;
 
-            if (System.IO.File.Exists(m_targetpath))
+            if (File.Exists(m_targetpath))
                 throw new UserInformationException(string.Format("Output file already exists, not overwriting: {0}", m_targetpath), "BugReportTargetAlreadyExists");
 
-            if (!System.IO.File.Exists(m_options.Dbpath))
+            if (!File.Exists(m_options.Dbpath))
                 throw new UserInformationException(string.Format("Database file does not exist: {0}", m_options.Dbpath), "BugReportSourceDatabaseNotFound");
 
             m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.BugReport_Running);
@@ -58,29 +69,26 @@ namespace Duplicati.Library.Main.Operation
 
             Logging.Log.WriteInformationMessage(LOGTAG, "ScrubbingFilenames", "Scrubbing filenames from database, this may take a while, please wait");
 
-            using (var tmp = new Library.Utility.TempFile())
+            using (var tmp = new TempFile())
             {
-                System.IO.File.Copy(m_options.Dbpath, tmp, true);
-                using (var db = new LocalBugReportDatabase(tmp))
+                File.Copy(m_options.Dbpath, tmp, true);
+                await using (var db = await LocalBugReportDatabase.CreateAsync(tmp, null, m_result.TaskControl.ProgressToken).ConfigureAwait(false))
                 {
-                    m_result.SetDatabase(db);
-                    db.Fix();
+                    await db.ObfuscateAsync(m_result.TaskControl.ProgressToken).ConfigureAwait(false);
                     if (m_options.AutoVacuum)
-                    {
-                        db.Vacuum();
-                    }
+                        await db.VacuumAsync(m_result.TaskControl.ProgressToken).ConfigureAwait(false);
                 }
 
-                using (var stream = new System.IO.FileStream(m_targetpath, FileMode.Create, FileAccess.Write, FileShare.Read))
-                using (ICompression cm = DynamicLoader.CompressionLoader.GetModule(module, stream, Interface.ArchiveMode.Write, m_options.RawOptions))
+                using (var stream = new FileStream(m_targetpath, FileMode.Create, FileAccess.Write, FileShare.Read))
+                using (ICompression cm = DynamicLoader.CompressionLoader.GetModule(module, stream, ArchiveMode.Write, m_options.RawOptions))
                 {
-                    using (var cs = cm.CreateFile("log-database.sqlite", Duplicati.Library.Interface.CompressionHint.Compressible, DateTime.UtcNow))
-                    using (var fs = System.IO.File.Open(tmp, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
-                        Library.Utility.Utility.CopyStream(fs, cs);
+                    using (var cs = cm.CreateFile("log-database.sqlite", CompressionHint.Compressible, DateTime.UtcNow))
+                    using (var fs = File.Open(tmp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        await Library.Utility.Utility.CopyStreamAsync(fs, cs, m_result.TaskControl.ProgressToken).ConfigureAwait(false);
 
-                    using (var cs = new System.IO.StreamWriter(cm.CreateFile("system-info.txt", Duplicati.Library.Interface.CompressionHint.Compressible, DateTime.UtcNow)))
+                    using (var cs = new StreamWriter(cm.CreateFile("system-info.txt", CompressionHint.Compressible, DateTime.UtcNow)))
                         foreach (var line in SystemInfoHandler.GetSystemInfo())
-                            cs.WriteLine(line);
+                            await cs.WriteLineAsync(line);
                 }
 
                 m_result.TargetPath = m_targetpath;

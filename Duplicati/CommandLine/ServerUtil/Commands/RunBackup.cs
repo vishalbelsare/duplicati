@@ -1,0 +1,169 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using System.CommandLine;
+using Duplicati.Library.Interface;
+
+namespace Duplicati.CommandLine.ServerUtil.Commands;
+
+public static class RunBackup
+{
+    public static Command Create()
+    {
+        var backupArgument = new Argument<string>("backup")
+        {
+            Description = "The backup to run, either ID or exact name (case-insensitive)",
+            Arity = ArgumentArity.ExactlyOne
+        };
+        var waitOption = new Option<bool>("--wait")
+        {
+            Description = "Wait for the backup to finish before returning"
+        };
+        var skipQueueOption = new Option<bool>("--skip-queue")
+        {
+            Description = "Insert the backup as the first task in the queue, instead of putting it at the end"
+        };
+        var pollIntervalOption = new Option<int>("--poll-interval")
+        {
+            Description = "The interval in seconds to poll for backup status",
+            DefaultValueFactory = _ => 5
+        };
+        var quietOption = new Option<bool>("--quiet")
+        {
+            Description = "Do not print progress messages"
+        };
+
+        var cmd = new Command("run", "Runs a backup")
+        {
+            backupArgument,
+            waitOption,
+            skipQueueOption,
+            pollIntervalOption,
+            quietOption
+        };
+        cmd.SetAction(async (parseResult, cancellationToken) =>
+        {
+            var settings = SettingsBinder.GetSettings(parseResult);
+            var output = OutputInterceptorBinder.GetConsoleInterceptor(parseResult);
+            var backup = parseResult.GetValue(backupArgument)!;
+            var wait = parseResult.GetValue(waitOption);
+            var skipqueue = parseResult.GetValue(skipQueueOption);
+            var pollinterval = parseResult.GetValue(pollIntervalOption);
+            var quiet = parseResult.GetValue(quietOption);
+
+            if (pollinterval < 1)
+                throw new UserReportedException("Poll interval must be at least 1 second");
+
+            var connection = await settings.GetConnectionAsync(output);
+
+            var matchingBackup = (await connection.ListBackupsAsync())
+                .FirstOrDefault(b => string.Equals(b.Name, backup, StringComparison.OrdinalIgnoreCase) || string.Equals(b.ID, backup));
+
+            if (matchingBackup == null)
+                throw new UserReportedException("No backup found with supplied ID or name");
+
+            if (!quiet)
+                output.AppendConsoleMessage($"Running backup {matchingBackup.Name} (ID: {matchingBackup.ID})");
+
+            await connection.RunBackupAsync(matchingBackup.ID, skipqueue);
+
+            if (wait)
+            {
+                if (!quiet)
+                    output.AppendConsoleMessage("Waiting for backup to finish...");
+
+                await WaitForBackupWithRetriesAsync(connection, settings, matchingBackup.ID, pollinterval, output, msg =>
+                {
+                    if (!quiet)
+                        output.AppendConsoleMessage($"[{DateTime.Now}]: {msg}");
+                });
+                var response = await connection.GetBackupStatusAsync(matchingBackup.ID);
+                if (!quiet)
+                    output.AppendConsoleMessage("Backup status: " + response);
+
+                // Map the parsed backup result to a process exit code so that callers
+                // (scripts, CI) can detect a backup that finished with warnings/errors.
+                // Codes mirror the main Duplicati CLI: warnings = 2, errors = 3, fatal = 4.
+                var parsedResult = Enum.TryParse<ParsedResultType>(response, ignoreCase: true, out var pr)
+                    ? pr
+                    : ParsedResultType.Unknown;
+
+                output.ExitCode = parsedResult switch
+                {
+                    ParsedResultType.Warning => 2,
+                    ParsedResultType.Error => 3,
+                    ParsedResultType.Fatal => 4,
+                    _ => 0
+                };
+                output.SetResult(output.ExitCode == 0);
+            }
+            else
+            {
+                // Without --wait the backup is only queued; its outcome is unknown here.
+                output.SetResult(true);
+            }
+        });
+        return cmd;
+    }
+
+    /// <summary>
+    /// Waits for a backup to finish with retries
+    /// </summary>
+    /// <param name="connection">The connection to use</param>
+    /// <param name="settings">The settings to use</param>
+    /// <param name="backupId">The ID of the backup to wait for</param>
+    /// <param name="pollInterval">The interval in seconds to poll for backup status</param>
+    /// <param name="output">The output interceptor to use</param>
+    /// <param name="onPoll">The action to perform on each poll</param>
+    /// <returns>A task that represents the asynchronous operation</returns>
+    private static async Task WaitForBackupWithRetriesAsync(Connection connection, Settings settings, string backupId, int pollInterval, OutputInterceptor output, Action<string> onPoll)
+    {
+        var retry = true;
+
+        while (retry)
+        {
+            try
+            {
+                await connection.WaitForBackupAsync(backupId, TimeSpan.FromSeconds(pollInterval), onPoll);
+                return;
+            }
+            catch (Exception)
+            {
+                retry = false;
+                try
+                {
+                    // See if we can get a new connection (re-connect)
+                    onPoll("Re-authenticating...");
+                    connection = await settings.ReloadPersistedSettings().GetConnectionAsync(output);
+                    retry = true;
+                }
+                catch (Exception)
+                {
+                }
+
+                // Throw original exception if we can't re-connect
+                if (!retry)
+                    throw;
+            }
+
+        } while (retry);
+    }
+}

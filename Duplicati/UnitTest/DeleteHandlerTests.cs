@@ -1,15 +1,36 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Main;
-using Duplicati.Library.Main.Database;
+using Duplicati.Library.Main.Database.Local;
 using Duplicati.Library.Main.Operation;
 using NUnit.Framework;
+using NUnit.Framework.Legacy;
 
 namespace Duplicati.UnitTest
 {
-    public class DeleteHandlerTests
+    public class DeleteHandlerTests : BasicSetupHelper
     {
         private class Fileset : IListResultFileset, IEquatable<Fileset>
         {
@@ -18,6 +39,7 @@ namespace Duplicati.UnitTest
             public DateTime Time { get; }
             public long FileCount { get; }
             public long FileSizes { get; }
+            public string Label { get; }
 
             public Fileset(int version, int backupType, DateTime time)
             {
@@ -58,10 +80,10 @@ namespace Duplicati.UnitTest
             // Although version 1 is older than the specified TimeSpan, we do not delete
             // it because it is the most recent full backup.
             TimeSpan timeSpan = new TimeSpan(1, 0, 0, 0);
-            IListResultFileset[] expectedFilesetsToRemove = {filesets[0]};
+            IListResultFileset[] expectedFilesetsToRemove = { filesets[0] };
 
             Random random = new Random();
-            Options options = new Options(new Dictionary<string, string> {{"keep-time", $"{(int) timeSpan.TotalSeconds}s"}});
+            Options options = new Options(new Dictionary<string, string> { { "keep-time", $"{(int)timeSpan.TotalSeconds}s" } });
             KeepTimeRemover remover = new KeepTimeRemover(options);
             IListResultFileset[] filesetsToRemove = remover.GetFilesetsToDelete(filesets.OrderBy(x => random.Next())).ToArray();
             CollectionAssert.AreEquivalent(expectedFilesetsToRemove, filesetsToRemove);
@@ -90,7 +112,7 @@ namespace Duplicati.UnitTest
                 new Fileset(5, BackupType.PARTIAL_BACKUP, new DateTime(2000, 1, 6)),
             };
 
-            Options options = new Options(new Dictionary<string, string> {{"keep-versions", "2"}});
+            Options options = new Options(new Dictionary<string, string> { { "keep-versions", "2" } });
             IListResultFileset[] expectedFilesetsToRemove =
             {
                 filesets[0], // Delete; third oldest full backup.
@@ -109,12 +131,12 @@ namespace Duplicati.UnitTest
         [Category("DeleteHandler")]
         public void RetentionPolicyRemover()
         {
-            Options options = new Options(new Dictionary<string, string> {{"retention-policy", "1W:U,3M:1D,1Y:1W,U:1M"}});
+            Options options = new Options(new Dictionary<string, string> { { "retention-policy", "1W:U,3M:1D,1Y:1W,U:1M" } });
 
             DateTime now = DateTime.Now;
             IListResultFileset[] filesets =
             {
-                // Past week.  These should all be retained.
+                // Past week. These should all be retained.
                 new Fileset(0, BackupType.PARTIAL_BACKUP, now),
                 new Fileset(1, BackupType.FULL_BACKUP, now.AddMilliseconds(-1)),
                 new Fileset(2, BackupType.FULL_BACKUP, now.AddSeconds(-1)),
@@ -129,7 +151,7 @@ namespace Duplicati.UnitTest
                 new Fileset(9, BackupType.FULL_BACKUP, now.AddDays(-8).AddHours(2)), // Delete; third in interval
                 new Fileset(10, BackupType.PARTIAL_BACKUP, now.AddMonths(-1)), // Keep; partial
                 new Fileset(11, BackupType.PARTIAL_BACKUP, now.AddMonths(-1).AddHours(1)), // Keep; partial
-                new Fileset(12, BackupType.FULL_BACKUP, now.AddMonths(-1).AddHours(2)), // Keep; first full in interval.  Do not discard full in favor of partial.
+                new Fileset(12, BackupType.FULL_BACKUP, now.AddMonths(-1).AddHours(2)), // Keep; first full in interval. Do not discard full in favor of partial.
                 new Fileset(13, BackupType.FULL_BACKUP, now.AddMonths(-2)), // Keep; first in interval
                 new Fileset(14, BackupType.FULL_BACKUP, now.AddMonths(-2).AddHours(1)), // Delete; second in interval.
                 new Fileset(15, BackupType.FULL_BACKUP, now.AddDays(-89).AddHours(1)), // Keep; first in interval.
@@ -140,7 +162,7 @@ namespace Duplicati.UnitTest
                 new Fileset(18, BackupType.FULL_BACKUP, now.AddDays(-91)), // Delete; second in interval.
                 new Fileset(19, BackupType.PARTIAL_BACKUP, now.AddDays(-(90 + 73))), // Keep; partial
                 new Fileset(20, BackupType.PARTIAL_BACKUP, now.AddDays(-(90 + 72))), // Keep; partial.
-                new Fileset(21, BackupType.PARTIAL_BACKUP, now.AddDays(-(90 + 71))), // Keep; first full in interval.  Do not discard full in favor of partial.
+                new Fileset(21, BackupType.PARTIAL_BACKUP, now.AddDays(-(90 + 71))), // Keep; first full in interval. Do not discard full in favor of partial.
                 new Fileset(22, BackupType.FULL_BACKUP, now.AddDays(-(90 + 142))), // Keep; first in interval.
                 new Fileset(23, BackupType.FULL_BACKUP, now.AddDays(-(90 + 141))), // Delete; second in interval.
 
@@ -148,7 +170,7 @@ namespace Duplicati.UnitTest
                 new Fileset(24, BackupType.FULL_BACKUP, now.AddYears(-1).AddMonths(-1)), // Keep; first in interval.
                 new Fileset(25, BackupType.FULL_BACKUP, now.AddYears(-1).AddMonths(-1).AddDays(1)), // Delete; second in interval.
                 new Fileset(26, BackupType.PARTIAL_BACKUP, new DateTime(1, 1, 1)), // Keep; partial
-                new Fileset(27, BackupType.FULL_BACKUP, new DateTime(1, 1, 30)), // Keep; first full in interval.  Do not discard full in favor of partial.
+                new Fileset(27, BackupType.FULL_BACKUP, new DateTime(1, 1, 30)), // Keep; first full in interval. Do not discard full in favor of partial.
             };
 
             IListResultFileset[] expectedFilesetsToRemove =
@@ -174,6 +196,41 @@ namespace Duplicati.UnitTest
             CollectionAssert.AreEquivalent(expectedFilesetsToRemove, filesetsToRemove);
         }
 
+        /// <summary>
+        /// A weekly scheduled backup can start a few seconds later than the week before, and that
+        /// must not make the retention policy delete it for being too close (issue #3987)
+        /// </summary>
+        [Test]
+        [Category("DeleteHandler")]
+        [TestCase(false)]
+        [TestCase(true)]
+        public void RetentionPolicyAllowsATimeToleranceOnTheInterval(bool disableTimeTolerance)
+        {
+            Options options = new Options(new Dictionary<string, string>
+            {
+                { "retention-policy", "1Y:1W" },
+                { "disable-time-tolerance", disableTimeTolerance ? "true" : "false" }
+            });
+
+            DateTime now = DateTime.Now;
+            IListResultFileset[] filesets =
+            {
+                new Fileset(0, BackupType.FULL_BACKUP, now),
+                new Fileset(1, BackupType.FULL_BACKUP, now.AddDays(-16).AddSeconds(-10)),
+                new Fileset(2, BackupType.FULL_BACKUP, now.AddDays(-23).AddSeconds(-5)), // A week less five seconds after the one before it
+                new Fileset(3, BackupType.FULL_BACKUP, now.AddDays(-30)),
+            };
+
+            IListResultFileset[] expectedFilesetsToRemove = disableTimeTolerance
+                ? new[] { filesets[2] }
+                : Array.Empty<IListResultFileset>();
+
+            RetentionPolicyRemover remover = new RetentionPolicyRemover(options);
+            IListResultFileset[] filesetsToRemove = remover.GetFilesetsToDelete(filesets).ToArray();
+
+            CollectionAssert.AreEquivalent(expectedFilesetsToRemove, filesetsToRemove);
+        }
+
         [Test]
         [Category("DeleteHandler")]
         public void SpecificVersionsRemover()
@@ -187,7 +244,7 @@ namespace Duplicati.UnitTest
                 new Fileset(4, BackupType.FULL_BACKUP, new DateTime(2000, 1, 5))
             };
 
-            Options options = new Options(new Dictionary<string, string> {{"version", "0,3,4"}});
+            Options options = new Options(new Dictionary<string, string> { { "version", "0,3,4" } });
             IListResultFileset[] expectedFilesetsToRemove =
             {
                 filesets[0],

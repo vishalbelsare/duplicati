@@ -1,19 +1,24 @@
-﻿//  Copyright (C) 2017, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using Duplicati.Library.Utility;
 using Duplicati.Library.Common.IO;
 using NUnit.Framework;
@@ -24,10 +29,13 @@ using System.Globalization;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using Duplicati.StreamUtil;
+using Assert = NUnit.Framework.Legacy.ClassicAssert;
+using NUnit.Framework.Legacy;
 
 namespace Duplicati.UnitTest
 {
-    public class UtilityTests
+    public class UtilityTests : BasicSetupHelper
     {
         [Test]
         [Category("Utility")]
@@ -67,10 +75,10 @@ namespace Duplicati.UnitTest
             Action<string, string> checkStringComparison = (x, y) => Assert.IsFalse(String.Equals(x, y, Utility.ClientFilenameStringComparison));
             Action<string, string> checkStringComparer = (x, y) => Assert.IsFalse(new HashSet<string>(new[] { x }).Contains(y, Utility.ClientFilenameStringComparer));
 
-            System.Globalization.CultureInfo originalCulture = System.Globalization.CultureInfo.CurrentCulture;
+            CultureInfo originalCulture = CultureInfo.CurrentCulture;
             try
             {
-                System.Threading.Thread.CurrentThread.CurrentCulture = new System.Globalization.CultureInfo(cultureName, false);
+                CultureInfo.CurrentCulture = new CultureInfo(cultureName, false);
 
                 // These are equivalent with respect to hu-HU, but different with respect to en-US.
                 string ddzs = "ddzs";
@@ -92,7 +100,7 @@ namespace Duplicati.UnitTest
             }
             finally
             {
-                System.Threading.Thread.CurrentThread.CurrentCulture = originalCulture;
+                CultureInfo.CurrentCulture = originalCulture;
             }
         }
 
@@ -104,7 +112,7 @@ namespace Duplicati.UnitTest
             long fixedGrowingStreamLength, limitStreamLength, nextGrowingStreamLength;
             using (CancellationTokenSource tokenSource = new CancellationTokenSource())
             {
-                Task task = TestUtils.GrowingFile(growingFilename, tokenSource.Token);
+                Task task = TestUtils.GrowingFileAsync(growingFilename, tokenSource.Token);
                 Thread.Sleep(100);
                 using (FileStream growingStream = new FileStream(growingFilename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 {
@@ -127,7 +135,7 @@ namespace Duplicati.UnitTest
 
         [Test]
         [Category("Utility")]
-        public static void ReadLimitLengthStream()
+        public static async Task ReadLimitLengthStreamAsync()
         {
             Action<IEnumerable<int>, IEnumerable<byte>> assertArray = (expected, actual) =>
             {
@@ -179,12 +187,12 @@ namespace Duplicati.UnitTest
                     Assert.AreEqual(5, stream.Length);
 
                     // Test reading past array bounds
-                    Assert.AreEqual(5, stream.Read(readBuffer, 0, 10), "Read count");
+                    Assert.AreEqual(5, await stream.ReadAsync(readBuffer, 0, 10), "Read count");
                     assertArray(Enumerable.Range(0, 5), readBuffer.Take(5));
 
                     // Set the position directly and read a shorter range
                     stream.Position = 2;
-                    Assert.AreEqual(2, stream.ReadAsync(readBuffer, 0, 2).Await(), "Read count");
+                    Assert.AreEqual(2, await stream.ReadAsync(readBuffer, 0, 2), "Read count");
                     assertArray(Enumerable.Range(2, 2), readBuffer.Take(2));
                 }
 
@@ -196,14 +204,14 @@ namespace Duplicati.UnitTest
                     Assert.AreEqual(0, stream.Position);
 
                     // Test basic read
-                    Assert.AreEqual(4, stream.Read(readBuffer, 0, 4), "Read count");
+                    Assert.AreEqual(4, await stream.ReadAsync(readBuffer, 0, 4), "Read count");
                     assertArray(Enumerable.Range(2, 4), readBuffer.Take(4));
 
                     // Test CopyTo
                     using (MemoryStream destination = new MemoryStream())
                     {
                         stream.Position = 0;
-                        stream.CopyTo(destination);
+                        await stream.CopyToAsync(destination);
                         assertArray(Enumerable.Range(2, 4), destination.ToArray());
                     }
 
@@ -211,7 +219,7 @@ namespace Duplicati.UnitTest
                     using (MemoryStream destination = new MemoryStream())
                     {
                         stream.Position = 0;
-                        stream.CopyToAsync(destination).Await();
+                        await stream.CopyToAsync(destination);
                         assertArray(Enumerable.Range(2, 4), destination.ToArray());
                     }
 
@@ -261,7 +269,7 @@ namespace Duplicati.UnitTest
                     Assert.AreEqual(0, stream.Position);
 
                     // Test basic read
-                    Assert.AreEqual(0, stream.Read(readBuffer, 0, 4), "Read count");
+                    Assert.AreEqual(0, await stream.ReadAsync(readBuffer, 0, 4), "Read count");
 
                     // Test seeking
                     testSeek(stream, 0, -1);
@@ -344,8 +352,7 @@ namespace Duplicati.UnitTest
             string[] duplicateItems = { "A", "c" };
 
             // Test with default comparer.
-            ISet<string> actualDuplicateItems;
-            ISet<string> actualUniqueItems = Utility.GetUniqueItems(collection, out actualDuplicateItems);
+            var actualUniqueItems = Utility.GetUniqueItems(collection, out var actualDuplicateItems);
 
             CollectionAssert.AreEquivalent(uniqueItems, actualUniqueItems);
             CollectionAssert.AreEquivalent(duplicateItems, actualDuplicateItems);
@@ -381,20 +388,90 @@ namespace Duplicati.UnitTest
             Assert.AreEqual(baseDateTimeUTC.AddSeconds(-1), Utility.NormalizeDateTime(baseDateTime.AddMilliseconds(-1)));
             Assert.AreEqual(baseDateTimeUTC.AddSeconds(1), Utility.NormalizeDateTime(baseDateTime.AddSeconds(1.9)));
         }
-        
+
         [Test]
         [Category("Utility")]
         public void NormalizeDateTimeToEpochSeconds()
         {
             DateTime baseDateTime = new DateTime(2000, 1, 2, 3, 4, 5);
-            long epochSeconds = (long) (baseDateTime.ToUniversalTime() - Utility.EPOCH).TotalSeconds;
+            long epochSeconds = (long)(baseDateTime.ToUniversalTime() - Utility.EPOCH).TotalSeconds;
             Assert.AreEqual(epochSeconds, Utility.NormalizeDateTimeToEpochSeconds(baseDateTime.AddMilliseconds(1)));
             Assert.AreEqual(epochSeconds, Utility.NormalizeDateTimeToEpochSeconds(baseDateTime.AddMilliseconds(500)));
             Assert.AreEqual(epochSeconds, Utility.NormalizeDateTimeToEpochSeconds(baseDateTime.AddMilliseconds(999)));
             Assert.AreEqual(epochSeconds - 1, Utility.NormalizeDateTimeToEpochSeconds(baseDateTime.AddMilliseconds(-1)));
             Assert.AreEqual(epochSeconds + 1, Utility.NormalizeDateTimeToEpochSeconds(baseDateTime.AddSeconds(1.9)));
         }
-        
+
+        [Flags]
+        private enum TestFlags
+        {
+            None = 0,
+            Alpha = 1,
+            Beta = 2,
+            Gamma = 4
+        }
+
+        private enum TestLongFlags : long
+        {
+            Low = 1,
+            High = 1L << 40
+        }
+
+        [Test]
+        [Category("Utility")]
+        public void TryParseEnumMatchesNamesOnly()
+        {
+            Assert.IsTrue(Utility.TryParseEnum<TestFlags>(" beta ", out var parsed));
+            Assert.AreEqual(TestFlags.Beta, parsed);
+
+            Assert.IsFalse(Utility.TryParseEnum<TestFlags>("2", out _), "Numeric values are not names");
+            Assert.IsFalse(Utility.TryParseEnum<TestFlags>("Alpha,Beta", out _));
+            Assert.IsFalse(Utility.TryParseEnum<TestFlags>("Delta", out _));
+            Assert.IsFalse(Utility.TryParseEnum<TestFlags>(null, out _));
+            Assert.IsFalse(Utility.TryParseEnum<TestFlags>("  ", out _));
+
+            Assert.AreEqual(TestFlags.Gamma, Utility.ParseEnum("GAMMA", TestFlags.Alpha));
+            Assert.AreEqual(TestFlags.Alpha, Utility.ParseEnum("Delta", TestFlags.Alpha));
+            Assert.AreEqual(TestFlags.Alpha, Utility.ParseEnum<TestFlags>(null, TestFlags.Alpha));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public void ParseEnums()
+        {
+            CollectionAssert.AreEqual(
+                new[] { TestFlags.Gamma, TestFlags.Alpha },
+                Utility.ParseEnums<TestFlags>(" gamma , ALPHA , ,Gamma,Delta,4,", []),
+                "Values should be distinct, in listed order, with unknown and numeric names ignored");
+
+            var @default = new[] { TestFlags.Beta };
+            CollectionAssert.AreEqual(@default, Utility.ParseEnums(null, @default));
+            CollectionAssert.AreEqual(@default, Utility.ParseEnums("  ", @default));
+            CollectionAssert.AreEqual(@default, Utility.ParseEnums("Delta,Epsilon", @default));
+            CollectionAssert.AreEqual(@default, Utility.ParseEnums("Alpha;Gamma", @default), "Only commas separate values");
+
+            var options = new Dictionary<string, string> { ["test"] = "alpha,beta" };
+            CollectionAssert.AreEqual(new[] { TestFlags.Alpha, TestFlags.Beta }, Utility.ParseEnumsOption(options, "test", @default));
+            CollectionAssert.AreEqual(@default, Utility.ParseEnumsOption(options, "missing", @default));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public void ParseFlags()
+        {
+            Assert.AreEqual(TestFlags.Alpha | TestFlags.Gamma, Utility.ParseFlags(" alpha , GAMMA ", TestFlags.Beta));
+            Assert.AreEqual(TestFlags.Beta, Utility.ParseFlags<TestFlags>(null, TestFlags.Beta));
+            Assert.AreEqual(TestFlags.Beta, Utility.ParseFlags("  ", TestFlags.Beta));
+            Assert.AreEqual(TestFlags.None, Utility.ParseFlags("Delta", TestFlags.Beta), "A value without matches gives no flags, not the default");
+            Assert.AreEqual(TestFlags.Alpha, Utility.ParseFlags("Alpha,Delta", TestFlags.Beta));
+
+            Assert.AreEqual(TestLongFlags.Low | TestLongFlags.High, Utility.ParseFlags("low,high", TestLongFlags.Low), "Enums that are not backed by an int should work");
+
+            var options = new Dictionary<string, string> { ["test"] = "beta,gamma" };
+            Assert.AreEqual(TestFlags.Beta | TestFlags.Gamma, Utility.ParseFlagsOption(options, "test", TestFlags.Alpha));
+            Assert.AreEqual(TestFlags.Alpha, Utility.ParseFlagsOption(options, "missing", TestFlags.Alpha));
+        }
+
         [Test]
         [Category("Utility")]
         public void ParseBool()
@@ -434,23 +511,85 @@ namespace Duplicati.UnitTest
 
         [Test]
         [Category("Utility")]
+        public void ExpandEnvironmentVariablesRegexp()
+        {
+            // Values with regex metacharacters, to prove the substituted value is Regex.Escape'd
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["FOO"] = "a.b",
+                ["BAR"] = "a+b(c)",
+            };
+            Func<string, string> lookup = k => (k != null && env.TryGetValue(k, out var v)) ? v : null;
+
+            // %VAR% behaves identically whether or not native syntax is enabled
+            foreach (var native in new[] { true, false })
+            {
+                Assert.AreEqual(@"xa\.by", Utility.ExpandEnvironmentVariablesRegexp("x%FOO%y", lookup, native));
+                Assert.AreEqual(@"a\+b\(c\)", Utility.ExpandEnvironmentVariablesRegexp("%BAR%", lookup, native));
+                // Undefined %VAR% expands to an empty string (unchanged legacy behavior)
+                Assert.AreEqual("", Utility.ExpandEnvironmentVariablesRegexp("%NOPE%", lookup, native));
+            }
+
+            // Native ON: $VAR and ${VAR} expand and are Regex.Escape'd
+            Assert.AreEqual(@"a\.b/bar", Utility.ExpandEnvironmentVariablesRegexp("$FOO/bar", lookup, true));
+            Assert.AreEqual(@"a\.bbar", Utility.ExpandEnvironmentVariablesRegexp("${FOO}bar", lookup, true));
+            // Undefined native variable is left as the original literal
+            Assert.AreEqual("$NOPE/x", Utility.ExpandEnvironmentVariablesRegexp("$NOPE/x", lookup, true));
+            Assert.AreEqual("${NOPE}", Utility.ExpandEnvironmentVariablesRegexp("${NOPE}", lookup, true));
+            // A brace group without a leading '$' (e.g. Duplicati {group} filters) is not matched
+            Assert.AreEqual("{FOO}", Utility.ExpandEnvironmentVariablesRegexp("{FOO}", lookup, true));
+            // A '$' regex anchor not followed by a word character is left alone
+            Assert.AreEqual(@".*\.log$", Utility.ExpandEnvironmentVariablesRegexp(@".*\.log$", lookup, true));
+
+            // Native OFF (Windows path): $VAR / ${VAR} are left untouched
+            Assert.AreEqual("$FOO/bar", Utility.ExpandEnvironmentVariablesRegexp("$FOO/bar", lookup, false));
+            Assert.AreEqual("${FOO}bar", Utility.ExpandEnvironmentVariablesRegexp("${FOO}bar", lookup, false));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public void ExpandEnvironmentVariablesNative()
+        {
+            // Space in the value proves the result is NOT regex-escaped
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["FOO"] = "a b",
+            };
+            Func<string, string> lookup = k => (k != null && env.TryGetValue(k, out var v)) ? v : null;
+
+            // Native ON: expands, unescaped
+            Assert.AreEqual("a b/x", Utility.ExpandEnvironmentVariablesNative("$FOO/x", lookup, true));
+            Assert.AreEqual("a b", Utility.ExpandEnvironmentVariablesNative("${FOO}", lookup, true));
+            // Undefined native variable is left as the original literal
+            Assert.AreEqual("$NOPE", Utility.ExpandEnvironmentVariablesNative("$NOPE", lookup, true));
+            // %VAR% is not this helper's concern and is left untouched
+            Assert.AreEqual("%FOO%", Utility.ExpandEnvironmentVariablesNative("%FOO%", lookup, true));
+            // A brace group without a leading '$' is not matched
+            Assert.AreEqual("{FOO}", Utility.ExpandEnvironmentVariablesNative("{FOO}", lookup, true));
+
+            // Native OFF (Windows path): no-op
+            Assert.AreEqual("$FOO/x", Utility.ExpandEnvironmentVariablesNative("$FOO/x", lookup, false));
+        }
+
+        [Test]
+        [Category("Utility")]
         public static void ThrottledStreamRead()
         {
-            byte[] sourceBuffer = {0x10, 0x20, 0x30, 0x40, 0x50};
-            byte[] destinationBuffer = new byte[sourceBuffer.Length + 1];
+            byte[] sourceBuffer = [0x10, 0x20, 0x30, 0x40, 0x50];
+            var destinationBuffer = new byte[sourceBuffer.Length + 1];
             const int offset = 1;
             const int bytesToRead = 3;
 
-            using (MemoryStream baseStream = new MemoryStream(sourceBuffer))
+            using (var baseStream = new MemoryStream(sourceBuffer))
             {
                 const int readSpeed = 1;
                 const int writeSpeed = 1;
 
-                ThrottledStream throttledStream = new ThrottledStream(baseStream, readSpeed, writeSpeed);
-                int bytesRead = throttledStream.Read(destinationBuffer, offset, bytesToRead);
+                var throttledStream = new ThrottleEnabledStream(baseStream, readSpeed, writeSpeed);
+                var bytesRead = throttledStream.Read(destinationBuffer, offset, bytesToRead);
                 Assert.AreEqual(bytesToRead, bytesRead);
 
-                for (int k = 0; k < destinationBuffer.Length; k++)
+                for (var k = 0; k < destinationBuffer.Length; k++)
                 {
                     if (offset <= k && k < offset + bytesToRead)
                     {
@@ -468,17 +607,17 @@ namespace Duplicati.UnitTest
         [Category("Utility")]
         public static void ThrottledStreamWrite()
         {
-            byte[] initialBuffer = {0x10, 0x20, 0x30, 0x40, 0x50};
-            byte[] source = {0x60, 0x70, 0x80, 0x90};
+            byte[] initialBuffer = [0x10, 0x20, 0x30, 0x40, 0x50];
+            byte[] source = [0x60, 0x70, 0x80, 0x90];
             const int offset = 1;
             const int bytesToWrite = 3;
 
-            using (MemoryStream baseStream = new MemoryStream(initialBuffer))
+            using (var baseStream = new MemoryStream(initialBuffer))
             {
                 const int readSpeed = 1;
                 const int writeSpeed = 1;
 
-                ThrottledStream throttledStream = new ThrottledStream(baseStream, readSpeed, writeSpeed);
+                var throttledStream = new ThrottleEnabledStream(baseStream, readSpeed, writeSpeed);
                 throttledStream.Write(source, offset, bytesToWrite);
 
                 byte[] result = baseStream.ToArray();
@@ -504,7 +643,7 @@ namespace Duplicati.UnitTest
             TimeSpan baseDelay = TimeSpan.FromSeconds(1);
 
             int[] testValues = { 1, 2, 11, 12, int.MaxValue };
-            double[] expect =  { 1, 1,  1,  1,            1 };
+            double[] expect = { 1, 1, 1, 1, 1 };
 
             for (int i = 0; i < testValues.Length; i++)
                 Assert.AreEqual(TimeSpan.FromSeconds(expect[i]), Utility.GetRetryDelay(baseDelay, testValues[i], false));
@@ -517,11 +656,155 @@ namespace Duplicati.UnitTest
             // test boundary values
             TimeSpan baseDelay = TimeSpan.FromSeconds(1);
 
-            int[] testValues = { 1, 2,   11,   12, int.MaxValue };
-            double[] expect =  { 1, 2, 1024, 1024,         1024 };
+            int[] testValues = { 1, 2, 11, 12, int.MaxValue };
+            double[] expect = { 1, 2, 1024, 1024, 1024 };
 
             for (int i = 0; i < testValues.Length; i++)
                 Assert.AreEqual(TimeSpan.FromSeconds(expect[i]), Utility.GetRetryDelay(baseDelay, testValues[i], true));
+        }
+
+        [Test]
+        [Category("Utility")]
+        [TestCase("s3://my-bucket/folder?s3-server-name=s3.eu-central-1.wasabisys.com&use-ssl=true", ".wasabisys.com")]
+        [TestCase("s3://my-bucket?use-ssl=true&s3-server-name=ams3.digitaloceanspaces.com", ".digitaloceanspaces.com")]
+        [TestCase("s3://my-bucket/folder?s3-server-name=ns.compat.objectstorage.eu-frankfurt-1.oci.customer-oci.com", ".customer-oci.com")]
+        [TestCase("s3://my-bucket?S3-Server-Name=FSN1.YOUR-OBJECTSTORAGE.COM", ".your-objectstorage.com")]
+        [TestCase("s3://my-bucket?s3-server-name=https%3A%2F%2Fs3.gra.io.cloud.ovh.net%2F", ".cloud.ovh.net")]
+        [TestCase("s3://my-bucket?s3-server-name=sos-ch-gva-2.exo.io:443", ".exo.io")]
+        [TestCase("s3://my-bucket/folder?use-ssl=true", ".amazonaws.com")]
+        public static void GuessHostSuffixSafeUsesS3ServerName(string url, string expected)
+        {
+            Assert.AreEqual(expected, Utility.GuessHostSuffixSafe(url));
+        }
+
+        [Test]
+        [Category("Utility")]
+        [TestCase("s3://my-bucket/folder?s3-server-name=minio.internal.example")]
+        [TestCase("s3://bucket.wasabisys.com/folder?s3-server-name=minio.internal.example")]
+        [TestCase("s3://my-bucket?s3-server-name=wasabisys.com.attacker.example")]
+        [TestCase("ftp://ftp.wasabisys.com/folder")]
+        [TestCase("")]
+        [TestCase(null)]
+        public static void GuessHostSuffixSafeIgnoresUnknownHosts(string url)
+        {
+            // The bucket name is never reported, even if it looks like a known host
+            Assert.IsNull(Utility.GuessHostSuffixSafe(url));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public static void GetUrlWithoutCredentialsRemovesCredentialsFromMalformedUrls()
+        {
+            // An unencoded '@' in the password makes the relaxed parser read
+            // "ssw0rd@example.com" as the host
+            var result = Utility.GetUrlWithoutCredentials("ftp://user:p@ssw0rd@example.com/path");
+            StringAssert.DoesNotContain("ssw0rd", result);
+
+            // A single-slash typo does not match the url parser, so the whole
+            // url is reinterpreted as a local file path and shown in full
+            result = Utility.GetUrlWithoutCredentials("ftps:/user:hunter2@example.com/path");
+            StringAssert.DoesNotContain("hunter2", result);
+
+            // Same reinterpretation when the scheme is missing entirely
+            result = Utility.GetUrlWithoutCredentials("user:hunter2@example.com/path");
+            StringAssert.DoesNotContain("hunter2", result);
+
+            // '\0' is an invalid path character on all platforms, so this is
+            // neither a url nor a path and hits the truncating fallback
+            result = Utility.GetUrlWithoutCredentials("user:hunter2@ex\0ample/x");
+            StringAssert.DoesNotContain("hunter2", result);
+        }
+
+        [Test]
+        [Category("Utility")]
+        public static void GetUrlWithoutCredentialsKeepsSafeUrlsReadable()
+        {
+            // Well-formed urls keep the exact pre-existing output
+            Assert.AreEqual("ftp://example.com/path", Utility.GetUrlWithoutCredentials("ftp://user:pass@example.com/path"));
+            Assert.AreEqual("ftp://example.com/path", Utility.GetUrlWithoutCredentials("ftp://example.com/path"));
+
+            // The part before a '|' separator stays hidden
+            Assert.AreEqual("ftp://host/x", Utility.GetUrlWithoutCredentials("mount|ftp://user:pass@host/x"));
+
+            // An '@' after the first path separator is not userinfo and must survive
+            var decoded = UrlEncoding.UrlDecode(Utility.GetUrlWithoutCredentials("ftp://host/dir@name/x"));
+            StringAssert.Contains("dir@name", decoded);
+
+            decoded = UrlEncoding.UrlDecode(Utility.GetUrlWithoutCredentials("/mnt/data@x/y"));
+            StringAssert.Contains("data@x", decoded);
+
+            // A drive letter is not a scheme, so '@' in a Windows path is kept
+            decoded = UrlEncoding.UrlDecode(Utility.GetUrlWithoutCredentials(@"C:\backup@daily\x"));
+            StringAssert.Contains("backup@daily", decoded);
+
+            decoded = UrlEncoding.UrlDecode(Utility.GetUrlWithoutCredentials(@"file://C:\backup@daily\x"));
+            StringAssert.Contains("backup@daily", decoded);
+
+            // Null and blank inputs pass through
+            Assert.IsNull(Utility.GetUrlWithoutCredentials(null));
+            Assert.AreEqual("", Utility.GetUrlWithoutCredentials(""));
+            Assert.AreEqual("   ", Utility.GetUrlWithoutCredentials("   "));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public static void UriExceptionsDoNotEchoCredentials()
+        {
+            // The parse error for an invalid url is shown to the user, so it
+            // must not echo an embedded password
+            var parseEx = Assert.Throws<ArgumentException>(() => new RelaxedUri("user:hunter2@ex\0ample/x"));
+            StringAssert.DoesNotContain("hunter2", parseEx.Message);
+
+            var hostEx = Assert.Throws<ArgumentException>(() => new RelaxedUri("ftp://user:hunter2@/path").RequireHost());
+            StringAssert.DoesNotContain("hunter2", hostEx.Message);
+        }
+
+        [Test]
+        [Category("Utility")]
+        public static async Task TimeoutWrappersLeaveTheCallersStreamOpen()
+        {
+            // Backends wrap the caller's stream without taking ownership of it, and callers
+            // keep using the stream afterwards, for example to rewind it for a retry
+            var wrappers = new Func<Stream, Stream>[] {
+                s => s.ObserveReadTimeout(TimeSpan.FromSeconds(30), false),
+                s => s.ObserveWriteTimeout(TimeSpan.FromSeconds(30), false)
+            };
+            var disposers = new Func<Stream, Task>[] {
+                s => { s.Dispose(); return Task.CompletedTask; },
+                s => { s.Close(); return Task.CompletedTask; },
+                s => s.DisposeAsync().AsTask()
+            };
+
+            foreach (var wrap in wrappers)
+                foreach (var dispose in disposers)
+                {
+                    using var stream = new MemoryStream();
+                    await dispose(wrap(stream));
+                    Assert.IsTrue(stream.CanRead, "The wrapped stream was closed when the wrapper was disposed");
+                }
+        }
+
+        [Test]
+        [Category("Utility")]
+        public static void TimeoutWrappersApplyTheRequestedMode()
+        {
+            var timeout = TimeSpan.FromSeconds(30);
+            foreach (var mode in Enum.GetValues<TimeoutMode>())
+            {
+                using var read = (TimeoutObservingStream)new MemoryStream().ObserveReadTimeout(timeout, true, mode);
+                Assert.AreEqual(mode, read.Mode);
+                Assert.AreEqual((int)timeout.TotalMilliseconds, read.ReadTimeout);
+                Assert.AreEqual(Timeout.Infinite, read.WriteTimeout, "Only the direction in use may have a timeout, or the idle timer fires");
+
+                using var write = (TimeoutObservingStream)new MemoryStream().ObserveWriteTimeout(timeout, true, mode);
+                Assert.AreEqual(mode, write.Mode);
+                Assert.AreEqual((int)timeout.TotalMilliseconds, write.WriteTimeout);
+                Assert.AreEqual(Timeout.Infinite, write.ReadTimeout, "Only the direction in use may have a timeout, or the idle timer fires");
+            }
+
+            // The original helpers keep the original behavior
+            using var legacy = (TimeoutObservingStream)new MemoryStream().ObserveReadTimeout(timeout, true);
+            Assert.AreEqual(TimeoutMode.CallAndGap, legacy.Mode);
         }
     }
 

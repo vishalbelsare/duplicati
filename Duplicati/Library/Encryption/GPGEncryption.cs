@@ -1,29 +1,31 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2019, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
-//
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-//
-#endregion
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using Duplicati.Library.Interface;
-using Duplicati.Library.Common;
 using Duplicati.Library.Logging;
-using Duplicati.Library.Utility;
 
 namespace Duplicati.Library.Encryption
 {
@@ -35,10 +37,6 @@ namespace Duplicati.Library.Encryption
         private static readonly string LOGTAG = Logging.Log.LogTagFromType<GPGEncryption>();
 
         #region Commandline option constants
-        /// <summary>
-        /// The commandline option supplied if armor should be disabled (--gpg-encryption-disable-armor)
-        /// </summary>
-        private const string COMMANDLINE_OPTIONS_DISABLE_ARMOR = "gpg-encryption-disable-armor";
         /// <summary>
         /// The commandline option supplied if armor should be enabled (--gpg-encryption-enable-armor)
         /// </summary>
@@ -98,8 +96,8 @@ namespace Duplicati.Library.Encryption
         /// <summary>
         /// The PGP program to use, should be with absolute path
         /// </summary>
-        private string m_programpath { get; set; } = GetGpgProgramPath();
-        
+        private string m_programpath { get; set; }
+
         /// <summary>
         /// Commandline switches for encryption
         /// </summary>
@@ -134,21 +132,7 @@ namespace Duplicati.Library.Encryption
             //NOTE: For reasons unknown, GPG commandline options are divided into "options" and "commands".
             //NOTE: The "options" must be placed before "commands" or it wont work!
 
-            bool enableArmor = false;
-
-            if (options.ContainsKey(COMMANDLINE_OPTIONS_ENABLE_ARMOR))
-            {
-                enableArmor = Utility.Utility.ParseBoolOption(options, COMMANDLINE_OPTIONS_ENABLE_ARMOR);
-            }
-            else
-            {
-                //Special handling of this option, it should have been --enable-armor instead,
-                //so this is now deprecated
-                if (options.ContainsKey(COMMANDLINE_OPTIONS_DISABLE_ARMOR))
-                    enableArmor = !Utility.Utility.ParseBoolOption(options, COMMANDLINE_OPTIONS_DISABLE_ARMOR);
-            }
-
-            if (enableArmor)
+            if (Utility.Utility.ParseBoolOption(options, COMMANDLINE_OPTIONS_ENABLE_ARMOR))
             {
                 //--armor is an option
                 m_encryption_args += GPG_ARMOR_OPTION;
@@ -163,9 +147,10 @@ namespace Duplicati.Library.Encryption
             var decryptCmd = options.ContainsKey(COMMANDLINE_OPTIONS_DECRYPTION_COMMAND) ? options[COMMANDLINE_OPTIONS_DECRYPTION_COMMAND] : GPG_DECRYPTION_COMMAND;
             m_decryption_args += " " + GPG_COMMANDLINE_STANDARD_OPTIONS + " " + decryptOptions + " " + decryptCmd;
 
-
             if (options.ContainsKey(COMMANDLINE_OPTIONS_PATH))
                 m_programpath = Environment.ExpandEnvironmentVariables(options[COMMANDLINE_OPTIONS_PATH]);
+            else
+                m_programpath = GetGpgProgramPath();
 
         }
 
@@ -176,12 +161,12 @@ namespace Duplicati.Library.Encryption
         public override string DisplayName { get { return Strings.GPGEncryption.DisplayName; } }
         protected override void Dispose(bool disposing) { m_key = null; }
 
-        public override System.IO.Stream Encrypt(System.IO.Stream input)
+        public override Stream Encrypt(Stream input)
         {
             return this.Execute(m_encryption_args, input, true);
         }
 
-        public override System.IO.Stream Decrypt(System.IO.Stream input)
+        public override Stream Decrypt(Stream input)
         {
             return this.Execute(m_decryption_args, input, false);
         }
@@ -191,13 +176,12 @@ namespace Duplicati.Library.Encryption
             get
             {
                 return new List<ICommandLineArgument>(new ICommandLineArgument[] {
-                    new CommandLineArgument(COMMANDLINE_OPTIONS_DISABLE_ARMOR, CommandLineArgument.ArgumentType.Boolean, Strings.GPGEncryption.GpgencryptiondisablearmorShort, Strings.GPGEncryption.GpgencryptiondisablearmorLong, "true", null, null, Strings.GPGEncryption.Gpgencryptiondisablearmordeprecated(COMMANDLINE_OPTIONS_ENABLE_ARMOR)),
                     new CommandLineArgument(COMMANDLINE_OPTIONS_ENABLE_ARMOR, CommandLineArgument.ArgumentType.Boolean, Strings.GPGEncryption.GpgencryptionenablearmorShort, Strings.GPGEncryption.GpgencryptionenablearmorLong, "false"),
                     new CommandLineArgument(COMMANDLINE_OPTIONS_ENCRYPTION_COMMAND , CommandLineArgument.ArgumentType.String, Strings.GPGEncryption.GpgencryptionencryptioncommandShort, Strings.GPGEncryption.GpgencryptionencryptioncommandLong(GPG_ENCRYPTION_COMMAND, "--encrypt"), GPG_ENCRYPTION_COMMAND),
                     new CommandLineArgument(COMMANDLINE_OPTIONS_DECRYPTION_COMMAND , CommandLineArgument.ArgumentType.String, Strings.GPGEncryption.GpgencryptiondecryptioncommandShort, Strings.GPGEncryption.GpgencryptiondecryptioncommandLong, GPG_DECRYPTION_COMMAND),
                     new CommandLineArgument(COMMANDLINE_OPTIONS_ENCRYPTION_OPTIONS , CommandLineArgument.ArgumentType.String, Strings.GPGEncryption.GpgencryptionencryptionswitchesShort, Strings.GPGEncryption.GpgencryptionencryptionswitchesLong, GPG_ENCRYPTION_DEFAULT_OPTIONS),
                     new CommandLineArgument(COMMANDLINE_OPTIONS_DECRYPTION_OPTIONS, CommandLineArgument.ArgumentType.String, Strings.GPGEncryption.GpgencryptiondecryptionswitchesShort, Strings.GPGEncryption.GpgencryptiondecryptionswitchesLong, GPG_DECRYPTION_DEFAULT_OPTIONS),
-                    new CommandLineArgument(COMMANDLINE_OPTIONS_PATH, CommandLineArgument.ArgumentType.Path, Strings.GPGEncryption.GpgprogrampathShort, Strings.GPGEncryption.GpgprogrampathLong),
+                    new CommandLineArgument(COMMANDLINE_OPTIONS_PATH, CommandLineArgument.ArgumentType.Path, Strings.GPGEncryption.GpgprogrampathShort, Strings.GPGEncryption.GpgprogrampathLong, GetGpgProgramPath()),
                 });
             }
         }
@@ -209,7 +193,7 @@ namespace Duplicati.Library.Encryption
         /// </summary>
         /// <param name="args">The commandline arguments</param>
         /// <param name="input">The input stream</param>
-        private System.IO.Stream Execute(string args, System.IO.Stream input, bool encrypt)
+        private Stream Execute(string args, Stream input, bool encrypt)
         {
             var psi = new System.Diagnostics.ProcessStartInfo
             {
@@ -223,67 +207,104 @@ namespace Duplicati.Library.Encryption
                 WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
             };
 
+            // The passphrase goes to the input of gpg, but the switches may hold one too
+            var shownArgs = HidePassphrase(args);
+            Logging.Log.WriteProfilingMessage(LOGTAG, "GPGCommand", "Running GPG: {0} {1}", m_programpath, shownArgs);
+
 #if DEBUG
             psi.CreateNoWindow = false;
             psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Normal;
-            Console.Error.WriteLine("Running command: {0} {1}", m_programpath, args);
+            Console.Error.WriteLine("Running command: {0} {1}", m_programpath, shownArgs);
 #endif
 
-            System.Diagnostics.Process p;
+            System.Diagnostics.Process p = null;
+            Task<string> stderr;
 
             try
             {
                 p = System.Diagnostics.Process.Start(psi);
+
+                //Read the error output while GPG runs, or GPG stops when the pipe is full
+                stderr = p.StandardError.ReadToEndAsync();
+
                 p.StandardInput.WriteLine(m_key);
                 p.StandardInput.Flush();
 
                 System.Threading.Thread.Sleep(1000);
                 if (p.HasExited)
-                    throw new Exception(p.StandardError.ReadToEnd());
+                    throw new Exception(stderr.GetAwaiter().GetResult());
             }
             catch (Exception ex)
             {
+                if (p != null)
+                {
+                    try
+                    {
+                        if (!p.HasExited)
+                            p.Kill(true);
+                    }
+                    catch
+                    {
+                    }
+                    p.Dispose();
+                }
+
                 Logging.Log.WriteErrorMessage(LOGTAG, "GPGEncryptFailure", ex, "Error occurred while encrypting with GPG:" + ex.Message);
-                throw new Exception(Strings.GPGEncryption.GPGExecuteError(m_programpath, args, ex.Message), ex);
+                throw new Exception(Strings.GPGEncryption.GPGExecuteError(m_programpath, shownArgs, ex.Message), ex);
             }
 
-            System.Threading.Thread t;
+            Task copier;
             if (encrypt)
             {
                 //Prevent blocking of the output buffer
-                t = new System.Threading.Thread(new System.Threading.ParameterizedThreadStart(Runner));
-                t.Start(new object[] { p.StandardOutput.BaseStream, input });
+                copier = StartCopy(p.StandardOutput.BaseStream, input);
 
-                return new GPGStreamWrapper(p, t, p.StandardInput.BaseStream);
+                return new GPGStreamWrapper(p, copier, stderr, p.StandardInput.BaseStream);
             }
 
             //Prevent blocking of the input buffer
-            t = new System.Threading.Thread(new System.Threading.ParameterizedThreadStart(Runner));
-            t.Start(new object[] { input, p.StandardInput.BaseStream });
+            copier = StartCopy(input, p.StandardInput.BaseStream);
 
-            return new GPGStreamWrapper(p, t, p.StandardOutput.BaseStream);
+            return new GPGStreamWrapper(p, copier, stderr, p.StandardOutput.BaseStream);
         }
 
         /// <summary>
-        /// Copies the content of one stream into another, invoked as a thread
+        /// Matches the value of a --passphrase switch, but not --passphrase-fd or --passphrase-file
         /// </summary>
-        /// <param name="x">An array with two stream instances</param>
-        private void Runner(object x)
+        private static readonly System.Text.RegularExpressions.Regex PassphraseSwitch =
+            new(@"(--passphrase)(=|\s+)(""[^""]*""|'[^']*'|\S+)", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// Hides the value of a --passphrase switch in the arguments, so they can be shown
+        /// </summary>
+        /// <param name="args">The commandline arguments</param>
+        /// <returns>The arguments with the passphrase replaced</returns>
+        private static string HidePassphrase(string args)
+            => PassphraseSwitch.Replace(args, "$1$2***");
+
+        /// <summary>
+        /// Copies the content of one stream into another on a thread of its own.
+        /// A failure is kept in the returned task, so the stream wrapper can report it
+        /// </summary>
+        /// <param name="source">The stream to read from</param>
+        /// <param name="target">The stream to write to, closed when the copy is done</param>
+        private static Task StartCopy(Stream source, Stream target)
         {
-            //Unwrap arguments and read stream
-            object[] tmp = (object[])x;
-            Utility.Utility.CopyStream((Stream)tmp[0], (Stream)tmp[1]);
-            ((Stream)tmp[1]).Close();
+            return Task.Factory.StartNew(() =>
+            {
+                Utility.Utility.CopyStream(source, target);
+                target.Close();
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
         /// <summary>
         /// Determines the path to the GPG program
         /// </summary>
-        public static string GetGpgProgramPath()
+        private static string GetGpgProgramPath()
         {
-            Log.WriteInformationMessage("GetGpgProgramPath", "gpg", Platform.IsClientWindows ? WinTools.GetWindowsGpgExePath() : "gpg");
-            // for Windows return the full path, otherwise just return "gpg"
-            return Platform.IsClientWindows ? WinTools.GetWindowsGpgExePath() : "gpg";
+            var gpgpath = GPGLocator.GetGpgExecutablePath();
+            Log.WriteVerboseMessage("GetGpgProgramPath", "gpg", gpgpath);
+            return gpgpath;
         }
     }
 }

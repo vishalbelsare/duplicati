@@ -35,18 +35,20 @@ backupApp.controller('StateController', function($scope, $timeout, ServerStatus,
                     pg = 0;
                 } else {
                     var unaccountedbytes = ($scope.state.lastPgEvent.CurrentFilecomplete) ? 0 : $scope.state.lastPgEvent.CurrentFileoffset;
-                    var filesleft = $scope.state.lastPgEvent.TotalFileCount - $scope.state.lastPgEvent.ProcessedFileCount;
-                    var sizeleft = $scope.state.lastPgEvent.TotalFileSize - $scope.state.lastPgEvent.ProcessedFileSize - unaccountedbytes;
+                    // Without the file scanner, the totals are those of the previous backup,
+                    // so the files processed can pass them, and they can be 0
+                    var filesleft = Math.max(0, $scope.state.lastPgEvent.TotalFileCount - $scope.state.lastPgEvent.ProcessedFileCount);
+                    var sizeleft = Math.max(0, $scope.state.lastPgEvent.TotalFileSize - $scope.state.lastPgEvent.ProcessedFileSize - unaccountedbytes);
                     pg = ($scope.state.lastPgEvent.ProcessedFileSize + unaccountedbytes) / $scope.state.lastPgEvent.TotalFileSize;
 
-                    if ($scope.state.lastPgEvent.ProcessedFileCount == 0)
+                    if ($scope.state.lastPgEvent.ProcessedFileCount == 0 || !($scope.state.lastPgEvent.TotalFileSize > 0))
                         pg = 0;
                     else if (pg >= 0.90)
                         pg = 0.90;
-                    
+
                     // If we have a speed append it
                     var speed_txt = ($scope.state.lastPgEvent.BackendSpeed < 0) ? "" : " at "+AppUtils.formatSizeString($scope.state.lastPgEvent.BackendSpeed)+"/s";
-                    
+
                     var restoring_text = $scope.state.lastPgEvent.Phase == 'Restore_DownloadingRemoteFiles' ? 'Restoring: ' : '';
 
                     // Finally construct the whole text
@@ -56,18 +58,29 @@ backupApp.controller('StateController', function($scope, $timeout, ServerStatus,
             else if ($scope.state.lastPgEvent.Phase == 'Backup_Finalize' || $scope.state.lastPgEvent.Phase == 'Backup_WaitForUpload')
             {
                 pg = 0.90;
-            } 
+            }
             else if ($scope.state.lastPgEvent.Phase == 'Backup_Delete' || $scope.state.lastPgEvent.Phase == 'Backup_Compact')
             {
                 pg = 0.95;
-            } 
+            }
             else if ($scope.state.lastPgEvent.Phase == 'Backup_VerificationUpload' || $scope.state.lastPgEvent.Phase == 'Backup_PostBackupVerify')
             {
                 pg = 0.98;
-            } 
+            }
             else if ($scope.state.lastPgEvent.Phase == 'Backup_Complete' || $scope.state.lastPgEvent.Phase == 'Backup_WaitForUpload')
             {
                 pg = 1;
+            }
+            else if ($scope.state.lastPgEvent.Phase == 'Backup_RemoteSynchronization')
+            {
+                if ($scope.state.lastPgEvent.TotalFileCount > 0) {
+                    var filesleft = $scope.state.lastPgEvent.TotalFileCount - $scope.state.lastPgEvent.ProcessedFileCount;
+                    var sizeleft = $scope.state.lastPgEvent.TotalFileSize - $scope.state.lastPgEvent.ProcessedFileSize;
+                    pg = $scope.state.lastPgEvent.OverallProgress > 0 ? $scope.state.lastPgEvent.OverallProgress : 0;
+
+                    var speed_txt = ($scope.state.lastPgEvent.BackendSpeed < 0) ? "" : " at "+AppUtils.formatSizeString($scope.state.lastPgEvent.BackendSpeed)+"/s";
+                    text = gettextCatalog.getString('Synchronizing remote destination: {{files}} files ({{size}}) to go{{speed_txt}}', { files: filesleft, size: AppUtils.formatSizeString(sizeleft), speed_txt: speed_txt});
+                }
             }
             else if ($scope.state.lastPgEvent.OverallProgress > 0) {
                 pg = $scope.state.lastPgEvent.OverallProgress;
@@ -89,13 +102,13 @@ backupApp.controller('StateController', function($scope, $timeout, ServerStatus,
         var txt = $scope.state.lastPgEvent == null ? '' : ($scope.state.lastPgEvent.Phase || '');
 
         function handleClick(ix) {
-            if (ix == 0) 
+            if (ix == 0)
             {
-                AppService.post('/task/' + taskId + '/stopaftercurrentfile');
+                AppService.post('/task/' + taskId + '/stop');
                 $scope.StopReqId = taskId;
             }
             else if (ix == 1) {
-                AppService.post('/task/' + taskId + '/stopnow');
+                AppService.post('/task/' + taskId + '/abort');
                 $scope.StopReqId = taskId;
             }
         };
@@ -104,8 +117,8 @@ backupApp.controller('StateController', function($scope, $timeout, ServerStatus,
         {
             DialogService.dialog(
                 gettextCatalog.getString("Stop running backup"),
-                gettextCatalog.getString("You can stop the backup after any file uploads currently in progress have finished."),
-                [gettextCatalog.getString("Stop after current file"), gettextCatalog.getString("Stop now"), gettextCatalog.getString("Cancel")],
+                gettextCatalog.getString("You can stop the backup after any file uploads currently in progress have finished. If you terminate the backup, the next run will need to recover from a failed backup."),
+                [gettextCatalog.getString("Stop after the current file"), gettextCatalog.getString("Terminate"), gettextCatalog.getString("Cancel")],
                 handleClick
             );
         }
@@ -113,8 +126,8 @@ backupApp.controller('StateController', function($scope, $timeout, ServerStatus,
         {
             DialogService.dialog(
                 gettextCatalog.getString("Stop running task"),
-                gettextCatalog.getString("You can stop the task immediately, or allow the process to continue its current file and then stop."),
-                [gettextCatalog.getString("Stop after the current file"), gettextCatalog.getString("Stop now"), gettextCatalog.getString("Cancel")],
+                gettextCatalog.getString("You can stop the task immediately, or allow the process to continue its current file and then stop. If you terminate the task, the backup could be left in an inconsistent state."),
+                [gettextCatalog.getString("Stop after the current file"), gettextCatalog.getString("Terminate"), gettextCatalog.getString("Cancel")],
                 handleClick
             );
         }

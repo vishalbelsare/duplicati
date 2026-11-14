@@ -1,29 +1,32 @@
-﻿//  Copyright (C) 2015, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 //
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
 //
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
 //
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using CoCoL;
 using System.Threading.Tasks;
 using System.IO;
 using System.Collections.Generic;
-using System.Security.Principal;
-using System.Threading;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Main.Operation.Common;
-using Duplicati.Library.Snapshots;
+using System.Threading;
 
 namespace Duplicati.Library.Main.Operation.Backup
 {
@@ -38,7 +41,7 @@ namespace Duplicati.Library.Main.Operation.Backup
         public class FileEntry
         {
             // From input
-            public string Path;
+            public ISourceProviderEntry Entry;
 
             // Split
             public long PathPrefixID;
@@ -58,17 +61,18 @@ namespace Duplicati.Library.Main.Operation.Backup
             // After processing metadata
             public IMetahash MetaHashAndSize;
             public bool MetadataChanged;
+            public bool TimestampChanged;
         }
-            
-        public static Task Run(Snapshots.ISnapshotService snapshot, Options options, BackupDatabase database, long lastfilesetid, CancellationToken token)
+
+        public static Task RunAsync(Channels channels, Options options, BackupDatabase database, long lastfilesetid, ITaskReader taskreader)
         {
             return AutomationExtensions.RunTask(new
             {
-                Input = Backup.Channels.SourcePaths.ForRead,
-                StreamBlockChannel = Channels.StreamBlock.ForWrite,
-                Output = Backup.Channels.ProcessedFiles.ForWrite,
+                Input = channels.SourcePaths.AsRead(),
+                StreamBlockChannel = channels.StreamBlock.AsWrite(),
+                Output = channels.ProcessedFiles.AsWrite(),
             },
-                
+
             async self =>
             {
                 var emptymetadata = Utility.WrapMetadata(new Dictionary<string, string>(), options);
@@ -79,51 +83,57 @@ namespace Duplicati.Library.Main.Operation.Backup
 
                 while (true)
                 {
-                    var path = await self.Input.ReadAsync();
+                    var entry = await self.Input.ReadAsync();
+
+                    // We ignore the stop signal, but not the pause and terminate
+                    await taskreader.ProgressRendevouzAsync().ConfigureAwait(false);
 
                     var lastwrite = new DateTime(0, DateTimeKind.Utc);
-                    var attributes = default(FileAttributes);
-                    try 
-                    { 
-                        lastwrite = snapshot.GetLastWriteTimeUtc(path); 
-                    }
-                    catch (Exception ex) 
+                    var attributes = entry.IsFolder
+                        ? FileAttributes.Directory
+                        : FileAttributes.Normal;
+
+                    try
                     {
-                        Logging.Log.WriteWarningMessage(FILELOGTAG, "TimestampReadFailed", ex, "Failed to read timestamp on \"{0}\"", path);
+                        lastwrite = entry.LastModificationUtc;
+                    }
+                    catch (Exception ex)
+                    {
+                        LogExceptionHelper.LogCommonWarning(ex, FILELOGTAG, "TimestampReadFailed", entry.Path, "Failed to read timestamp on \"{0}\"");
                     }
 
-                    try 
-                    { 
-                        attributes = snapshot.GetAttributes(path); 
-                    }
-                    catch (Exception ex) 
+                    try
                     {
-                        Logging.Log.WriteVerboseMessage(FILELOGTAG, "FailedAttributeRead", "Failed to read attributes from {0}: {1}", path, ex.Message);                     
+                        attributes = entry.Attributes;
+                    }
+                    catch (Exception ex)
+                    {
+                        LogExceptionHelper.LogCommonWarning(ex, FILELOGTAG, "AttributeReadFailed", entry.Path, "Failed to read attributes on \"{0}\"");
                     }
 
                     // If we only have metadata, stop here
-                    if (await ProcessMetadata(path, attributes, lastwrite, options, snapshot, emptymetadata, database, self.StreamBlockChannel).ConfigureAwait(false))
+                    if (await ProcessMetadataAsync(entry, attributes, lastwrite, options, emptymetadata, database, self.StreamBlockChannel, taskreader.ProgressToken).ConfigureAwait(false))
                     {
                         try
                         {
-                            var split = Database.LocalDatabase.SplitIntoPrefixAndName(path);
+                            var split = Database.Local.LocalDatabase.SplitIntoPrefixAndName(entry.Path);
 
                             long prefixid;
                             if (string.Equals(prevprefix.Key, split.Key, StringComparison.Ordinal))
                                 prefixid = prevprefix.Value;
                             else
                             {
-                                prefixid = await database.GetOrCreatePathPrefix(split.Key);
+                                prefixid = await database.GetOrCreatePathPrefixAsync(split.Key, taskreader.ProgressToken);
                                 prevprefix = new KeyValuePair<string, long>(split.Key, prefixid);
                             }
 
                             if (CHECKFILETIMEONLY || DISABLEFILETIMECHECK)
                             {
-                                var tmp = await database.GetFileLastModifiedAsync(prefixid, split.Value, lastfilesetid, false);
+                                var tmp = await database.GetFileLastModifiedAsync(prefixid, split.Value, lastfilesetid, false, taskreader.ProgressToken);
                                 await self.Output.WriteAsync(new FileEntry
                                 {
                                     OldId = tmp.Item1,
-                                    Path = path,
+                                    Entry = entry,
                                     PathPrefixID = prefixid,
                                     Filename = split.Value,
                                     Attributes = attributes,
@@ -136,11 +146,11 @@ namespace Duplicati.Library.Main.Operation.Backup
                             }
                             else
                             {
-                                var res = await database.GetFileEntryAsync(prefixid, split.Value, lastfilesetid);
+                                var res = await database.GetFileEntryAsync(prefixid, split.Value, lastfilesetid, taskreader.ProgressToken);
                                 await self.Output.WriteAsync(new FileEntry
                                 {
                                     OldId = res == null ? -1 : res.id,
-                                    Path = path,
+                                    Entry = entry,
                                     PathPrefixID = prefixid,
                                     Filename = split.Value,
                                     Attributes = attributes,
@@ -154,12 +164,10 @@ namespace Duplicati.Library.Main.Operation.Backup
                         }
                         catch (Exception ex)
                         {
-                            if (ex.IsRetiredException() || token.IsCancellationRequested)
-                            {
+                            if (ex.IsRetiredException())
                                 continue;
-                            }
-                            Logging.Log.WriteWarningMessage(FILELOGTAG, "ProcessingMetadataFailed", ex,
-                                "Failed to process entry, path: {0}", path);
+
+                            LogExceptionHelper.LogCommonWarning(ex, FILELOGTAG, "ProcessingMetadataFailed", entry.Path);
                         }
                     }
                 }
@@ -171,10 +179,18 @@ namespace Duplicati.Library.Main.Operation.Backup
         /// <summary>
         /// Processes the metadata for the given path.
         /// </summary>
+        /// <param name="entry">The source provider entry to process.</param>
+        /// <param name="attributes">The file attributes of the entry.</param>
+        /// <param name="lastwrite">The last write timestamp of the entry.</param>
+        /// <param name="options">The options for the backup operation.</param>
+        /// <param name="emptymetadata">An empty metadata object to use if no metadata is generated.</param>
+        /// <param name="database">The backup database to use for storing metadata.</param>
+        /// <param name="streamblockchannel">The channel to write stream blocks to.</param>
+        /// <param name="cancellationToken">The cancellation token to use for the operation.</param>
         /// <returns><c>True</c> if the path should be submitted to more analysis, <c>false</c> if there is nothing else to do</returns>
-        private static async Task<bool> ProcessMetadata(string path, FileAttributes attributes, DateTime lastwrite, Options options, Snapshots.ISnapshotService snapshot, IMetahash emptymetadata, BackupDatabase database, IWriteChannel<StreamBlock> streamblockchannel)
+        private static async Task<bool> ProcessMetadataAsync(ISourceProviderEntry entry, FileAttributes attributes, DateTime lastwrite, Options options, IMetahash emptymetadata, BackupDatabase database, IWriteChannel<StreamBlock> streamblockchannel, CancellationToken cancellationToken)
         {
-            if (snapshot.IsSymlink(path, attributes))
+            if (entry.IsSymlink)
             {
                 // Not all reparse points are symlinks.
                 // For example, on Windows 10 Fall Creator's Update, the OneDrive folder (and all subfolders)
@@ -183,41 +199,48 @@ namespace Duplicati.Library.Main.Operation.Backup
                 string symlinkTarget = null;
                 try
                 {
-                    symlinkTarget = snapshot.GetSymlinkTarget(path);
+                    symlinkTarget = entry.SymlinkTarget;
                 }
                 catch (Exception ex)
                 {
-                    Logging.Log.WriteExplicitMessage(FILELOGTAG, "SymlinkTargetReadFailure", ex, "Failed to read symlink target for path: {0}", path);
+                    Logging.Log.WriteExplicitMessage(FILELOGTAG, "SymlinkTargetReadFailure", ex, "Failed to read symlink target for path: {0}", entry.Path);
                 }
 
                 if (!string.IsNullOrWhiteSpace(symlinkTarget))
                 {
                     if (options.SymlinkPolicy == Options.SymlinkStrategy.Ignore)
                     {
-                        Logging.Log.WriteVerboseMessage(FILELOGTAG, "IgnoreSymlink", "Ignoring symlink {0}", path);
+                        Logging.Log.WriteVerboseMessage(FILELOGTAG, "IgnoreSymlink", "Ignoring symlink {0}", entry.Path);
                         return false;
                     }
 
                     if (options.SymlinkPolicy == Options.SymlinkStrategy.Store)
                     {
-                        var metadata = MetadataGenerator.GenerateMetadata(path, attributes, options, snapshot);
+                        var metadata = await MetadataGenerator.GenerateMetadataUnlessAbortedAsync(entry, attributes, options, cancellationToken);
 
                         if (!metadata.ContainsKey("CoreSymlinkTarget"))
                             metadata["CoreSymlinkTarget"] = symlinkTarget;
 
-                        var metahash = Utility.WrapMetadata(metadata, options);
-                        await AddSymlinkToOutputAsync(path, DateTime.UtcNow, metahash, database, streamblockchannel).ConfigureAwait(false);
+                        // A junction and a symbolic link to a folder both have a target, but
+                        // they are different kinds of link, so the kind is kept to make the
+                        // same kind again on restore
+                        if (OperatingSystem.IsWindows() && !metadata.ContainsKey("CoreSymlinkType") && new Duplicati.Library.Common.IO.SystemIOWindows().IsJunction(entry.Path))
+                            metadata["CoreSymlinkType"] = "junction";
 
-                        Logging.Log.WriteVerboseMessage(FILELOGTAG, "StoreSymlink", "Stored symlink {0}", path);
+                        var metahash = Utility.WrapMetadata(metadata, options);
+                        await AddSymlinkToOutputAsync(entry.Path, DateTime.UtcNow, metahash, database, streamblockchannel, cancellationToken).ConfigureAwait(false);
+
+                        Logging.Log.WriteVerboseMessage(FILELOGTAG, "StoreSymlink", "Stored symlink {0}", entry.Path);
                         // Don't process further
                         return false;
                     }
                 }
                 else
                 {
-                    Logging.Log.WriteVerboseMessage(FILELOGTAG, "FollowingEmptySymlink", "Treating empty symlink as regular path {0}", path);
+                    Logging.Log.WriteVerboseMessage(FILELOGTAG, "FollowingEmptySymlink", "Treating empty symlink as regular path {0}", entry.Path);
                 }
             }
+
 
             if ((attributes & FileAttributes.Directory) == FileAttributes.Directory)
             {
@@ -225,15 +248,15 @@ namespace Duplicati.Library.Main.Operation.Backup
 
                 if (!options.SkipMetadata)
                 {
-                    metahash = Utility.WrapMetadata(MetadataGenerator.GenerateMetadata(path, attributes, options, snapshot), options);
+                    metahash = Utility.WrapMetadata(await MetadataGenerator.GenerateMetadataUnlessAbortedAsync(entry, attributes, options, cancellationToken), options);
                 }
                 else
                 {
                     metahash = emptymetadata;
                 }
 
-                Logging.Log.WriteVerboseMessage(FILELOGTAG, "AddDirectory", "Adding directory {0}", path);
-                await AddFolderToOutputAsync(path, lastwrite, metahash, database, streamblockchannel).ConfigureAwait(false);
+                Logging.Log.WriteVerboseMessage(FILELOGTAG, "AddDirectory", "Adding directory {0}", entry.Path);
+                await AddFolderToOutputAsync(entry.Path, lastwrite, metahash, database, streamblockchannel, cancellationToken).ConfigureAwait(false);
                 return false;
             }
 
@@ -244,43 +267,51 @@ namespace Duplicati.Library.Main.Operation.Backup
         /// <summary>
         /// Adds metadata to output, and returns the metadataset ID
         /// </summary>
-        /// <returns>The metadataset ID.</returns>
         /// <param name="path">The path for which metadata is processed.</param>
         /// <param name="meta">The metadata entry.</param>
         /// <param name="database">The database connection.</param>
         /// <param name="streamblockchannel">The channel to write streams to.</param>
-        internal static async Task<Tuple<bool, long>> AddMetadataToOutputAsync(string path, IMetahash meta, BackupDatabase database, IWriteChannel<StreamBlock> streamblockchannel)
+        /// <param name="cancellationToken">The cancellation token to use.</param>
+        /// <returns>A task that when awaited returns a tuple with the first value indicating if the metadata set was added, and the second value being the metadata ID.</returns>
+        internal static async Task<(bool, long)> AddMetadataToOutputAsync(string path, IMetahash meta, BackupDatabase database, IWriteChannel<StreamBlock> streamblockchannel, CancellationToken cancellationToken)
         {
             StreamProcessResult res;
             using (var ms = new MemoryStream(meta.Blob))
-                res = await StreamBlock.ProcessStream(streamblockchannel, path, ms, true, CompressionHint.Default); 
+                res = await StreamBlock.ProcessStreamAsync(streamblockchannel, path, ms, true, CompressionHint.Default);
 
-            return await database.AddMetadatasetAsync(res.Streamhash, res.Streamlength, res.Blocksetid);
+            return await database.AddMetadatasetAsync(res.Streamhash, res.Streamlength, res.Blocksetid, meta, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>
-        /// Adds a file to the output, 
+        /// Adds a file to the output,
         /// </summary>
         /// <param name="filename">The name of the file to record</param>
         /// <param name="lastModified">The value of the lastModified timestamp</param>
-        private static async Task AddFolderToOutputAsync(string filename, DateTime lastModified, IMetahash meta, BackupDatabase database, IWriteChannel<StreamBlock> streamblockchannel)
-        {
-            var metadataid = await AddMetadataToOutputAsync(filename, meta, database, streamblockchannel).ConfigureAwait(false);
-            await database.AddDirectoryEntryAsync(filename, metadataid.Item2, lastModified);
-        }
-
-        /// <summary>
-        /// Adds a file to the output, 
-        /// </summary>
-        /// <param name="filename">The name of the file to record</param>
-        /// <param name="lastModified">The value of the lastModified timestamp</param>
+        /// <param name="meta">The metadata to record</param>
         /// <param name="database">The database to use</param>
         /// <param name="streamblockchannel">The channel to write blocks to</param>
-        /// <param name="meta">The metadata ti record</param>
-        private static async Task AddSymlinkToOutputAsync(string filename, DateTime lastModified, IMetahash meta, BackupDatabase database, IWriteChannel<StreamBlock> streamblockchannel)
+        /// <param name="cancellationToken">The cancellation token to use</param>
+        /// <returns>A task that completes when the file has been added to the output.</returns>
+        private static async Task AddFolderToOutputAsync(string filename, DateTime lastModified, IMetahash meta, BackupDatabase database, IWriteChannel<StreamBlock> streamblockchannel, CancellationToken cancellationToken)
         {
-            var metadataid = await AddMetadataToOutputAsync(filename, meta, database, streamblockchannel).ConfigureAwait(false);
-            await database.AddSymlinkEntryAsync(filename, metadataid.Item2, lastModified);
+            var metadataid = await AddMetadataToOutputAsync(filename, meta, database, streamblockchannel, cancellationToken).ConfigureAwait(false);
+            await database.AddDirectoryEntryAsync(filename, metadataid.Item2, lastModified, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Adds a file to the output,
+        /// </summary>
+        /// <param name="filename">The name of the file to record</param>
+        /// <param name="lastModified">The value of the lastModified timestamp</param>
+        /// <param name="meta">The metadata ti record</param>
+        /// <param name="database">The database to use</param>
+        /// <param name="streamblockchannel">The channel to write blocks to</param>
+        /// <param name="cancellationToken">The cancellation token to use</param>
+        /// <returns>A task that completes when the file has been added to the output.</returns>
+        private static async Task AddSymlinkToOutputAsync(string filename, DateTime lastModified, IMetahash meta, BackupDatabase database, IWriteChannel<StreamBlock> streamblockchannel, CancellationToken cancellationToken)
+        {
+            var metadataid = await AddMetadataToOutputAsync(filename, meta, database, streamblockchannel, cancellationToken).ConfigureAwait(false);
+            await database.AddSymlinkEntryAsync(filename, metadataid.Item2, lastModified, cancellationToken).ConfigureAwait(false);
         }
 
     }

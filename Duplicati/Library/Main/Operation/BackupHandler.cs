@@ -1,38 +1,41 @@
-﻿#region Disclaimer / License
-// Copyright (C) 2019, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 //
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
 //
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
 //
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-//
-#endregion
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using Duplicati.Library.Main.Database;
+using Duplicati.Library.Main.Database.Local;
 using Duplicati.Library.Main.Volumes;
 using Duplicati.Library.Interface;
 using System.Threading.Tasks;
 using CoCoL;
 using System.Threading;
-using Duplicati.Library.Snapshots;
 using Duplicati.Library.Utility;
 using Duplicati.Library.Common.IO;
-using Duplicati.Library.Common;
 using Duplicati.Library.Logging;
-using Duplicati.Library.Main.Operation.Backup;
 using Duplicati.Library.Main.Operation.Common;
+using System.Data;
+using Duplicati.Library.SourceProvider;
+using Duplicati.Library.Snapshots.USN;
 
 namespace Duplicati.Library.Main.Operation
 {
@@ -42,73 +45,103 @@ namespace Duplicati.Library.Main.Operation
     /// to the chosen destination
     /// </summary>
     internal class BackupHandler : IDisposable
-    {   
+    {
         /// <summary>
         /// The tag used for logging
         /// </summary>
-        private static readonly string LOGTAG = Logging.Log.LogTagFromType<BackupHandler>();
+        private static readonly string LOGTAG = Log.LogTagFromType<BackupHandler>();
 
         private readonly Options m_options;
-        private readonly string m_backendurl;
 
         private LocalBackupDatabase m_database;
-        private System.Data.IDbTransaction m_transaction;
-
-        private Library.Utility.IFilter m_filter;
-        private Library.Utility.IFilter m_sourceFilter;
+        private IFilter m_filter;
 
         private readonly BackupResults m_result;
+        private readonly ITaskReader m_taskReader;
+        /// <summary>
+        /// The provider of the paths that changed since the previous backup, or null to scan everything
+        /// </summary>
+        private readonly IChangeListProvider m_changeListProvider;
+        /// <summary>
+        /// The longest time the change list provider may take to hand over the list
+        /// </summary>
+        private static readonly TimeSpan CHANGE_LIST_DRAIN_TIMEOUT = TimeSpan.FromMinutes(5);
+        /// <summary>
+        /// The scope of the state a change list provider's token is stored under
+        /// </summary>
+        private const string CHANGE_LIST_STATE_SCOPE = "change-list-provider";
+        /// <summary>
+        /// The key of the token in the stored state
+        /// </summary>
+        private const string CHANGE_LIST_TOKEN_KEY = "token";
+        /// <summary>
+        /// The key prefix of a path the run failed on, to be looked at again by the next run
+        /// </summary>
+        private const string CHANGE_LIST_RETRY_PREFIX = "retry:";
+        /// <summary>
+        /// The number of failed paths above which the next run scans everything instead of retrying them
+        /// </summary>
+        private const int MAX_RETRY_PATHS = 100000;
+        /// <summary>
+        /// The normalized change list of this run, if any
+        /// </summary>
+        private TempFile m_normalizedChangeList;
 
         public readonly CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
 
-        public BackupHandler(string backendurl, Options options, BackupResults results)
+        public BackupHandler(Options options, BackupResults results, IChangeListProvider changeListProvider)
         {
             m_options = options;
             m_result = results;
-            m_backendurl = backendurl;
-                            
+            m_taskReader = results.TaskControl;
+            m_changeListProvider = changeListProvider;
+
             if (options.AllowPassphraseChange)
                 throw new UserInformationException(Strings.Common.PassphraseChangeUnsupported, "PassphraseChangeUnsupported");
         }
-        
-        public static Snapshots.ISnapshotService GetSnapshot(string[] sources, Options options)
-        {
-            try
-            {
-                if (options.SnapShotStrategy != Options.OptimizationStrategy.Off)
-                    return Duplicati.Library.Snapshots.SnapshotUtility.CreateSnapshot(sources, options.RawOptions);
-            }
-            catch (Exception ex)
-            {
-                if (options.SnapShotStrategy == Options.OptimizationStrategy.Required)
-                    throw new UserInformationException(Strings.Common.SnapshotFailedError(ex.Message), "SnapshotFailed", ex);
-                else if (options.SnapShotStrategy == Options.OptimizationStrategy.On)
-                    Logging.Log.WriteWarningMessage(LOGTAG, "SnapshotFailed", ex, Strings.Common.SnapshotFailedError(ex.Message));
-                else if (options.SnapShotStrategy == Options.OptimizationStrategy.Auto)
-                    Logging.Log.WriteInformationMessage(LOGTAG, "SnapshotFailed", Strings.Common.SnapshotFailedError(ex.Message));
-            }
-
-            return Platform.IsClientPosix ?
-                (Library.Snapshots.ISnapshotService)new Duplicati.Library.Snapshots.NoSnapshotLinux()
-                    :
-                new Duplicati.Library.Snapshots.NoSnapshotWindows();
-        }
 
         /// <summary>
-        /// Create instance of USN journal service
+        /// Gets a single source provider for the given sources
         /// </summary>
-        /// <param name="sources"></param>
-        /// <param name="snapshot"></param>
-        /// <param name="filter"></param>
-        /// <param name="lastfilesetid"></param>
-        /// <returns></returns>
-        private UsnJournalService GetJournalService(IEnumerable<string> sources, ISnapshotService snapshot, IFilter filter, long lastfilesetid)
+        /// <param name="sources">The sources to get providers for</param>
+        /// <param name="options">The options to use</param>
+        /// <param name="cancellationToken">The cancellation token</param>
+        /// <returns>The source providers</returns>
+        public static Task<ISourceProvider> GetSourceProviderAsync(IEnumerable<string> sources, Options options, CancellationToken cancellationToken)
+            => SourceProviderFactory.GetSourceProviderAsync(sources, options, cancellationToken);
+
+        public UsnJournalService GetJournalService(ISourceProvider provider, IFilter filter, long lastfilesetid)
         {
             if (m_options.UsnStrategy == Options.OptimizationStrategy.Off) return null;
+            if (!OperatingSystem.IsWindows())
+                throw new UserInformationException("USN journal is only supported on Windows", "UsnJournalNotSupported");
 
-            var journalData = m_database.GetChangeJournalData(lastfilesetid);
-            var service = new UsnJournalService(sources, snapshot, filter, m_options.FileAttributeFilter, m_options.SkipFilesLargerThan,
-                journalData, cancellationTokenSource.Token);
+            var providers = (provider is Combiner c ? c.Providers : [provider])
+                .Select((x, i) => new { Provider = x, Index = i })
+                .Where(x => x.Provider is LocalFileSource)
+                .ToList();
+
+            if (providers.Count == 0)
+                return null;
+            if (providers.Count > 1)
+                throw new UserInformationException("Multiple USN journal services are not supported", "MultipleUSNJournalServices");
+            var fileProvider = providers.First().Provider as LocalFileSource;
+
+            // TODO because of the new SQLite backend, this method returns an
+            // async enumerable. The proper way to handle this would be to
+            // change the UsnJournalService to use factory construction (see how
+            // all of the local database classes handle this), as the constructor
+            // is not async and shouldn't be executing "heavy" code, such as
+            // database queries.
+            var journalData = m_database.GetChangeJournalDataAsync(lastfilesetid, m_taskReader.ProgressToken).ToBlockingEnumerable();
+            // The journal only lists the changed files. The time limits are compared as points in time,
+            // so a limit given as an interval moves with every run and the files have to be scanned again,
+            // as a file can cross it without being changed
+            var timeLimits = new[] { ("skip-files-modified-before", m_options.SkipFilesModifiedBefore), ("skip-files-modified-after", m_options.SkipFilesModifiedAfter) }
+                .Where(x => x.Item2.HasValue)
+                .Select(x => $"{x.Item1}={x.Item2!.Value.Ticks}");
+            var service = new UsnJournalService(fileProvider.SnapshotService, filter, m_options.FileAttributeFilter, m_options.SkipFilesLargerThan,
+                journalData, cancellationTokenSource.Token, timeLimits);
 
             foreach (var volumeData in service.VolumeDataList)
             {
@@ -117,8 +150,7 @@ namespace Duplicati.Library.Main.Operation
                     if (volumeData.Exception == null || volumeData.Exception is UsnJournalSoftFailureException)
                     {
                         // soft fail
-                        Logging.Log.WriteInformationMessage(LOGTAG, "SkipUsnForVolume",
-                            "Performing full scan for volume \"{0}\": {1}", volumeData.Volume, volumeData.Exception?.Message);
+                        LogUsnFullScan(volumeData.Volume, volumeData.Exception, m_options.UsnStrategy);
                     }
                     else
                     {
@@ -141,131 +173,699 @@ namespace Duplicati.Library.Main.Operation
             return service;
         }
 
-        private void PreBackupVerify(BackendManager backend, string protectedfile)
+        /// <summary>
+        /// Logs that a volume is scanned in full because the USN journal could not be used.
+        /// A journal that is too small to reach back to the previous backup is a warning
+        /// when the USN journal was asked for, as it happens on every backup until it is enlarged
+        /// </summary>
+        /// <param name="volume">The volume that is scanned in full</param>
+        /// <param name="exception">The reason the journal could not be used, if any</param>
+        /// <param name="strategy">The USN policy in use</param>
+        internal static void LogUsnFullScan(string volume, Exception exception, Options.OptimizationStrategy strategy)
         {
-            m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_PreBackupVerify);
-            using(new Logging.Timer(LOGTAG, "PreBackupVerify", "PreBackupVerify"))
+            if (exception is UsnJournalPurgedException && strategy is Options.OptimizationStrategy.On or Options.OptimizationStrategy.Required)
+                Logging.Log.WriteWarningMessage(LOGTAG, "UsnJournalPurged", null,
+                    "Performing full scan for volume \"{0}\": {1}", volume, exception.Message);
+            else
+                Logging.Log.WriteInformationMessage(LOGTAG, "SkipUsnForVolume",
+                    "Performing full scan for volume \"{0}\": {1}", volume, exception?.Message);
+        }
+
+        /// <summary>
+        /// Rejects option combinations that would make two mechanisms decide what is copied from the previous fileset
+        /// </summary>
+        private void ValidateChangeListOptions()
+        {
+            var listPath = m_options.ChangedFilesList;
+            var hasInlineList = m_options.ChangedFilelist is { Length: > 0 };
+
+            if (m_changeListProvider != null && (hasInlineList || listPath != null))
+                throw new UserInformationException("The options --changed-files and --changed-files-list cannot be used when the change list is supplied by the host", "ChangeListOptionWithProvider");
+            if (listPath != null && hasInlineList)
+                throw new UserInformationException("The option --changed-files-list cannot be combined with --changed-files", "ChangedFilesListWithChangedFiles");
+            if (listPath != null && m_options.UsnStrategy != Options.OptimizationStrategy.Off)
+                throw new UserInformationException("A change list cannot be combined with the USN change journal. Disable the USN journal with --usn-policy=off.", "ChangeListWithUsn");
+            if (listPath != null && !System.IO.File.Exists(listPath))
+                throw new UserInformationException($"The change list file \"{listPath}\" does not exist", "ChangeListFileMissing");
+            if (listPath != null && m_options.GetChangeListUnsupportedReason() is string reason)
+                throw new UserInformationException($"The option --changed-files-list cannot be used because {reason}", "ChangeListNotSupported");
+        }
+
+        /// <summary>
+        /// Asks the change list provider, if any, for the change list of this run. Called right
+        /// after the source provider, so the snapshot exists, and so the provider closes its
+        /// recording at that point.
+        /// </summary>
+        /// <param name="source">The source provider</param>
+        /// <param name="referenceTimeUtc">The time taken before the source provider was created</param>
+        /// <returns>The handoff, or null if there is none</returns>
+        private async Task<ChangeListHandoff> DrainChangeListAsync(ISourceProvider source, DateTime referenceTimeUtc)
+        {
+            if (m_changeListProvider == null && m_options.ChangedFilesList == null)
+                return null;
+
+            // Both mechanisms decide which paths are copied from the previous fileset, and they
+            // are not combined. A list given by option is refused
+            var trackingSource = Backup.FileEnumerationProcess.GetProviders(source).OfType<IChangeTrackingSourceProvider>().Any(x => !string.IsNullOrWhiteSpace(x.MountedPath));
+            if (trackingSource && m_changeListProvider == null)
+                throw new UserInformationException("A change list cannot be combined with a source that tracks its own changes.", "ChangeListWithChangeTrackingSource");
+
+            if (m_changeListProvider == null)
+                return null;
+
+            // A list offered by the host is still asked for, so its recording moves on, but
+            // it is not used
+            if (trackingSource)
+            {
+                var drained = await DrainFromProviderAsync(referenceTimeUtc).ConfigureAwait(false);
+                Log.WriteInformationMessage(LOGTAG, "ChangeListNotUsedWithChangeTrackingSource", "A source tracks its own changes, so the change list is not used and all files are scanned");
+                return drained == null ? null : drained with { ListPath = null };
+            }
+
+            return await DrainFromProviderAsync(referenceTimeUtc).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Asks the change list provider for the change list, with a time limit
+        /// </summary>
+        /// <param name="referenceTimeUtc">The time taken before the source provider was created</param>
+        /// <returns>The handoff, or null if there is none</returns>
+        private async Task<ChangeListHandoff> DrainFromProviderAsync(DateTime referenceTimeUtc)
+        {
+            // The provider is cancelled when it takes too long, so it can put its recording back
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(m_taskReader.ProgressToken);
+            cts.CancelAfter(CHANGE_LIST_DRAIN_TIMEOUT);
+            try
+            {
+                return await m_changeListProvider
+                    .DrainChangeListAsync(referenceTimeUtc, cts.Token)
+                    .WaitAsync(cts.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!m_taskReader.ProgressToken.IsCancellationRequested)
+            {
+                // A host that cannot deliver the list must not fail or block the backup
+                Log.WriteWarningMessage(LOGTAG, "ChangeListDrainFailed", ex, "The change list could not be obtained, scanning all files");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Prepares the change list of this run, from the host's handoff or from the option.
+        /// A list from the host is only used when the previous fileset carries a token the
+        /// list was recorded against, so a list never applies to a fileset that was cut short,
+        /// deleted, purged or recreated. The paths the previous run failed on are added.
+        /// </summary>
+        /// <param name="db">The database</param>
+        /// <param name="source">The source provider</param>
+        /// <param name="sources">The expanded sources</param>
+        /// <param name="handoff">The host's handoff, or null</param>
+        /// <param name="lastfilesetid">The previous fileset, or a negative value if there is none</param>
+        /// <returns>The normalized change list, or null to scan everything</returns>
+        private async Task<Backup.ChangeList> PrepareChangeListAsync(Backup.BackupDatabase db, ISourceProvider source, string[] sources, ChangeListHandoff handoff, long lastfilesetid)
+        {
+            var listPath = m_options.ChangedFilesList ?? handoff?.ListPath;
+            if (listPath == null)
+            {
+                if (handoff != null)
+                    Log.WriteInformationMessage(LOGTAG, "ChangeListNotAvailable", "No change list is available, scanning all files");
+                return null;
+            }
+
+            if (lastfilesetid < 0)
+            {
+                Log.WriteInformationMessage(LOGTAG, "ChangeListWithoutPreviousBackup", "There is no previous backup to copy unchanged files from, scanning all files");
+                return null;
+            }
+
+            if (handoff != null && m_options.GetChangeListUnsupportedReason() is string reason)
+            {
+                Log.WriteInformationMessage(LOGTAG, "ChangeListNotSupported", "The change list is not used because {0}, scanning all files", reason);
+                return null;
+            }
+
+            IEnumerable<string> retryPaths = [];
+            if (handoff != null)
+            {
+                if (!System.IO.File.Exists(listPath))
+                {
+                    Log.WriteWarningMessage(LOGTAG, "ChangeListFileMissing", null, "The change list file \"{0}\" does not exist, scanning all files", listPath);
+                    return null;
+                }
+
+                var state = await db.GetSourceProviderStateAsync(lastfilesetid, CHANGE_LIST_STATE_SCOPE, m_taskReader.ProgressToken).ConfigureAwait(false);
+                string token = null;
+                if (state == null || !state.Rows.TryGetValue(CHANGE_LIST_TOKEN_KEY, out token) || !handoff.BaseTokens.Contains(token, StringComparer.Ordinal))
+                {
+                    Log.WriteInformationMessage(LOGTAG, "ChangeListBaseMismatch", "The change list was not recorded against the previous backup, scanning all files");
+                    return null;
+                }
+
+                retryPaths = state.Rows.Keys
+                    .Where(x => x.StartsWith(CHANGE_LIST_RETRY_PREFIX, StringComparison.Ordinal))
+                    .Select(x => x.Substring(CHANGE_LIST_RETRY_PREFIX.Length))
+                    .ToList();
+            }
+
+            Log.WriteInformationMessage(LOGTAG, "UsingChangeList", "Examining only the paths in the change list \"{0}\"", listPath);
+
+            m_normalizedChangeList = new TempFile();
+            var fileRoots = sources.Where(SourceProviderFactory.IsLocalFileSource).ToList();
+            try
+            {
+                return await NormalizeChangeListAsync(db, source, listPath, retryPaths, fileRoots, handoff != null, lastfilesetid).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (handoff != null && !m_taskReader.ProgressToken.IsCancellationRequested)
+            {
+                // A list from the host that cannot be processed must not fail the backup
+                Log.WriteWarningMessage(LOGTAG, "ChangeListNotProcessed", ex, "The change list could not be processed, scanning all files");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Normalizes a change list for this run
+        /// </summary>
+        /// <param name="db">The database</param>
+        /// <param name="source">The source provider</param>
+        /// <param name="listPath">The raw change list</param>
+        /// <param name="retryPaths">The paths the previous run failed on</param>
+        /// <param name="fileRoots">The local file source roots</param>
+        /// <param name="fromHost">Whether the list comes from the host</param>
+        /// <param name="lastfilesetid">The previous fileset</param>
+        /// <returns>The normalized change list, or null to scan everything</returns>
+        private async Task<Backup.ChangeList> NormalizeChangeListAsync(Backup.BackupDatabase db, ISourceProvider source, string listPath, IEnumerable<string> retryPaths, List<string> fileRoots, bool fromHost, long lastfilesetid)
+        {
+            // The Photos library is backed up as an export the list cannot describe
+            var photosLibraryIsVirtual = OperatingSystem.IsMacOS() && m_options.HandleMacOSPhotoLibrary != Snapshots.MacOS.MacOSPhotosHandling.LibraryOnly;
+            return await Backup.FileEnumerationProcess.NormalizeChangeListAsync(
+                listPath,
+                retryPaths,
+                fileRoots,
+                m_normalizedChangeList,
+                fromHost,
+                photosLibraryIsVirtual,
+                source,
+                path => db.IsFolderOrDescendantInFilesetAsync(path, lastfilesetid, m_taskReader.ProgressToken),
+                path => db.IsPathInFilesetAsync(path, lastfilesetid, m_taskReader.ProgressToken),
+                m_options.FileAttributeFilter,
+                m_filter,
+                m_options.SymlinkPolicy,
+                m_options.HardlinkPolicy,
+                m_options.DisableBackupExclusionXattr,
+                m_options.IgnoreFilenames,
+                GetBlacklistedPaths(m_options, fileRoots),
+                m_taskReader.ProgressToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Stores the change list provider's token with the new fileset, together with the
+        /// paths the run failed on, so the next run can check its list against this fileset
+        /// and look at those paths again. A run that was cut short stores nothing, as its
+        /// fileset lacks what the stop left out, so the next run scans everything.
+        /// </summary>
+        /// <param name="database">The database</param>
+        /// <param name="token">The token to store</param>
+        /// <param name="failedPaths">The paths the run failed on</param>
+        /// <param name="partial">Whether the run was cut short</param>
+        /// <param name="cancellationToken">The cancellation token</param>
+        private static async Task StoreChangeListTokenAsync(Backup.BackupDatabase database, string token, Backup.FailedPathRecorder failedPaths, bool partial, CancellationToken cancellationToken)
+        {
+            if (partial)
+                Log.WriteInformationMessage(LOGTAG, "ChangeListTokenNotStored", "The backup was cut short, so the next backup scans all files");
+            else if (failedPaths.Overflowed)
+                Log.WriteInformationMessage(LOGTAG, "ChangeListTooManyFailures", "Too many files could not be processed to retry them individually, so the next backup scans all files");
+            else
+            {
+                var rows = new Dictionary<string, string> { [CHANGE_LIST_TOKEN_KEY] = token };
+                foreach (var path in failedPaths.GetPaths())
+                    rows[CHANGE_LIST_RETRY_PREFIX + path] = string.Empty;
+
+                await database.CreateSourceProviderStateAsync(CHANGE_LIST_STATE_SCOPE, CHANGE_LIST_STATE_SCOPE, rows, cancellationToken).ConfigureAwait(false);
+            }
+
+            await database.PruneSourceProviderStateAsync(Backup.ChangeTrackingCoordinator.STATE_FILESETS_TO_KEEP, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Finds the source providers that track their own changes and hands them the
+        /// state stored with the previous fileset
+        /// </summary>
+        /// <param name="provider">The source provider, possibly a combination of providers</param>
+        /// <param name="filter">The filter in use</param>
+        /// <param name="sources">The source strings the backup was started with</param>
+        /// <param name="lastfilesetid">The previous fileset, or a negative value if there is none</param>
+        /// <param name="usesJournal">Whether the USN change journal is in use</param>
+        /// <returns>The coordinator, or <c>null</c> if no provider tracks changes</returns>
+        private async Task<Backup.ChangeTrackingCoordinator> GetChangeTrackingAsync(ISourceProvider provider, IFilter filter, string[] sources, long lastfilesetid, bool usesJournal)
+        {
+            var coordinator = Backup.ChangeTrackingCoordinator.Create(provider, filter, sources);
+            if (coordinator == null)
+                return null;
+
+            // Both mechanisms decide which paths are copied from the previous fileset,
+            // and they are not combined; refuse rather than guess
+            if (usesJournal)
+                throw new UserInformationException("The USN change journal cannot be combined with a source that tracks its own changes. Disable the USN journal with --usn-policy=off.", "UsnWithChangeTrackingSource");
+
+            // A changed-files list restricts the enumeration and copies everything else from the
+            // previous fileset without asking the provider, so the state would be loaded but
+            // neither honored nor stored
+            if (m_options.ChangedFilelist is { Length: > 0 })
+                throw new UserInformationException("The --changed-files option cannot be combined with a source that tracks its own changes.", "ChangedFilesWithChangeTrackingSource");
+
+            // The provider only enumerates what changed, and a file can cross a moving limit without being changed
+            if (m_options.HasMovingModifiedTimeLimit)
+                throw new UserInformationException("A modification time limit given relative to now, such as --skip-files-modified-after=1W, cannot be combined with a source that tracks its own changes. Give the limit as a date instead.", "MovingTimeLimitWithChangeTrackingSource");
+
+            await coordinator.LoadStateAsync(m_database, lastfilesetid, m_taskReader.ProgressToken).ConfigureAwait(false);
+            return coordinator;
+        }
+
+        /// <summary>
+        /// Returns a list of paths that should be blacklisted
+        /// </summary>
+        /// <returns>The list of paths</returns>
+        /// <param name="options">The options to use</param>
+        /// <param name="sources">The source paths, used to find the other file systems below them</param>
+        public static HashSet<string> GetBlacklistedPaths(Options options, IEnumerable<string> sources)
+        {
+            var paths = new HashSet<string>(Library.Utility.Utility.ClientFilenameStringComparer)
+            {
+                //m_options.Dbpath,
+                options.Dbpath + "-journal",
+                // The database uses write-ahead logging, which keeps these next to it while it is open
+                options.Dbpath + "-wal",
+                options.Dbpath + "-shm",
+            };
+
+            // The log file is written while the backup runs (#1443). It is opened relative to the
+            // current folder, and the source paths are full paths
+            if (!string.IsNullOrWhiteSpace(options.Logfile))
             {
                 try
                 {
-                    if (m_options.NoBackendverification)
-                    {
-                        FilelistProcessor.VerifyLocalList(backend, m_database);
-                        UpdateStorageStatsFromDatabase();
-                    }
-                    else
-                        FilelistProcessor.VerifyRemoteList(backend, m_options, m_database, m_result.BackendWriter, new string[] { protectedfile });
+                    paths.Add(System.IO.Path.GetFullPath(options.Logfile));
                 }
-                catch (RemoteListVerificationException ex)
+                catch (Exception ex) when (ex is ArgumentException || ex is NotSupportedException || ex is System.IO.PathTooLongException)
                 {
-                    if (m_options.AutoCleanup)
-                    {
-                        Logging.Log.WriteWarningMessage(LOGTAG, "BackendVerifyFailedAttemptingCleanup", ex, "Backend verification failed, attempting automatic cleanup");
-                        m_result.RepairResults = new RepairResults(m_result);
-                        new RepairHandler(backend.BackendUrl, m_options, (RepairResults)m_result.RepairResults).Run();
+                    // The log file could not be opened with that path either
+                }
+            }
 
-                        Logging.Log.WriteInformationMessage(LOGTAG, "BackendCleanupFinished", "Backend cleanup finished, retrying verification");
-                        FilelistProcessor.VerifyRemoteList(backend, m_options, m_database, m_result.BackendWriter, new string[] { protectedfile });
+            if (options.OneFileSystem)
+                foreach (var mountPoint in Backup.OtherFileSystems.GetMountPointsBelowSources(sources, Backup.OtherFileSystems.ListMountPoints()))
+                {
+                    Logging.Log.WriteVerboseMessage(LOGTAG, "ExcludingOtherFileSystem", "Excluding folder on another file system: {0}", mountPoint);
+                    paths.Add(mountPoint);
+                }
+
+            return paths;
+        }
+
+        private sealed record PreBackupVerifyResult(
+            LocalBackupDatabase Database,
+            RemoteVolumeEntry LastTempFilelist
+        );
+
+        /// <summary>
+        /// Verifies the database and backend before starting the backup.
+        /// The logic here is needed to check that the database is in a state
+        /// where it can be used for the backup, and that the backend is also
+        /// in the same state as the database.
+        ///
+        /// If the auto-repair option is enabled, this method will attempt to
+        /// call the repair method, which requires that the database is closed
+        /// and re-opened.
+        ///
+        /// For efficiency, the database is only closed if the repair is needed,
+        /// and returned to the caller in an open state in either case.
+        /// </summary>
+        /// <returns>Results from the pre-backup verification</returns>
+        private static async Task<PreBackupVerifyResult> PreBackupVerifyAsync(Options options, BackupResults result, IBackendManager backendManager)
+        {
+            result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_PreBackupVerify);
+
+            // Setup variables
+            LocalBackupDatabase database = null;
+
+            // If we have an interrupted backup, grab the fileset
+            RemoteVolumeEntry lastTempFilelist = default;
+
+            using (new Logging.Timer(LOGTAG, "PreBackupVerify", "PreBackupVerify"))
+            {
+                try
+                {
+                    database = await LocalBackupDatabase.CreateAsync(options.Dbpath, options, result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false);
+                    var lastFilestTime = await database.FilesetTimesAsync(result.TaskControl.ProgressToken)
+                        .Select(x => x.Value)
+                        .Append(DateTime.UnixEpoch)
+                        .Select(Library.Utility.Utility.NormalizeDateTimeToEpochSeconds)
+                        .MaxAsync()
+                        .ConfigureAwait(false);
+
+                    var currentStamp = Library.Utility.Utility.NormalizeDateTimeToEpochSeconds(database.OperationTimestamp);
+                    // Fileset timestamps have one-second resolution, so a backup starting in the same second
+                    // as the last fileset must also wait, otherwise the previous fileset lookup does not find it
+                    if (lastFilestTime >= currentStamp)
+                    {
+                        if (lastFilestTime - currentStamp > 5)
+                            throw new UserInformationException(string.Format("The database has a timestamp of {0}, but the last fileset has a timestamp of {1}. Something is wrong with the clock.", database.OperationTimestamp.ToLocalTime(), Library.Utility.Utility.EPOCH.AddSeconds(lastFilestTime).ToLocalTime()), "DatabaseTimestampError");
+
+                        var sleepSeconds = lastFilestTime - currentStamp + 1;
+                        Log.WriteVerboseMessage(LOGTAG, "DatabaseTimestampError", "The database has a timestamp of {0}, but the last fileset has a timestamp of {1}. Sleeping for {2} seconds to allow the clock to catch up.", database.OperationTimestamp.ToLocalTime(), Library.Utility.Utility.EPOCH.AddSeconds(lastFilestTime).ToLocalTime(), sleepSeconds);
+                        Thread.Sleep(TimeSpan.FromSeconds(sleepSeconds));
+                        await database.DisposeAsync();
+                        database = await LocalBackupDatabase.CreateAsync(options.Dbpath, options, result.TaskControl.ProgressToken)
+                            .ConfigureAwait(false);
                     }
-                    else
-                        throw;
+
+                    result.Dryrun = options.Dryrun;
+
+                    // A backup that was killed before it could close leaves the query statistics
+                    // describing the database as it was when that run started, which is enough to
+                    // make the planner choose join orders that never finish. Everything below
+                    // reads tables that are affected, starting with the longest-path probe, so
+                    // this has to come before any of it.
+                    await database
+                        .RefreshQueryStatisticsAsync(result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false);
+
+                    // Check the database integrity
+                    await Utility.UpdateOptionsFromDbAsync(database, options, result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false);
+                    await Utility.VerifyOptionsAndUpdateDatabaseAsync(database, options, result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false);
+
+                    var probe_path = await database
+                        .GetFirstPathAsync(result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false);
+
+                    if (probe_path != null && Util.GuessDirSeparator(probe_path) != Util.DirectorySeparatorString)
+                        throw new UserInformationException(string.Format("The backup contains files that belong to another operating system. Proceeding with a backup would cause the database to contain paths from two different operation systems, which is not supported. To proceed without losing remote data, delete all filesets and make sure the --{0} option is set, then run the backup again to re-use the existing data on the remote store.", "no-auto-compact"), "CrossOsDatabaseReuseNotSupported");
+
+                    if (await database.PartiallyRecreatedAsync(result.TaskControl.ProgressToken).ConfigureAwait(false))
+                        throw new UserInformationException("The database was only partially recreated. This database may be incomplete and the repair process is not allowed to alter remote files as that could result in data loss.", "DatabaseIsPartiallyRecreated");
+
+                    if (await database.RepairInProgressAsync(result.TaskControl.ProgressToken).ConfigureAwait(false))
+                        throw new UserInformationException("The database was attempted repaired, but the repair did not complete. This database may be incomplete and the backup process cannot continue. You may delete the local database and attempt to repair it again.", "DatabaseRepairInProgress");
+
+                    // Make sure the database is sane
+                    await database
+                        .VerifyConsistencyAsync(options.Blocksize, options.BlockhashSize, !options.DisableFilelistConsistencyChecks, result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false);
+
+                    // Guard the last filelist
+                    if (!options.DisableSyntheticFilelist)
+                        lastTempFilelist = await database
+                            .GetLastIncompleteFilesetVolumeAsync(result.TaskControl.ProgressToken)
+                            .ConfigureAwait(false);
+
+                    try
+                    {
+                        if (options.NoBackendverification)
+                        {
+                            await FilelistProcessor.VerifyLocalListAsync(backendManager, database, options.Dryrun, result.TaskControl.ProgressToken).ConfigureAwait(false);
+                            await UpdateStorageStatsFromDatabaseAsync(result, database, options, backendManager, result.TaskControl.ProgressToken).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await FilelistProcessor.VerifyRemoteListAsync(backendManager, options, database, result.BackendWriter, [lastTempFilelist.Name], [], logErrors: false, verifyMode: FilelistProcessor.VerifyMode.VerifyAndClean, result.TaskControl.ProgressToken).ConfigureAwait(false);
+                            var updatedLastTemp = string.IsNullOrWhiteSpace(lastTempFilelist.Name) ? default : await database.GetRemoteVolumeAsync(lastTempFilelist.Name, result.TaskControl.ProgressToken).ConfigureAwait(false);
+                            if (!string.IsNullOrWhiteSpace(updatedLastTemp.Name) && updatedLastTemp.State == RemoteVolumeState.Deleting)
+                            {
+                                // The last temporary filelist was emptied, and scheduled for deletion, so we need to delete it
+                                try
+                                {
+                                    if (options.Dryrun)
+                                    {
+                                        Log.WriteDryrunMessage(LOGTAG, "WouldDeleteFile", "Would delete file: {0}", updatedLastTemp.Name);
+                                    }
+                                    else
+                                    {
+                                        Log.WriteInformationMessage(LOGTAG, "DeletingFile", "Deleting file: {0}", updatedLastTemp.Name);
+                                        await backendManager.DeleteAsync(updatedLastTemp.Name, updatedLastTemp.Size, true, result.TaskControl.ProgressToken).ConfigureAwait(false);
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log.WriteMessage(LogMessageType.Information, LOGTAG, "BackendDeleteFailed", ex, "Backend delete failed: {0}", ex.Message);
+                                }
+
+                                await backendManager.WaitForEmptyAsync(database, result.TaskControl.ProgressToken).ConfigureAwait(false);
+                                // In case the backend delete failed, manually set the state to deleted
+                                await database
+                                    .UpdateRemoteVolumeAsync(updatedLastTemp.Name, RemoteVolumeState.Deleted, updatedLastTemp.Size, updatedLastTemp.Hash, false, TimeSpan.FromHours(2), null, result.TaskControl.ProgressToken)
+                                    .ConfigureAwait(false);
+                                // The last temporary filelist is no more
+                                lastTempFilelist = default;
+                            }
+                        }
+                    }
+                    catch (RemoteListVerificationException ex)
+                    {
+                        if (options.AutoCleanup)
+                        {
+                            Log.WriteWarningMessage(LOGTAG, "BackendVerifyFailedAttemptingCleanup", ex, "Backend verification failed, attempting automatic cleanup");
+                            result.RepairResults = new RepairResults(result);
+                            await database.DisposeAsync();
+
+                            database = null;
+                            await new RepairHandler(options, (RepairResults)result.RepairResults)
+                                .RunAsync(backendManager, null)
+                                .ConfigureAwait(false);
+
+                            // Re-open the database and backend manager
+                            database = await LocalBackupDatabase.CreateAsync(options.Dbpath, options, result.TaskControl.ProgressToken)
+                                .ConfigureAwait(false);
+
+                            Log.WriteInformationMessage(LOGTAG, "BackendCleanupFinished", "Backend cleanup finished, retrying verification");
+                            await FilelistProcessor.VerifyRemoteListAsync(backendManager, options, database, result.BackendWriter, [lastTempFilelist.Name], [], logErrors: true, verifyMode: FilelistProcessor.VerifyMode.VerifyStrict, result.TaskControl.ProgressToken).ConfigureAwait(false);
+                        }
+                        else
+                            throw;
+                    }
+
+                    // Return the updated version of the fileset, in case it was actually complete
+                    return new PreBackupVerifyResult(database, await database.GetLastIncompleteFilesetVolumeAsync(result.TaskControl.ProgressToken).ConfigureAwait(false));
+                }
+                catch
+                {
+                    backendManager?.Dispose();
+                    await (database?.DisposeAsync().AsTask() ?? Task.CompletedTask);
+                    throw;
                 }
             }
         }
 
         /// <summary>
+        /// Stops the backup after the current file once it has uploaded --max-upload-per-run, the same
+        /// way as a stop from the user, so the files it did not reach are backed up by the next run
+        /// </summary>
+        private void StopWhenUploadLimitIsReached()
+        {
+            var limit = m_options.MaxUploadPerRun;
+            if (limit <= 0)
+                return;
+
+            var reached = 0;
+            void Check(long uploaded)
+            {
+                if (uploaded < limit || Interlocked.Exchange(ref reached, 1) != 0)
+                    return;
+
+                Log.WriteWarningMessage(LOGTAG, "MaxUploadPerRunReached", null,
+                    Strings.Options.MaxUploadPerRunReached(Library.Utility.Utility.FormatSizeString(limit), Library.Utility.Utility.FormatSizeString(uploaded)));
+                m_result.TaskControl.Stop();
+            }
+
+            m_result.BackendWriter.UploadCompleted = Check;
+
+            // The checks before the backup can already have uploaded files
+            Check(m_result.BackendWriter.BytesUploaded);
+        }
+
+        /// <summary>
         /// Performs the bulk of work by starting all relevant processes
         /// </summary>
-        private static async Task RunMainOperation(IEnumerable<string> sources, Snapshots.ISnapshotService snapshot, UsnJournalService journalService, Backup.BackupDatabase database, Backup.BackupStatsCollector stats, Options options, IFilter sourcefilter, IFilter filter, BackupResults result, Common.ITaskReader taskreader, long filesetid, long lastfilesetid, CancellationToken token)
+        private static async Task RunMainOperationAsync(Backup.Channels channels, ISourceProvider source, UsnJournalService journalService, Backup.ChangeTrackingCoordinator changeTracking, Backup.ChangeList changeList, string changeListToken, Backup.FailedPathRecorder failedPaths, Backup.BackupDatabase database, IBackendManager backendManager, Backup.BackupStatsCollector stats, Options options, IFilter filter, HashSet<string> blacklistPaths, BackupResults result, ITaskReader taskreader, long filesetid, long lastfilesetid)
         {
             using (new Logging.Timer(LOGTAG, "BackupMainOperation", "BackupMainOperation"))
             {
                 // Make sure the CompressionHints table is initialized, otherwise all workers will initialize it
                 var unused = options.CompressionHints.Count;
 
-                Task all;
-                using (new ChannelScope())
-                {
-                    all = Task.WhenAll(
-                        new[]
-                            {
-                                    Backup.DataBlockProcessor.Run(database, options, taskreader),
-                                    Backup.FileBlockProcessor.Run(snapshot, options, database, stats, taskreader, token),
-                                    Backup.StreamBlockSplitter.Run(options, database, taskreader),
-                                    Backup.FileEnumerationProcess.Run(sources, snapshot, journalService,
-                                        options.FileAttributeFilter, sourcefilter, filter, options.SymlinkPolicy,
-                                        options.HardlinkPolicy, options.ExcludeEmptyFolders, options.IgnoreFilenames,
-                                        options.ChangedFilelist, taskreader, token),
-                                    Backup.FilePreFilterProcess.Run(snapshot, options, stats, database),
-                                    Backup.MetadataPreProcess.Run(snapshot, options, database, lastfilesetid, token),
-                                    Backup.SpillCollectorProcess.Run(options, database, taskreader),
-                                    Backup.ProgressHandler.Run(result)
-                            }
-                            // Spawn additional block hashers
-                            .Union(
-                                Enumerable.Range(0, options.ConcurrencyBlockHashers - 1).Select(x =>
-                                    Backup.StreamBlockSplitter.Run(options, database, taskreader))
-                            )
-                            // Spawn additional compressors
-                            .Union(
-                                Enumerable.Range(0, options.ConcurrencyCompressors - 1).Select(x =>
-                                    Backup.DataBlockProcessor.Run(database, options, taskreader))
-                            )
-                    );
-                }
+                Task all = Task.WhenAll(
+                    new[]
+                        {
+                                Backup.DataBlockProcessor.RunAsync(channels, database, backendManager, options, taskreader),
+                                Backup.FileBlockProcessor.RunAsync(channels, options, database, stats, taskreader),
+                                Backup.StreamBlockSplitter.RunAsync(channels, options, database, taskreader),
+                                Backup.FileEnumerationProcess.RunAsync(channels, source, journalService,
+                                    options.FileAttributeFilter, filter, options.SymlinkPolicy,
+                                    options.HardlinkPolicy, options.DisableBackupExclusionXattr, options.ExcludeEmptyFolders,
+                                    changeTracking != null && changeTracking.HasLoadedState ? changeTracking.IsIncrementallyEnumeratedFolder : null,
+                                    options.IgnoreFilenames,
+                                    blacklistPaths, options.ChangedFilelist, changeList, taskreader,
+                                    () => result.PartialBackup = true, CancellationToken.None),
+                                Backup.FilePreFilterProcess.RunAsync(channels, options, stats, database, taskreader),
+                                Backup.MetadataPreProcess.RunAsync(channels, options, database, lastfilesetid, taskreader),
+                                Backup.SpillCollectorProcess.RunAsync(channels, options, database, backendManager, taskreader),
+                                Backup.ProgressHandler.RunAsync(channels, result)
+                        }
+                        // Spawn additional block hashers
+                        .Concat(
+                            Enumerable.Range(0, options.ConcurrencyBlockHashers - 1).Select(x =>
+                                Backup.StreamBlockSplitter.RunAsync(channels, options, database, taskreader))
+                        )
+                        // Spawn additional compressors
+                        .Concat(
+                            Enumerable.Range(0, options.ConcurrencyCompressors - 1).Select(x =>
+                                Backup.DataBlockProcessor.RunAsync(channels, database, backendManager, options, taskreader))
+                        )
+                        // Spawn additional file processors
+                        .Concat(
+                            Enumerable.Range(0, options.ConcurrencyFileprocessors - 1).Select(x =>
+                                Backup.FileBlockProcessor.RunAsync(channels, options, database, stats, taskreader)
+                        )
+                    )
+                );
 
                 await all.ConfigureAwait(false);
 
-                if (options.ChangedFilelist != null && options.ChangedFilelist.Length >= 1)
+                if (changeList != null)
                 {
-                    await database.AppendFilesFromPreviousSetAsync(options.DeletedFilelist);
+                    // The providers other than the file source are not covered by the change list,
+                    // so they were enumerated in full, and nothing below them comes from the previous fileset
+                    var fullyEnumeratedRoots = Backup.FileEnumerationProcess.GetNonFileProviders(source)
+                        .Select(x => x.MountedPath)
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Select(x => (Path: Backup.ChangeList.NormalizePath(x), Recurse: true))
+                        .ToAsyncEnumerable();
+
+                    var exclusions = changeList.ReadAsync(taskreader.ProgressToken)
+                        .Select(x => (x.Path, x.Recurse))
+                        .Concat(fullyEnumeratedRoots);
+
+                    // The roots of the providers enumerated in full are kept: their previous
+                    // entries were all excluded above, and the copy must not drop anything else
+                    var sourceRoots = changeList.FileSourceRoots
+                        .Concat(Backup.FileEnumerationProcess.GetNonFileProviders(source).Select(x => x.MountedPath).Where(x => !string.IsNullOrWhiteSpace(x)))
+                        .ToList();
+
+                    var (carriedCount, carriedSize) = await database
+                        .AppendFilesFromPreviousSetExcludingListAsync(exclusions, sourceRoots, lastfilesetid, taskreader.ProgressToken)
+                        .ConfigureAwait(false);
+                    await stats.AddExaminedFilesAsync(carriedCount, carriedSize).ConfigureAwait(false);
+                    Log.WriteInformationMessage(LOGTAG, "ChangeListCarryForward", "Copied {0} files from the previous backup that were not in the change list", carriedCount);
+                }
+                else if (options.ChangedFilelist != null && options.ChangedFilelist.Length >= 1)
+                {
+                    await database
+                        .AppendFilesFromPreviousSetAsync(options.DeletedFilelist, taskreader.ProgressToken)
+                        .ConfigureAwait(false);
                 }
                 else if (journalService != null)
                 {
+                    if (!OperatingSystem.IsWindows())
+                        throw new UserInformationException("USN journal is only supported on Windows", "USNJournalNotSupported");
+
+                    // The providers other than the file source are not covered by the change journal,
+                    // so they were enumerated in full, and nothing below them comes from the previous fileset
+                    var fullyEnumeratedRoots = Backup.FileEnumerationProcess.GetNonFileProviders(source)
+                        .Select(x => x.MountedPath)
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Select(Util.AppendDirSeparator)
+                        .ToList();
+
                     // append files from previous fileset, unless part of modifiedSources, which we've just scanned
                     await database.AppendFilesFromPreviousSetWithPredicateAsync((path, fileSize) =>
                     {
+                        if (!OperatingSystem.IsWindows())
+                            throw new UserInformationException("USN journal is only supported on Windows", "USNJournalNotSupported");
+
+                        if (fullyEnumeratedRoots.Any(root => path.StartsWith(root, Library.Utility.Utility.ClientFilenameStringComparison)))
+                            return true;
+
+                        // TODO: This is technically unsupported, but the method itself works cross-platform
                         if (journalService.IsPathEnumerated(path))
                             return true;
 
                         if (fileSize >= 0)
-                        {
-                            stats.AddExaminedFile(fileSize);
-                        }
+                            stats.AddExaminedFileAsync(fileSize).FireAndForget();
+
                         return false;
-                    });
+                    }, taskreader.ProgressToken)
+                        .ConfigureAwait(false);
 
                     // store journal data in database, unless job is being canceled
-                    if (!token.IsCancellationRequested)
+                    if (!result.PartialBackup)
                     {
                         var data = journalService.VolumeDataList.Where(p => p.JournalData != null).Select(p => p.JournalData).ToList();
                         if (data.Any())
                         {
                             // always record change journal data for current fileset (entry may be dropped later if nothing is uploaded)
-                            await database.CreateChangeJournalDataAsync(data);
+                            await database
+                                .CreateChangeJournalDataAsync(data, taskreader.ProgressToken)
+                                .ConfigureAwait(false);
 
                             // update the previous fileset's change journal entry to resume at this point in case nothing was backed up
-                            await database.UpdateChangeJournalDataAsync(data, lastfilesetid);
+                            await database
+                                .UpdateChangeJournalDataAsync(data, lastfilesetid, taskreader.ProgressToken)
+                                .ConfigureAwait(false);
                         }
                     }
                 }
-
-                if (token.IsCancellationRequested)
+                else if (changeTracking != null)
                 {
-                    result.PartialBackup = true;
+                    // The enumeration is done, so the progress total is not adjusted further;
+                    // wait for the pending lookups so none overwrites the totals set below
+                    await changeTracking.StopProgressEstimateAsync().ConfigureAwait(false);
+
+                    // A provider that was handed state may have enumerated only the entries that
+                    // changed, so copy everything it did not examine from the previous fileset.
+                    // Without loaded state every provider walked everything, and the copy would
+                    // only cost a pass over the previous fileset
+                    if (changeTracking.HasLoadedState)
+                    {
+                        await database.AppendFilesFromPreviousSetWithPredicateAsync((path, fileSize) =>
+                        {
+                            if (changeTracking.WasPathEnumerated(path))
+                                return true;
+
+                            if (fileSize >= 0)
+                                stats.AddExaminedFileAsync(fileSize).FireAndForget();
+
+                            return false;
+                        }, taskreader.ProgressToken)
+                            .ConfigureAwait(false);
+                    }
+
+                    // Store the exported state; a canceled job stores nothing, as its fileset
+                    // lacks what the stop left out, so the next run walks everything
+                    await changeTracking.StoreStateAsync(database, result.PartialBackup, taskreader.ProgressToken).ConfigureAwait(false);
+                }
+
+                if (changeListToken != null)
+                    await StoreChangeListTokenAsync(database, changeListToken, failedPaths, result.PartialBackup, taskreader.ProgressToken).ConfigureAwait(false);
+
+                if (result.PartialBackup)
+                {
                     Log.WriteWarningMessage(LOGTAG, "CancellationRequested", null, "Cancellation was requested by user.");
                 }
                 else
                 {
-                    result.PartialBackup = false;
-                    await database.UpdateFilesetAndMarkAsFullBackupAsync(filesetid);
+                    await database
+                        .UpdateFilesetAndMarkAsFullBackupAsync(filesetid, taskreader.ProgressToken)
+                        .ConfigureAwait(false);
                 }
 
                 result.OperationProgressUpdater.UpdatefileCount(result.ExaminedFiles, result.SizeOfExaminedFiles, true);
             }
         }
 
-        private void CompactIfRequired(BackendManager backend, long lastVolumeSize)
+        private async Task CompactIfRequiredAsync(IBackendManager backendManager, long lastVolumeSize)
         {
             var currentIsSmall = lastVolumeSize != -1 && lastVolumeSize <= m_options.SmallFileSize;
 
@@ -273,80 +873,142 @@ namespace Duplicati.Library.Main.Operation
             {
                 m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_Delete);
                 m_result.DeleteResults = new DeleteResults(m_result);
-                using(var db = new LocalDeleteDatabase(m_database))
-                    new DeleteHandler(backend.BackendUrl, m_options, (DeleteResults)m_result.DeleteResults).DoRun(db, ref m_transaction, true, currentIsSmall, backend);
+                await using var db = await LocalDeleteDatabase.CreateAsync(m_database, null, m_result.TaskControl.ProgressToken).ConfigureAwait(false);
+                await new DeleteHandler(m_options, (DeleteResults)m_result.DeleteResults)
+                    .DoRunAsync(db, true, currentIsSmall, backendManager)
+                    .ConfigureAwait(false);
 
             }
             else if (currentIsSmall && !m_options.NoAutoCompact)
             {
                 m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_Compact);
                 m_result.CompactResults = new CompactResults(m_result);
-                using(var db = new LocalDeleteDatabase(m_database))
-                    new CompactHandler(backend.BackendUrl, m_options, (CompactResults)m_result.CompactResults).DoCompact(db, true, ref m_transaction, backend);
+                await using var db = await LocalDeleteDatabase.CreateAsync(m_database, null, m_result.TaskControl.ProgressToken).ConfigureAwait(false);
+                await new CompactHandler(m_options, (CompactResults)m_result.CompactResults)
+                    .DoCompactAsync(db, true, backendManager)
+                    .ConfigureAwait(false);
             }
         }
 
-        private void PostBackupVerification(string currentFilelistVolume)
+        private async Task RunLockOperationAsync(IBackendManager backendManager, IEnumerable<DateTime> versionTimestamps)
         {
-            m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_PostBackupVerify);
-            using(var backend = new BackendManager(m_backendurl, m_options, m_result.BackendWriter, m_database))
+            if (m_options.RemoteFileLockDuration is null || m_options.RemoteFileLockDuration.Value == TimeSpan.Zero)
             {
-                using (new Logging.Timer(LOGTAG, "AfterBackupVerify", "AfterBackupVerify"))
-                    FilelistProcessor.VerifyRemoteList(backend, m_options, m_database, m_result.BackendWriter, new string[] { currentFilelistVolume });
-                backend.WaitForComplete(m_database, null);
+                Log.WriteVerboseMessage(LOGTAG, "FileLockDurationNotSpecified", "No file-lock-duration provided; skipping lock operation.");
+                return;
             }
 
-            long remoteVolumeCount = m_database.GetRemoteVolumes().LongCount(x => x.State == RemoteVolumeState.Verified);
-            long samplesToTest = Math.Max(m_options.BackupTestSampleCount, (long)Math.Round(remoteVolumeCount * (m_options.BackupTestPercentage / 100D), MidpointRounding.AwayFromZero));
+            if (!versionTimestamps.Any())
+            {
+                Log.WriteVerboseMessage(LOGTAG, "NoVersionsToLock", "No versions to lock; skipping lock operation.");
+                return;
+            }
+
+            if (!backendManager.SupportsObjectLocking)
+            {
+                Log.WriteWarningMessage(LOGTAG, "BackendDoesNotSupportLocking", null, "Backend does not support object locking; skipping lock operation.");
+                return;
+            }
+
+            using var lockDb = await LocalLockDatabase.CreateAsync(m_database, m_taskReader.StopToken);
+            m_result.LockResults ??= new SetLockResults();
+            try
+            {
+                await new SetLocksHandler(m_options, (SetLockResults)m_result.LockResults)
+                    .RunAsync(backendManager, lockDb, versionTimestamps)
+                    .ConfigureAwait(false);
+            }
+            catch (ObjectLockNotSupportedException ex)
+            {
+                // The backup itself has succeeded, so an unavailable lock feature is only a warning
+                Log.WriteWarningMessage(LOGTAG, "ObjectLockingUnavailable", ex, "Object locking is not available on the destination; no locks were applied: {0}", ex.Message);
+            }
+        }
+
+        private async Task PostBackupVerificationAsync(string currentFilelistVolume, string previousTemporaryFilelist, IBackendManager backendManager)
+        {
+            m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_PostBackupVerify);
+            using (new Logging.Timer(LOGTAG, "AfterBackupVerify", "AfterBackupVerify"))
+                await FilelistProcessor.VerifyRemoteListAsync(backendManager, m_options, m_database, m_result.BackendWriter, [currentFilelistVolume], [previousTemporaryFilelist], logErrors: true, verifyMode: FilelistProcessor.VerifyMode.VerifyStrict, m_result.TaskControl.ProgressToken).ConfigureAwait(false);
+
+            await backendManager
+                .WaitForEmptyAsync(m_database, m_taskReader.ProgressToken)
+                .ConfigureAwait(false);
+
+            // Calculate the number of samples to test, using the largest number of file of a given type
+            var remoteVolumeCount = await m_database
+                .GetRemoteVolumesAsync(m_result.TaskControl.ProgressToken)
+                .Where(x => x.State == RemoteVolumeState.Verified)
+                .GroupBy(x => x.Type)
+                .Select(x => x.LongCount())
+                .Append(0L)
+                .MaxAsync()
+                .ConfigureAwait(false);
+
+            long samplesToTest = Math.Max(m_options.BackupTestSampleCount, (long)Math.Round(remoteVolumeCount * (m_options.BackupTestPercentage / 100m), MidpointRounding.AwayFromZero));
             if (samplesToTest > 0 && remoteVolumeCount > 0)
             {
                 m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_PostBackupTest);
                 m_result.TestResults = new TestResults(m_result);
 
-                using(var testdb = new LocalTestDatabase(m_database))
-                using(var backend = new BackendManager(m_backendurl, m_options, m_result.BackendWriter, testdb))
-                    new TestHandler(m_backendurl, m_options, (TestResults)m_result.TestResults)
-                        .DoRun(samplesToTest, testdb, backend);
+                await using var testdb = await LocalTestDatabase.CreateAsync(m_database, null, m_result.TaskControl.ProgressToken).ConfigureAwait(false);
+                await new TestHandler(m_options, (TestResults)m_result.TestResults)
+                    .DoRunAsync(samplesToTest, testdb, backendManager)
+                    .ConfigureAwait(false);
             }
         }
 
         /// <summary>
         /// Handler for computing backend statistics, without relying on a remote folder listing
         /// </summary>
-        private void UpdateStorageStatsFromDatabase()
+        private static async Task UpdateStorageStatsFromDatabaseAsync(BackupResults result, LocalBackupDatabase database, Options options, IBackendManager backendManager, CancellationToken cancelToken)
         {
-            if (m_result.BackendWriter != null)
+            if (result.BackendWriter != null)
             {
-                m_result.BackendWriter.KnownFileCount = m_database.GetRemoteVolumes().Count();
-                m_result.BackendWriter.KnownFileSize = m_database.GetRemoteVolumes().Select(x => Math.Max(0, x.Size)).Sum();
+                result.BackendWriter.KnownFileCount = await database
+                    .GetRemoteVolumesAsync(cancelToken)
+                    .CountAsync(cancelToken)
+                    .ConfigureAwait(false);
 
-                m_result.BackendWriter.UnknownFileCount = 0;
-                m_result.BackendWriter.UnknownFileSize = 0;
+                result.BackendWriter.KnownFilesets = await database
+                    .GetRemoteVolumesAsync(cancelToken)
+                    .CountAsync(x => x.Type == RemoteVolumeType.Files)
+                    .ConfigureAwait(false);
 
-                m_result.BackendWriter.BackupListCount = m_database.FilesetTimes.Count();
-                m_result.BackendWriter.LastBackupDate = m_database.FilesetTimes.FirstOrDefault().Value.ToLocalTime();
+                result.BackendWriter.KnownFileSize = await database
+                    .GetRemoteVolumesAsync(cancelToken)
+                    .Select(x => Math.Max(0, x.Size))
+                    .SumAsync(cancelToken)
+                    .ConfigureAwait(false);
 
-                // TODO: If we have a BackendManager, we should query through that
-                using (var backend = DynamicLoader.BackendLoader.GetBackend(m_backendurl, m_options.RawOptions))
+                result.BackendWriter.UnknownFileCount = 0;
+                result.BackendWriter.UnknownFileSize = 0;
+
+                result.BackendWriter.BackupListCount = await database
+                    .FilesetTimesAsync(cancelToken)
+                    .CountAsync(cancelToken)
+                    .ConfigureAwait(false);
+
+                result.BackendWriter.LastBackupDate = (
+                    await database
+                        .FilesetTimesAsync(cancelToken)
+                        .FirstOrDefaultAsync(cancelToken)
+                        .ConfigureAwait(false)
+                )
+                    .Value.ToLocalTime();
+
+                if (!options.QuotaDisable)
                 {
-                    if (backend is IQuotaEnabledBackend enabledBackend)
+                    var quota = await backendManager.GetQuotaInfoAsync(cancelToken).ConfigureAwait(false);
+                    if (quota != null)
                     {
-                        Library.Interface.IQuotaInfo quota = enabledBackend.Quota;
-                        if (quota != null)
-                        {
-                            m_result.BackendWriter.TotalQuotaSpace = quota.TotalQuotaSpace;
-                            m_result.BackendWriter.FreeQuotaSpace = quota.FreeQuotaSpace;
-                        }
+                        result.BackendWriter.TotalQuotaSpace = quota.TotalQuotaSpace;
+                        result.BackendWriter.FreeQuotaSpace = quota.FreeQuotaSpace;
                     }
                 }
-                
-                m_result.BackendWriter.AssignedQuotaSpace = m_options.QuotaSize;
-            }
-        }
 
-        public void Run(string[] sources, Library.Utility.IFilter filter, CancellationToken token)
-        {
-            RunAsync(sources, filter, token).WaitForTaskOrThrow();
+                result.BackendWriter.AssignedQuotaSpace = options.QuotaSize;
+            }
         }
 
         private static Exception BuildException(Exception source, params Task[] tasks)
@@ -354,14 +1016,20 @@ namespace Duplicati.Library.Main.Operation
             if (tasks == null || tasks.Length == 0)
                 return source;
 
-            var ex = new List<Exception>();
-            ex.Add(source);
+            var ex = new List<Exception>
+            {
+                source
+            };
 
-            foreach(var t in tasks)
+            foreach (var t in tasks)
                 if (t != null)
                 {
+                    // Give the task a moment to finish. Its failure is collected below; waiting for it
+                    // must not replace the exception that is built, whether the task fails or does
+                    // not finish in time
                     if (!t.IsCompleted && !t.IsFaulted && !t.IsCanceled)
-                        t.Wait(500);
+                        try { t.WaitAsync(TimeSpan.FromMilliseconds(500)).Await(); }
+                        catch { }
 
                     if (t.IsFaulted && t.Exception != null)
                         ex.Add(t.Exception);
@@ -373,234 +1041,334 @@ namespace Duplicati.Library.Main.Operation
                 return new AggregateException(ex.First().Message, ex);
         }
 
-        private static async Task<long> FlushBackend(BackupResults result, IWriteChannel<Backup.IUploadRequest> uploadtarget, Task uploader)
+        private static async Task FlushBackendAsync(Backup.BackupDatabase database, BackupResults result, IBackendManager backendManager)
         {
             // Wait for upload completion
             result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_WaitForUpload);
 
-            if (await uploadtarget.IsRetiredAsync)
+            try
             {
-                await uploader.ConfigureAwait(false);
-                return -1;
+                await database.FlushBackendMessagesAndCommitAsync(backendManager, result.TaskControl.ProgressToken).ConfigureAwait(false);
+                await backendManager.WaitForEmptyAsync(result.TaskControl.ProgressToken).ConfigureAwait(false);
+                await database.FlushBackendMessagesAndCommitAsync(backendManager, result.TaskControl.ProgressToken).ConfigureAwait(false);
             }
-
-            var flushReq = new Backup.FlushRequest();
-
-            await uploadtarget.WriteAsync(flushReq).ConfigureAwait(false);
-            await uploader.ConfigureAwait(false);
-
-            // Grab the size of the last uploaded volume
-            return await flushReq.LastWriteSizeAsync;
+            catch (RetiredException)
+            {
+            }
         }
 
-        private async Task RunAsync(string[] sources, Library.Utility.IFilter filter, CancellationToken token)
+        public async Task RunAsync(string[] sources, IBackendManager backendManager, IFilter filter)
         {
-            m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_Begin);                        
-            
-            // New isolated scope for each operation
-            using(new IsolatedChannelScope())
-            using(m_database = new LocalBackupDatabase(m_options.Dbpath, m_options))
+            m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_Begin);
+
+            // Only reads the options, so it refuses a bad combination before the database is opened
+            ValidateChangeListOptions();
+
+            // Do a remote verification, unless disabled
+            var (database, lastTempFilelist) = await PreBackupVerifyAsync(m_options, m_result, backendManager)
+                .ConfigureAwait(false);
+
+            var lastTempVolumeIncomplete = false;
+
+            if (!string.IsNullOrWhiteSpace(lastTempFilelist.Name))
             {
-                m_result.SetDatabase(m_database);
-                m_result.Dryrun = m_options.Dryrun;
+                if (lastTempFilelist.State == RemoteVolumeState.Temporary || lastTempFilelist.State == RemoteVolumeState.Uploading)
+                    lastTempVolumeIncomplete = true;
+            }
 
-                // Check the database integrity
-                Utility.UpdateOptionsFromDb(m_database, m_options);
-                Utility.VerifyParameters(m_database, m_options);
+            Backup.Channels channels = new();
+            var blacklistPaths = GetBlacklistedPaths(m_options, sources);
 
-                var probe_path = m_database.GetFirstPath();
-                if (probe_path != null && Util.GuessDirSeparator(probe_path) != Util.DirectorySeparatorString)
-                    throw new UserInformationException(string.Format("The backup contains files that belong to another operating system. Proceeding with a backup would cause the database to contain paths from two different operation systems, which is not supported. To proceed without losing remote data, delete all filesets and make sure the --{0} option is set, then run the backup again to re-use the existing data on the remote store.", "no-auto-compact"), "CrossOsDatabaseReuseNotSupported");
+            StopWhenUploadLimitIsReached();
 
-                if (m_database.PartiallyRecreated)
-                    throw new UserInformationException("The database was only partially recreated. This database may be incomplete and the repair process is not allowed to alter remote files as that could result in data loss.", "DatabaseIsPartiallyRecreated");
-                
-                if (m_database.RepairInProgress)
-                    throw new UserInformationException("The database was attempted repaired, but the repair did not complete. This database may be incomplete and the backup process cannot continue. You may delete the local database and attempt to repair it again.", "DatabaseRepairInProgress");
+            // If there is no filter, we set an empty filter to simplify the code
+            m_filter = filter ?? new Library.Utility.FilterExpression();
 
-                // If there is no filter, we set an empty filter to simplify the code
-                // If there is a filter, we make sure that the sources are included
-                m_filter = filter ?? new Library.Utility.FilterExpression();
-                m_sourceFilter = new Library.Utility.FilterExpression(sources, true);
+            // Collects the paths this run fails on, so a run driven by a change list can retry them
+            var failedPaths = Backup.FailedPathRecorder.Start(MAX_RETRY_PATHS);
 
-                Task parallelScanner = null;
-                Task uploaderTask = null;
-                try
+            // Warn about a likely misconfigured filter that excludes everything but has no includes
+            if (Library.Utility.FilterExpression.IsExcludeAllBeforeIncludes(m_filter))
+                Logging.Log.WriteWarningMessage(LOGTAG, "FilterExcludesAll", null,
+                    "The filter has an \"exclude all\" rule that appears before any include rules. This is likely a misconfiguration; no files will be backed up. Please check the filter settings.");
+
+            Task parallelScanner = null;
+            Backup.ChangeTrackingCoordinator changeTracking = null;
+            try
+            {
+                // If we crash now, there is a chance we leave behind partial remote files
+                if (!m_options.Dryrun)
+                    await database
+                        .TerminatedWithActiveUploadsAsync(m_result.TaskControl.ProgressToken, true)
+                        .ConfigureAwait(false);
+
+                DateTime? syntheticFilesetTimestamp = null;
+                await using (m_database = database)
+                using (var db = new Backup.BackupDatabase(m_database, m_options))
+                // Setup runners and instances here
+                using (var filesetvolume = new FilesetVolumeWriter(m_options, m_database.OperationTimestamp) { IsRemoteNameTaken = FilesetVolumeWriter.NameTakenIn(db) })
                 {
-                    // Setup runners and instances here
-                    using(var db = new Backup.BackupDatabase(m_database, m_options))
-                    using(var backendManager = new BackendManager(m_backendurl, m_options, m_result.BackendWriter, m_database))
-                    using(var filesetvolume = new FilesetVolumeWriter(m_options, m_database.OperationTimestamp))
-                    using(var stats = new Backup.BackupStatsCollector(m_result))
-                    // Keep a reference to these channels to avoid shutdown
-                    using(var uploadtarget = ChannelManager.GetChannel(Backup.Channels.BackendRequest.ForWrite))
+                    long filesetid;
+                    // A stop before the files are processed leaves the fileset without any of them
+                    var stoppedBeforeProcessing = false;
+                    using var counterToken = CancellationTokenSource.CreateLinkedTokenSource(m_taskReader.ProgressToken);
+                    // Everything the run reads reflects the file system at or after this instant,
+                    // which the change list provider needs to know what to report to the next run
+                    var referenceTime = DateTime.UtcNow;
+                    using (var source = await GetSourceProviderAsync(sources, m_options, m_taskReader.ProgressToken).ConfigureAwait(false))
                     {
-                        long filesetid;
-                        var counterToken = new CancellationTokenSource();
-                        var uploader = new Backup.BackendUploader(() => DynamicLoader.BackendLoader.GetBackend(m_backendurl, m_options.RawOptions), m_options, db, m_result.TaskReader, stats);
-                        using (var snapshot = GetSnapshot(sources, m_options))
+                        // The snapshot exists now, so the host's recording is closed here
+                        var changeListHandoff = await DrainChangeListAsync(source, referenceTime).ConfigureAwait(false);
+                        try
                         {
-                            try
+                            // If the previous backup was interrupted, send a synthetic list
+                            syntheticFilesetTimestamp = await Backup.UploadSyntheticFilelist.RunAsync(db, m_options, m_result, m_result.TaskControl, backendManager, lastTempFilelist)
+                                .ConfigureAwait(false);
+
+                            // Grab the previous backup ID, if any
+                            var prevfileset = await m_database
+                                .FilesetTimesAsync(m_result.TaskControl.ProgressToken)
+                                .FirstOrDefaultAsync()
+                                .ConfigureAwait(false);
+
+                            if (prevfileset.Value.ToUniversalTime() > m_database.OperationTimestamp.ToUniversalTime())
+                                throw new Exception(string.Format("The previous backup has time {0}, but this backup has time {1}. Something is wrong with the clock.", prevfileset.Value.ToLocalTime(), m_database.OperationTimestamp.ToLocalTime()));
+
+                            var lastfilesetid = prevfileset.Value.Ticks == 0 ? -1 : prevfileset.Key;
+
+                            // Prepare the operation by registering the filelist
+                            m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_ProcessingFiles);
+
+                            var repcnt = 0;
+                            while (repcnt < 100 && await db.GetRemoteVolumeIDAsync(filesetvolume.RemoteFilename, m_taskReader.ProgressToken).ConfigureAwait(false) >= 0)
+                                filesetvolume.ResetRemoteFilename(m_options, m_database.OperationTimestamp.AddSeconds(repcnt++));
+
+                            if (await db.GetRemoteVolumeIDAsync(filesetvolume.RemoteFilename, m_taskReader.ProgressToken).ConfigureAwait(false) >= 0)
+                                throw new Exception("Unable to generate a unique fileset name");
+
+                            var filesetvolumeid = await db
+                                .RegisterRemoteVolumeAsync(filesetvolume.RemoteFilename, RemoteVolumeType.Files, RemoteVolumeState.Temporary, m_taskReader.ProgressToken)
+                                .ConfigureAwait(false);
+
+                            filesetid = await db
+                                .CreateFilesetAsync(filesetvolumeid, VolumeBase.ParseFilename(filesetvolume.RemoteFilename).Time, m_taskReader.ProgressToken)
+                                .ConfigureAwait(false);
+
+                            // Record the version label, if one is set
+                            if (!string.IsNullOrWhiteSpace(m_options.VersionName))
+                                await db
+                                    .UpdateFilesetLabelAsync(filesetid, m_options.VersionName, m_taskReader.ProgressToken)
+                                    .ConfigureAwait(false);
+
+                            var changeList = await PrepareChangeListAsync(db, source, sources, changeListHandoff, lastfilesetid).ConfigureAwait(false);
+
+                            var journalService = GetJournalService(source, filter, lastfilesetid);
+                            changeTracking = await GetChangeTrackingAsync(source, filter, sources, lastfilesetid, journalService != null).ConfigureAwait(false);
+
+                            // Start parallel scan, or use the database. A source that tracks its own
+                            // changes records what it examined while it is enumerated, so it must be
+                            // enumerated once, by the backup; a parallel count would race it for the
+                            // state that is stored with the fileset
+                            if (changeTracking != null && !m_options.DisableFileScanner)
+                                Log.WriteVerboseMessage(LOGTAG, "FileScannerDisabledForChangeTracking", "The parallel file count is not run because a source tracks its own changes; the count of the previous backup is shown instead, less what the source reports as carried forward");
+
+                            if (m_options.DisableFileScanner || changeTracking != null || changeList != null)
                             {
-                                // Make sure the database is sane
-                                await db.VerifyConsistencyAsync(m_options.Blocksize, m_options.BlockhashSize, !m_options.DisableFilelistConsistencyChecks);
+                                var d = await m_database
+                                    .GetLastBackupFileCountAndSizeAsync(lastfilesetid, m_result.TaskControl.ProgressToken)
+                                    .ConfigureAwait(false);
 
-                                // Start the uploader process
-                                uploaderTask = uploader.Run();
+                                m_result.OperationProgressUpdater.UpdatefileCount(d.Item1, d.Item2, true);
 
-                                // If we have an interrupted backup, grab the fileset
-                                string lastTempFilelist = null;
-                                long lastTempFilesetId = -1;
-                                if (!m_options.DisableSyntheticFilelist)
-                                {
-                                    var candidates = (await db.GetIncompleteFilesetsAsync()).OrderBy(x => x.Value).ToArray();
-                                    if (candidates.Any())
-                                    {
-                                        lastTempFilesetId = candidates.Last().Key;
-                                        lastTempFilelist = m_database.GetRemoteVolumeFromFilesetID(lastTempFilesetId).Name;
-                                    }
-                                }
-
-                                // TODO: Rewrite to using the uploader process, or the BackendHandler interface
-                                // Do a remote verification, unless disabled
-                                PreBackupVerify(backendManager, lastTempFilelist);
-
-                                // If the previous backup was interrupted, send a synthetic list
-                                await Backup.UploadSyntheticFilelist.Run(db, m_options, m_result, m_result.TaskReader, lastTempFilelist, lastTempFilesetId);
-
-                                // Grab the previous backup ID, if any
-                                var prevfileset = m_database.FilesetTimes.FirstOrDefault();
-                                if (prevfileset.Value.ToUniversalTime() > m_database.OperationTimestamp.ToUniversalTime())
-                                    throw new Exception(string.Format("The previous backup has time {0}, but this backup has time {1}. Something is wrong with the clock.", prevfileset.Value.ToLocalTime(), m_database.OperationTimestamp.ToLocalTime()));
-                                
-                                var lastfilesetid = prevfileset.Value.Ticks == 0 ? -1 : prevfileset.Key;
-
-                                // Rebuild any index files that are missing
-                                await Backup.RecreateMissingIndexFiles.Run(db, m_options, m_result.TaskReader);
-
-                                // Prepare the operation by registering the filelist
-                                m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_ProcessingFiles);
-
-                                var repcnt = 0;
-                                while(repcnt < 100 && await db.GetRemoteVolumeIDAsync(filesetvolume.RemoteFilename) >= 0)
-                                    filesetvolume.ResetRemoteFilename(m_options, m_database.OperationTimestamp.AddSeconds(repcnt++));
-
-                                if (await db.GetRemoteVolumeIDAsync(filesetvolume.RemoteFilename) >= 0)
-                                    throw new Exception("Unable to generate a unique fileset name");
-
-                                var filesetvolumeid = await db.RegisterRemoteVolumeAsync(filesetvolume.RemoteFilename, RemoteVolumeType.Files, RemoteVolumeState.Temporary);
-                                filesetid = await db.CreateFilesetAsync(filesetvolumeid, VolumeBase.ParseFilename(filesetvolume.RemoteFilename).Time);
-
-                                // create USN-based scanner if enabled
-                                var journalService = GetJournalService(sources, snapshot, filter, lastfilesetid);
-
-                                // Start parallel scan, or use the database
-                                if (m_options.DisableFileScanner)
-                                {
-                                    var d = m_database.GetLastBackupFileCountAndSize();
-                                    m_result.OperationProgressUpdater.UpdatefileCount(d.Item1, d.Item2, true);
-                                }
-                                else
-                                {
-                                    parallelScanner = Backup.CountFilesHandler.Run(sources, snapshot, journalService, m_result, m_options, m_sourceFilter, m_filter, m_result.TaskReader, counterToken.Token);
-                                }
-
-                                // Run the backup operation
-                                if (await m_result.TaskReader.ProgressAsync)
-                                {
-                                    await RunMainOperation(sources, snapshot, journalService, db, stats, m_options, m_sourceFilter, m_filter, m_result, m_result.TaskReader, filesetid, lastfilesetid, token).ConfigureAwait(false);
-                                }
+                                // A source that was handed state lists only its changes below the
+                                // folders it walks incrementally, and reports them as it reaches
+                                // them; the total follows, leaving out what is carried forward
+                                changeTracking?.StartProgressEstimate(db, lastfilesetid, d.Item1, d.Item2,
+                                    (count, size) => m_result.OperationProgressUpdater.UpdatefileCount(count, size, true),
+                                    m_result.TaskControl.ProgressToken);
                             }
-                            finally
+                            else
                             {
-                                //If the scanner is still running for some reason, make sure we kill it now 
-                                counterToken.Cancel();
+                                parallelScanner = Backup.CountFilesHandler.RunAsync(source, journalService, m_result, m_options, m_filter, blacklistPaths, m_result.TaskControl, counterToken.Token);
                             }
-                        }
 
-                        // Add the fileset file to the dlist file
-                        filesetvolume.CreateFilesetFile(!token.IsCancellationRequested);
-
-                        // Ensure the database is in a sane state after adding data
-                        using (new Logging.Timer(LOGTAG, "VerifyConsistency", "VerifyConsistency"))
-                            await db.VerifyConsistencyAsync(m_options.Blocksize, m_options.BlockhashSize, false);
-
-                        // Send the actual filelist
-                        if (await m_result.TaskReader.ProgressAsync)
-                            await Backup.UploadRealFilelist.Run(m_result, db, m_options, filesetvolume, filesetid, m_result.TaskReader);
-
-                        // Wait for upload completion
-                        m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_WaitForUpload);
-                        var lastVolumeSize = await FlushBackend(m_result, uploadtarget, uploaderTask).ConfigureAwait(false);
-
-                        // Make sure we have the database up-to-date
-                        await db.CommitTransactionAsync("CommitAfterUpload", false);
-
-                        // TODO: Remove this later
-                        m_transaction = m_database.BeginTransaction();
-    		                                        
-                        if (await m_result.TaskReader.ProgressAsync)
-                            CompactIfRequired(backendManager, lastVolumeSize);
-
-                        if (m_options.UploadVerificationFile && await m_result.TaskReader.ProgressAsync)
-                        {
-                            m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_VerificationUpload);
-                            FilelistProcessor.UploadVerificationFile(backendManager.BackendUrl, m_options, m_result.BackendWriter, m_database, m_transaction);
-                        }
-
-                        if (m_options.Dryrun)
-                        {
-                            m_transaction.Rollback();
-                            m_transaction = null;
-                        }
-                        else
-                        {
-                            using(new Logging.Timer(LOGTAG, "CommitFinalizingBackup", "CommitFinalizingBackup"))
-                                m_transaction.Commit();
-                                
-                            m_transaction = null;
-
-                            if (m_result.TaskControlRendevouz() != TaskControlState.Abort)
+                            // Run the backup operation
+                            if (await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
                             {
-                                if (m_options.NoBackendverification)
-                                    UpdateStorageStatsFromDatabase();
-                                else
-                                    PostBackupVerification(filesetvolume.RemoteFilename);
+                                var stats = new Backup.BackupStatsCollector(m_result);
+                                await RunMainOperationAsync(channels, source, journalService, changeTracking, changeList, changeListHandoff?.Token, failedPaths, db, backendManager, stats, m_options, m_filter, blacklistPaths, m_result, m_result.TaskControl, filesetid, lastfilesetid).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                stoppedBeforeProcessing = true;
                             }
                         }
-                        
-                        m_database.WriteResults();                    
-                        m_database.PurgeLogData(m_options.LogRetention);
-                        m_database.PurgeDeletedVolumes(DateTime.UtcNow);
-
-                        if (m_options.AutoVacuum)
+                        finally
                         {
-                            m_result.VacuumResults = new VacuumResults(m_result);
-                            new VacuumHandler(m_options, (VacuumResults)m_result.VacuumResults).Run();
+                            //If the scanner is still running for some reason, make sure we kill it now
+                            await counterToken.CancelAsync();
+
+                            // The estimate is stopped once the files are processed; this covers a failed run
+                            if (changeTracking != null)
+                                await changeTracking.StopProgressEstimateAsync().ConfigureAwait(false);
                         }
-                        m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_Complete);
-                        return;
+
+                        try
+                        {
+                            // Await the scanner as it may still be running
+                            if (parallelScanner != null)
+                                await parallelScanner.ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // This is expected if the scanner is still running, so we can ignore this
+                        }
                     }
-                }
-                catch (Exception ex)
-                {
-                    var aex = BuildException(ex, uploaderTask, parallelScanner);
-                    Logging.Log.WriteErrorMessage(LOGTAG, "FatalError", ex, "Fatal error");
-                    if (aex == ex)
-                        throw;
-                    
-                    throw aex;
-                }
-                finally
-                {
-                    if (parallelScanner != null && !parallelScanner.IsCompleted)
-                        parallelScanner.Wait(500);
 
-                    // TODO: We want to commit? always?
-                    if (m_transaction != null)
-                        try { m_transaction.Rollback(); }
-                        catch (Exception ex) { Logging.Log.WriteErrorMessage(LOGTAG, "RollbackError", ex, "Rollback error: {0}", ex.Message); }                
+                    // Add the fileset file to the dlist file
+                    filesetvolume.CreateFilesetFile(!m_result.PartialBackup);
+
+                    // The tables have just grown by everything this backup added, which can be
+                    // several orders of magnitude when the previous run was small. Rebuild the
+                    // statistics before the fileset is written, because that query joins six
+                    // tables and the planner needs to know how big they actually are.
+                    await db
+                        .RefreshQueryStatisticsAsync(m_taskReader.ProgressToken)
+                        .ConfigureAwait(false);
+
+                    // Ensure the database is in a sane state after adding data
+                    using (new Logging.Timer(LOGTAG, "VerifyConsistency", "VerifyConsistency"))
+                        await db
+                            .VerifyConsistencyAsync(m_options.Blocksize, m_options.BlockhashSize, false, m_taskReader.ProgressToken)
+                            .ConfigureAwait(false);
+
+                    await FlushBackendAsync(db, m_result, backendManager)
+                        .ConfigureAwait(false);
+
+                    // Rebuild any index files that are missing.
+                    // This has to happen after the block volumes have been processed:
+                    // an interrupted backup can leave a block volume registered as uploaded
+                    // while the blocklists it contains are only registered by the following
+                    // backup. Re-creating the index file before that registration produces an
+                    // index file without any blocklists, which is then uploaded and recorded
+                    // as complete.
+                    await Backup.RecreateMissingIndexFiles.RunAsync(db, backendManager, m_options, m_result.TaskControl)
+                        .ConfigureAwait(false);
+
+                    // Send the actual filelist
+                    var uploadedNewFileset = await Backup.UploadRealFilelist.RunAsync(m_result, db, backendManager, m_options, filesetvolume, filesetid, m_result.TaskControl, lastTempVolumeIncomplete, stoppedBeforeProcessing)
+                        .ConfigureAwait(false);
+
+                    // Warn if the backup examined only folders and/or symlinks but no actual files,
+                    // as this is likely a misconfiguration (e.g. wrong source path or over-aggressive filter)
+                    if (uploadedNewFileset && !m_result.PartialBackup && m_result.ExaminedFiles == 0)
+                        Logging.Log.WriteWarningMessage(LOGTAG, "NoFilesInBackup", null,
+                            "The backup completed but no files were processed. This is likely a misconfiguration; please check the source paths and filter settings.");
+
+                    // Wait for upload completion
+                    m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_WaitForUpload);
+                    await FlushBackendAsync(db, m_result, backendManager)
+                        .ConfigureAwait(false);
+
+                    if (!m_options.Dryrun)
+                        await database
+                            .TerminatedWithActiveUploadsAsync(m_result.TaskControl.ProgressToken, false)
+                            .ConfigureAwait(false);
+
+                    // Make sure we have the database up-to-date
+                    await db
+                        .CommitTransactionAsync("CommitAfterUpload", true, m_taskReader.ProgressToken)
+                        .ConfigureAwait(false);
+
+                    // Remove any duplicate paths from the fileset
+                    await db.RemoveDuplicatePathsFromFilesetAsync(filesetid, m_taskReader.ProgressToken)
+                        .ConfigureAwait(false);
+
+
+                    // Invoke the after-backup callback, after the backup is complete
+                    // and sources are disposed, but before verification
+                    if (await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false) && m_options.LoadedModules != null)
+                    {
+                        // Make filter available to modules
+                        using var _ = Controller.PushFilterToOptions(m_options, filter);
+                        foreach (var mx in m_options.LoadedModules)
+                            if (mx is IBackupCallbackModule module)
+                                try { Controller.RunScriptCallbackWithStatus(m_result, mx, () => module.OnFinishBackup(m_result, null)); }
+                                catch (Exception ex) { Logging.Log.WriteWarningMessage(LOGTAG, $"OnFinishBackupError{mx.Key}", ex, "OnFinishBackup callback {0} failed: {1}", mx.Key, ex.Message); }
+                    }
+
+
+                    // If this throws, we should roll back the transaction
+                    if (await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
+                    {
+                        var versionsToLock = new List<DateTime>();
+                        if (syntheticFilesetTimestamp.HasValue)
+                            versionsToLock.Add(syntheticFilesetTimestamp.Value);
+
+                        if (uploadedNewFileset)
+                            versionsToLock.Add(VolumeBase.ParseFilename(filesetvolume.RemoteFilename).Time);
+
+                        await RunLockOperationAsync(backendManager, versionsToLock)
+                            .ConfigureAwait(false);
+                    }
+
+                    // If this throws, we should roll back the transaction
+                    if (await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
+                    {
+                        var lastVolumeSize = await m_database
+                        .GetLastWrittenDBlockVolumeSizeAsync(m_result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false);
+
+                        await CompactIfRequiredAsync(backendManager, lastVolumeSize)
+                            .ConfigureAwait(false);
+                    }
+
+                    if (m_options.UploadVerificationFile && await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
+                    {
+                        m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_VerificationUpload);
+                        await FilelistProcessor.UploadVerificationFileAsync(backendManager, m_options, m_database, m_result.TaskControl.ProgressToken)
+                            .ConfigureAwait(false);
+                    }
+
+                    if (!m_options.Dryrun)
+                    {
+                        await database.Transaction
+                            .CommitAsync("CommitFinalizingBackup")
+                            .ConfigureAwait(false);
+
+                        if (await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
+                        {
+                            if (m_options.NoBackendverification)
+                                await UpdateStorageStatsFromDatabaseAsync(m_result, m_database, m_options, backendManager, m_taskReader.ProgressToken)
+                                    .ConfigureAwait(false);
+                            else
+                                await PostBackupVerificationAsync(filesetvolume.RemoteFilename, lastTempFilelist.Name, backendManager)
+                                    .ConfigureAwait(false);
+                        }
+                        await database.Transaction
+                            .CommitAsync("CommitAfterVerification")
+                            .ConfigureAwait(false);
+                    }
+
+                    m_result.OperationProgressUpdater.UpdatePhase(OperationPhase.Backup_Complete);
+                    return;
                 }
+            }
+            catch (Exception ex)
+            {
+                var aex = BuildException(ex, parallelScanner);
+                Logging.Log.WriteErrorMessage(LOGTAG, "FatalError", ex, "Fatal error");
+                if (aex == ex)
+                    throw;
+
+                throw aex;
+            }
+            finally
+            {
+                // Give the scanner a moment to stop, without replacing the outcome of the operation
+                if (parallelScanner != null && !parallelScanner.IsCompleted)
+                    try { await parallelScanner.WaitAsync(TimeSpan.FromMilliseconds(500)); }
+                    catch { }
             }
         }
 
@@ -608,6 +1376,9 @@ namespace Duplicati.Library.Main.Operation
         {
             if (m_result.EndTime.Ticks == 0)
                 m_result.EndTime = DateTime.UtcNow;
+
+            m_normalizedChangeList?.Dispose();
+            m_normalizedChangeList = null;
         }
     }
 }

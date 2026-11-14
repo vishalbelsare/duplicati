@@ -1,27 +1,30 @@
-﻿//  Copyright (C) 2018, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
-//
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
-//
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
-//
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using System;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
-
-using Duplicati.Library.Utility;
 
 namespace Duplicati.Library
 {
@@ -31,42 +34,20 @@ namespace Duplicati.Library
 
         private readonly OAuthHttpMessageHandler m_authenticator;
 
-        static OAuthHttpClient()
-        {
-            // There is a regression in some versions of Mono (6.0) where an HttpClient
-            // with a BaseAddress cannot make requests to URLs that begin with '/'.
-            // https://github.com/mono/mono/issues/14630
-            // https://www.mono-project.com/docs/faq/known-issues/urikind-relativeorabsolute/.
-            if (Utility.Utility.IsMono)
-            {
-                FieldInfo field = typeof(System.Uri).GetField("useDotNetRelativeOrAbsolute", BindingFlags.Static | BindingFlags.GetField | BindingFlags.NonPublic);
-                field?.SetValue(null, true);
-            }
-        }
-
-        public OAuthHttpClient(string authid, string protocolKey)
-            : this(CreateMessageHandler(authid, protocolKey))
+        public OAuthHttpClient(string authid, string protocolKey, string oauthurl)
+            : this(new OAuthHttpMessageHandler(authid, protocolKey, oauthurl))
         {
         }
 
-        private OAuthHttpClient(OAuthHttpMessageHandler authenticator)
+        public OAuthHttpClient(OAuthHttpMessageHandler authenticator)
             : base(authenticator, true)
         {
             this.m_authenticator = authenticator;
 
-            // Set the overall timeout
-            if (HttpContextSettings.OperationTimeout > TimeSpan.Zero)
-            {
-                this.Timeout = HttpContextSettings.OperationTimeout;
-            }
-            else
-            {
-                // If no timeout is set, default to infinite
-                this.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
-            }
-
             // Set the default user agent
             this.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Duplicati", USER_AGENT_VERSION));
+            // Make sure the client never times out, we use a custom timeout setup
+            this.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
         }
 
         /// <summary>
@@ -103,26 +84,20 @@ namespace Duplicati.Library
                 this.PreventAuthentication(request);
             }
 
-            // The HttpCompletionOptions are a nice way to emulate the BufferRequests behavior.
-            // When set to ResponseContentRead, async call will not complete until the response has been
-            // read and is cached in memory (somehow).
-            // When set to ResponseHeadersRead, it looks like both Mono and .NET don't buffer the result.
-            HttpCompletionOption httpCompletionOption = HttpContextSettings.BufferRequests ? HttpCompletionOption.ResponseContentRead : HttpCompletionOption.ResponseHeadersRead;
-
             // The HttpClient.SendAsync method throws an OperationCanceledException when the timeout is exceeded.
             // In order to provide a more informative exception, we will detect this case and throw a TimeoutException
-            // instead.  This will also allow the BackendUploader to differentiate between cancellations requested by
+            // instead. This will also allow the BackendUploader to differentiate between cancellations requested by
             // the user and those generated by timeouts.
             try
             {
-                return await this.SendAsync(request, httpCompletionOption, cancellationToken).ConfigureAwait(false);
+                return await this.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
                 throw new TimeoutException($"HTTP timeout {this.Timeout} exceeded.");
             }
         }
-        
+
         /// <summary>
         /// Prevents authentication from being applied on the given request
         /// </summary>
@@ -131,31 +106,6 @@ namespace Duplicati.Library
         public HttpRequestMessage PreventAuthentication(HttpRequestMessage request)
         {
             return this.m_authenticator.PreventAuthentication(request);
-        }
-
-        /// <summary>
-        /// Create a message handler with the global timeout / certificate settings.
-        /// </summary>
-        /// <param name="authid">OAuth Auth-ID</param>
-        /// <param name="protocolKey">Protocol key</param>
-        /// <returns>Http message handler</returns>
-        private static OAuthHttpMessageHandler CreateMessageHandler(string authid, string protocolKey)
-        {
-            OAuthHttpMessageHandler handler = new OAuthHttpMessageHandler(authid, protocolKey);
-
-            // Set the read/write timeout
-            if (HttpContextSettings.ReadWriteTimeout > TimeSpan.Zero)
-            {
-                handler.ReadWriteTimeout = (int)HttpContextSettings.ReadWriteTimeout.TotalMilliseconds;
-            }
-
-            // Set the certificate validator
-            if (HttpContextSettings.CertificateValidator != null)
-            {
-                handler.ServerCertificateValidationCallback = HttpContextSettings.CertificateValidator.ValidateServerCertficate;
-            }
-
-            return handler;
         }
     }
 }

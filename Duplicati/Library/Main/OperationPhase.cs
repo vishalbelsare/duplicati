@@ -1,25 +1,29 @@
-//  Copyright (C) 2013, The Duplicati Team
-//  http://www.duplicati.com, info@duplicati.com
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 //
-//  This library is free software; you can redistribute it and/or modify
-//  it under the terms of the GNU Lesser General Public License as
-//  published by the Free Software Foundation; either version 2.1 of the
-//  License, or (at your option) any later version.
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
 //
-//  This library is distributed in the hope that it will be useful, but
-//  WITHOUT ANY WARRANTY; without even the implied warranty of
-//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-//  Lesser General Public License for more details.
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
 //
-//  You should have received a copy of the GNU Lesser General Public
-//  License along with this library; if not, write to the Free Software
-//  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
-using System;
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
 
 namespace Duplicati.Library.Main
 {
     public enum OperationPhase
     {
+        Starting_Operation,
         Backup_Begin,
         Backup_PreBackupVerify,
         Backup_PostBackupTest,
@@ -29,10 +33,13 @@ namespace Duplicati.Library.Main
         Backup_WaitForUpload,
         Backup_Delete,
         Backup_Compact,
+        Backup_Lock,
         Backup_VerificationUpload,
         Backup_PostBackupVerify,
+        Backup_PostBackupRestoreTest,
         Backup_Complete,
-        
+        Backup_RemoteSynchronization,
+
         Restore_Begin,
         Restore_RecreateDatabase,
         Restore_PreRestoreVerify,
@@ -43,9 +50,20 @@ namespace Duplicati.Library.Main
         Restore_PatchWithLocalBlocks,
         Restore_DownloadingRemoteFiles,
         Restore_PostRestoreVerify,
+        Restore_Finalize,
         Restore_Complete,
 
+        RestoreTest_Begin,
+        RestoreTest_RecreateDatabase,
+        RestoreTest_SelectSample,
+        RestoreTest_Restore,
+        RestoreTest_Verify,
+        RestoreTest_CompareSource,
+        RestoreTest_Cleanup,
+        RestoreTest_Complete,
+
         Recreate_Running,
+        ReadLockInfo_Running,
         Vacuum_Running,
         Verify_Running,
 
@@ -59,7 +77,15 @@ namespace Duplicati.Library.Main
         PurgeFiles_Compact,
         PurgeFiles_Complete,
 
-        Error
+        Sync_Begin,
+        Sync_CountingFiles,
+        Sync_ProcessingFiles,
+        Sync_WaitForUpload,
+        Sync_Complete,
+
+        Error,
+
+        RunScript_Running
     }
 }
 

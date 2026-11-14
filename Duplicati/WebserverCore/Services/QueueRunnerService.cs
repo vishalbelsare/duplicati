@@ -1,0 +1,356 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using Duplicati.Library.ChangeTracking;
+using Duplicati.Library.Interface;
+using Duplicati.Library.RestAPI;
+using Duplicati.Library.Utility;
+using Duplicati.Server;
+using Duplicati.Server.Database;
+using Duplicati.Server.Serialization.Interface;
+using Duplicati.WebserverCore.Abstractions;
+
+namespace Duplicati.WebserverCore.Services;
+
+/// <summary>
+/// Simple queue that will run the given task
+/// </summary>
+public class QueueRunnerService(
+    Connection connection,
+    EventPollNotify eventPollNotify,
+    INotificationUpdateService notificationUpdateService,
+    IProgressStateProviderService progressStateProviderService,
+    IApplicationSettings applicationSettings,
+    IDatabaseLockTracker databaseLockTracker,
+    IChangeTrackingService changeTracking) : IQueueRunnerService, IDisposable
+{
+    /// <summary>
+    /// The tag used for logging
+    /// </summary>
+    private static readonly string LOGTAG = Library.Logging.Log.LogTagFromType<QueueRunnerService>();
+    private readonly object _lock = new();
+    /// <summary>
+    /// A thread-safe dictionary to store cached task results.
+    /// </summary>
+    private readonly Dictionary<long, CachedTaskResult> _taskCache = new();
+
+    /// <summary>
+    /// The maximum number of completed task results to keep in memory
+    /// </summary>
+    private static readonly int MAX_TASK_RESULT_CACHE_SIZE = 100;
+
+    /// <summary>
+    /// One turn per database for the tasks that run immediately, so they wait for each other
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _immediateTurns = new(Library.Utility.Utility.ClientFilenameStringComparer);
+
+    private readonly List<IQueuedTask> _tasks = new();
+    private (Task? Task, IQueuedTask? QueuedTask, CancellationTokenSource? LockCts) _current;
+    private bool _isPaused;
+    private bool _isTerminated;
+    private readonly CancellationTokenSource _terminateCts = new();
+
+    public long AddTask(IQueuedTask task)
+        => AddTask(task, false);
+
+    public long AddTask(IQueuedTask task, bool skipQueue)
+    {
+        lock (_lock)
+            if (skipQueue)
+                _tasks.Insert(0, task);
+            else
+                _tasks.Add(task);
+
+        eventPollNotify.SignalNewEvent();
+        eventPollNotify.SignalTaskQueueUpdate();
+        StartNextTask();
+        return task.TaskID;
+    }
+
+    public bool GetIsActive()
+        => _current.Task != null;
+
+    public IQueuedTask? GetCurrentTask()
+        => _current.QueuedTask;
+
+    public List<IQueuedTask> GetCurrentTasks()
+    {
+        lock (_lock)
+            return [.. _tasks];
+    }
+
+    public void Pause()
+    {
+        lock (_lock)
+            _isPaused = true;
+    }
+
+    public void Resume()
+    {
+        lock (_lock)
+            _isPaused = false;
+
+        StartNextTask();
+    }
+
+    public void Terminate(bool wait)
+    {
+        _isTerminated = true;
+        CancelTermination();
+        if (wait)
+        {
+            var task = _current.Task;
+            if (task != null)
+                task.Await();
+        }
+    }
+
+    private void StartNextTask()
+    {
+        lock (_lock)
+        {
+            if (_isTerminated || _isPaused || (_current.Task != null && !_current.Task.IsCompleted))
+                return;
+
+            // Clean up completed tasks
+            if (_current.Task != null && _current.Task.IsCompleted)
+            {
+                _current.LockCts?.Dispose();
+                _current = (null, null, null);
+            }
+
+            if (_tasks.Count == 0)
+                return;
+
+            var nextTask = _tasks[0];
+            _tasks.RemoveAt(0);
+            _current = (Task.Run(() => RunTaskAsync(nextTask), CancellationToken.None), nextTask, null);
+        }
+    }
+
+    private async Task RunTaskAsync(IQueuedTask task)
+    {
+        var completed = false;
+        IAsyncDisposable? dbLock = null;
+        var lockCts = CancellationTokenSource.CreateLinkedTokenSource(_terminateCts.Token);
+        lock (_lock)
+            _current = (_current.Task, _current.QueuedTask, lockCts);
+        try
+        {
+            eventPollNotify.SignalNewEvent();
+            eventPollNotify.SignalTaskQueueUpdate();
+            task.TaskStarted = DateTime.UtcNow;
+            if (task.OnStarting != null)
+                await task.OnStarting().ConfigureAwait(false);
+
+            dbLock = await AcquireDatabaseLockAsync(task, lockCts.Token).ConfigureAwait(false);
+
+            var result = await Runner.RunAsync(connection, eventPollNotify, notificationUpdateService, progressStateProviderService, applicationSettings, changeTracking, task, true).ConfigureAwait(false);
+
+            // If the task is completed, don't call OnFinished again
+            completed = true;
+            AddTaskResult(new CachedTaskResult(task.TaskID, task.BackupID, task.TaskStarted, task.TaskFinished ?? DateTime.Now, null, GetResultErrorMessage(result), TaskResultSummary.FromResults(result)));
+            if (task.OnFinished != null)
+                await task.OnFinished(null).ConfigureAwait(false);
+        }
+        catch (Scheduler.RunNoLongerScheduledException ex)
+        {
+            // The run was skipped before it started, which is not an error
+            Library.Logging.Log.WriteInformationMessage(LOGTAG, "ScheduledRunSkipped", ex.Message);
+            completed = true;
+            AddTaskResult(new CachedTaskResult(task.TaskID, task.BackupID, task.TaskStarted, DateTime.UtcNow, null, null, null));
+        }
+        catch (Exception ex)
+        {
+            connection.LogError(task.BackupID, "Error in worker", ex);
+            if (!completed)
+            {
+                AddTaskResult(new CachedTaskResult(task.TaskID, task.BackupID, task.TaskStarted, task.TaskFinished ?? DateTime.Now, ex, null, null));
+                if (task.OnFinished != null)
+                    await task.OnFinished(ex).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            if (dbLock != null)
+                await dbLock.DisposeAsync().ConfigureAwait(false);
+            task.TaskFinished = DateTime.UtcNow;
+            lock (_lock)
+            {
+                lockCts.Dispose();
+                _current = (null, null, null);
+            }
+            eventPollNotify.SignalNewEvent();
+            eventPollNotify.SignalTaskQueueUpdate();
+            eventPollNotify.SignalTaskCompleted(task.TaskID);
+            StartNextTask();
+        }
+    }
+
+    public IList<Tuple<long, string?>> GetQueueWithIds()
+    {
+        return (from n in GetCurrentTasks()
+                where n.BackupID != null
+                select new Tuple<long, string?>(n.TaskID, n.BackupID)).ToList();
+    }
+
+
+    /// <inheritdoc/>
+    public CachedTaskResult? GetCachedTaskResults(long taskID)
+    {
+        lock (_lock)
+        {
+            _taskCache.TryGetValue(taskID, out var result);
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Describes the errors of a task that finished without throwing. Such a task can still have
+    /// failed: a restore that could not restore a file reports it as an error in its results and
+    /// returns normally. The text follows the notification the runner registers for the result.
+    /// </summary>
+    /// <param name="result">The results of the task, or <c>null</c> if it has none.</param>
+    /// <returns>The error message, or <c>null</c> if the task reported no errors.</returns>
+    private static string? GetResultErrorMessage(IBasicResults? result)
+    {
+        if (result == null || result.ParsedResult is not (ParsedResultType.Error or ParsedResultType.Fatal))
+            return null;
+
+        var errors = result.Errors.ToList();
+        return errors.Count == 1
+            ? errors[0]
+            : $"Got {errors.Count} error(s)";
+    }
+
+    private void AddTaskResult(CachedTaskResult taskResult)
+    {
+        lock (_lock)
+        {
+            // If the task result is already in the cache, remove it
+            if (_taskCache.TryGetValue(taskResult.TaskID, out var existingResult))
+            {
+                // If the stored task result has an exception, do not overwrite it
+                if (existingResult.Exception != null)
+                    return;
+            }
+
+            // Add/update the new task result in the cache
+            _taskCache[taskResult.TaskID] = taskResult;
+
+            // If the cache size exceeds the maximum, remove the oldest entry
+            while (_taskCache.Count >= MAX_TASK_RESULT_CACHE_SIZE)
+            {
+                var oldestTaskID = _taskCache.Keys.Min();
+                _taskCache.Remove(oldestTaskID);
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task<IBasicResults?> RunImmediatelyAsync(IQueuedTask task)
+    {
+        IAsyncDisposable? dbLock = null;
+        SemaphoreSlim? turn = null;
+        var dbPath = Runner.GetEffectiveDBPath(task);
+
+        // If we have a database to work with, make sure we can get the lock
+        if (!string.IsNullOrWhiteSpace(dbPath))
+        {
+            // Tasks that run immediately, such as the listings of the restore tree, are short, and the UI
+            // can start several at once. They take turns, so they do not fail on each other's lock.
+            // A queued task, such as a backup, can hold the lock for a long time, so that still fails at once.
+            turn = _immediateTurns.GetOrAdd(Path.GetFullPath(dbPath), _ => new SemaphoreSlim(1, 1));
+            await turn.WaitAsync(_terminateCts.Token).ConfigureAwait(false);
+
+            dbLock = databaseLockTracker.TryAcquire(dbPath);
+            if (dbLock == null)
+            {
+                turn.Release();
+                throw new DatabaseLockedException(dbPath);
+            }
+        }
+
+        try
+        {
+            return await Runner.RunAsync(connection, eventPollNotify, notificationUpdateService, progressStateProviderService, applicationSettings, changeTracking, task, false).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (dbLock != null)
+                await dbLock.DisposeAsync().ConfigureAwait(false);
+            turn?.Release();
+        }
+    }
+
+    /// <inheritdoc/>
+    public void CancelCurrentTaskLockWait(long taskID)
+    {
+        lock (_lock)
+        {
+            if (_current.QueuedTask?.TaskID == taskID && _current.LockCts != null)
+                _current.LockCts.Cancel();
+        }
+    }
+
+    /// <summary>
+    /// Acquires the database lock for a queued task, waiting until the lock is available
+    /// or the cancellation token is cancelled. Tasks without a database path (e.g. custom
+    /// runner tasks) skip locking.
+    /// </summary>
+    private async Task<IAsyncDisposable?> AcquireDatabaseLockAsync(IQueuedTask task, CancellationToken cancellationToken)
+    {
+        var dbPath = Runner.GetEffectiveDBPath(task);
+        if (string.IsNullOrWhiteSpace(dbPath))
+            return null;
+
+        return await databaseLockTracker.AcquireAsync(dbPath, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Disposes resources held by the queue runner, including the termination
+    /// cancellation token source used to cancel tasks waiting on the database lock.
+    /// </summary>
+    public void Dispose()
+    {
+        // The service container disposes the queue runner when the web server stops, which the
+        // server's shutdown does before it terminates the queue runner. Disposing therefore stops
+        // the queue as terminating does, so nothing is left waiting on the disposed source.
+        _isTerminated = true;
+        CancelTermination();
+        _terminateCts.Dispose();
+    }
+
+    /// <summary>
+    /// Cancels the tasks waiting on the database lock. The source may already be disposed, which
+    /// cancelled it first.
+    /// </summary>
+    private void CancelTermination()
+    {
+        try
+        {
+            _terminateCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+}

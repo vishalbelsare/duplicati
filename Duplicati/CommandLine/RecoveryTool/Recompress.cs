@@ -1,4 +1,25 @@
-﻿using Duplicati.Library.Interface;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using Duplicati.Library.Interface;
 using Duplicati.Library.Main;
 using Duplicati.Library.Main.Volumes;
 using Duplicati.Library.Utility;
@@ -8,6 +29,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Duplicati.CommandLine.RecoveryTool
 {
@@ -30,6 +52,7 @@ namespace Duplicati.CommandLine.RecoveryTool
             }
 
             var m_Options = new Options(options);
+            RestoreOptionsFromLocalDatabaseIfAvailable(args[2], m_Options);
 
             using (var backend = Library.DynamicLoader.BackendLoader.GetBackend(args[2], options))
             {
@@ -49,12 +72,13 @@ namespace Duplicati.CommandLine.RecoveryTool
 
                 Console.WriteLine("Listing files on backend: {0} ...", backend.ProtocolKey);
 
-                var rawlist = backend.List().ToList();
+                var rawlist = backend.ListAsync(CancellationToken.None).ToBlockingEnumerable().ToList();
 
                 Console.WriteLine("Found {0} files at remote storage", rawlist.Count);
 
                 var i = 0;
                 var downloaded = 0;
+                var reuploaded = 0;
                 var errors = 0;
                 var needspass = 0;
 
@@ -91,6 +115,31 @@ namespace Duplicati.CommandLine.RecoveryTool
 
                 bool reencrypt = Library.Utility.Utility.ParseBoolOption(options, "reencrypt");
                 bool reupload = Library.Utility.Utility.ParseBoolOption(options, "reupload");
+                bool addEncryption = Library.Utility.Utility.ParseBoolOption(options, "add-encryption");
+                var reencryptPassphrase = string.IsNullOrWhiteSpace(m_Options.NewPassphrase) ? m_Options.Passphrase : m_Options.NewPassphrase;
+
+                string addEncryptionModule = null;
+                string addEncryptionExtension = null;
+                if (addEncryption)
+                {
+                    if (string.IsNullOrWhiteSpace(reencryptPassphrase))
+                    {
+                        Console.WriteLine("The --add-encryption option requires --passphrase or --new-passphrase");
+                        return 100;
+                    }
+
+                    // The local database may have set --no-encryption, so read the module name directly
+                    m_Options.RawOptions.TryGetValue("encryption-module", out var requestedEncryptionModule);
+                    addEncryptionModule = Library.DynamicLoader.EncryptionLoader.GetCanonicalKey(string.IsNullOrWhiteSpace(requestedEncryptionModule) ? "aes" : requestedEncryptionModule);
+                    if (!Library.DynamicLoader.EncryptionLoader.Keys.Contains(addEncryptionModule))
+                    {
+                        Console.WriteLine("Encryption module not found: {0}{1}Modules supported: {2}", addEncryptionModule, Environment.NewLine, string.Join(", ", Library.DynamicLoader.EncryptionLoader.Keys));
+                        return 100;
+                    }
+
+                    using (var m = Library.DynamicLoader.EncryptionLoader.GetModule(addEncryptionModule, reencryptPassphrase, options))
+                        addEncryptionExtension = m.FilenameExtension;
+                }
 
                 // Needs order (Files or Blocks) and Indexes as last because indexes content will be adjusted based on recompressed blocks
                 var files = remotefiles.Where(a => a.FileType == RemoteVolumeType.Files).ToArray();
@@ -99,7 +148,13 @@ namespace Duplicati.CommandLine.RecoveryTool
 
                 remotefiles = files.Concat(blocks).ToArray().Concat(indexes).ToArray();
 
+                var retainedReuploadedBlockFiles = new List<string>();
+
                 Console.WriteLine("Found {0} files which belongs to backup with prefix {1}", remotefiles.Count(), m_Options.Prefix);
+
+                var unencryptedCount = remotefiles.Count(a => a.EncryptionModule == null);
+                if (reencrypt && !addEncryption && unencryptedCount > 0)
+                    Console.WriteLine("Warning: {0} of {1} files are not encrypted, so --reencrypt has no effect on them and they stay unencrypted, use --add-encryption to encrypt them", unencryptedCount, remotefiles.Count());
 
                 foreach (var remoteFile in remotefiles)
                 {
@@ -134,7 +189,21 @@ namespace Duplicati.CommandLine.RecoveryTool
                             continue;
                         }
 
-                        if ((!reencrypt && File.Exists(localFileTarget)) || (reencrypt && File.Exists(localFileTarget + "." + localFileSourceEncryption)))
+                        string targetEncryptionModule = null;
+                        string targetEncryptionExtension = null;
+                        if (remoteFile.EncryptionModule != null && reencrypt)
+                        {
+                            targetEncryptionModule = remoteFile.EncryptionModule;
+                            targetEncryptionExtension = localFileSourceEncryption;
+                        }
+                        else if (remoteFile.EncryptionModule == null && addEncryption)
+                        {
+                            targetEncryptionModule = addEncryptionModule;
+                            targetEncryptionExtension = addEncryptionExtension;
+                        }
+
+                        var localFileFinal = targetEncryptionModule == null ? localFileTarget : localFileTarget + "." + targetEncryptionExtension;
+                        if (File.Exists(localFileFinal))
                         {
                             Console.WriteLine(" - target file already exist");
                             continue;
@@ -150,7 +219,7 @@ namespace Duplicati.CommandLine.RecoveryTool
 
                         using (var tf = new TempFile())
                         {
-                            backend.Get(remoteFile.File.Name, tf);
+                            backend.GetAsync(remoteFile.File.Name, tf, CancellationToken.None).Await();
                             originLastWriteTime = new FileInfo(tf).LastWriteTime;
                             downloaded++;
 
@@ -177,7 +246,7 @@ namespace Duplicati.CommandLine.RecoveryTool
                         {
                             Console.Write(" recompressing ...");
 
-                            //Recompressing from eg. zip to zip
+                            //Recompressing from e.g. ZIP to ZIP
                             if (localFileSource == localFileTarget)
                             {
                                 File.Move(localFileSource, localFileSource + ".same");
@@ -196,8 +265,10 @@ namespace Duplicati.CommandLine.RecoveryTool
                                     {
                                         // Correct inner filename extension to target compression type
                                         cmfileNew = cmfileNew.Replace("." + cmFileVolume.CompressionModule, "." + target_compr_module);
-                                        if (!reencrypt)
+                                        if (!reencrypt && !string.IsNullOrWhiteSpace(cmFileVolume.EncryptionModule))
                                             cmfileNew = cmfileNew.Replace("." + cmFileVolume.EncryptionModule, "");
+                                        else if (addEncryption && string.IsNullOrWhiteSpace(cmFileVolume.EncryptionModule))
+                                            cmfileNew = cmfileNew + "." + addEncryptionExtension;
 
                                         //Because compression changes blocks file sizes - needs to be updated
                                         string textJSON;
@@ -207,8 +278,7 @@ namespace Duplicati.CommandLine.RecoveryTool
                                             textJSON = sourceStreamReader.ReadToEnd();
                                             JToken token = JObject.Parse(textJSON);
                                             var fileInfoBlocks = new FileInfo(Path.Combine(targetfolder, cmfileNew.Replace("vol/", "")));
-                                            var filehasher = HashAlgorithmHelper.Create(m_Options.FileHashAlgorithm);
-
+                                            using (var filehasher = HashFactory.CreateHasher(m_Options.FileHashAlgorithm))
                                             using (var fileStream = fileInfoBlocks.Open(FileMode.Open))
                                             {
                                                 fileStream.Position = 0;
@@ -237,14 +307,14 @@ namespace Duplicati.CommandLine.RecoveryTool
                             destinationFileInfo.LastWriteTime = originLastWriteTime;
                         }
 
-                        if (reencrypt && remoteFile.EncryptionModule != null)
+                        if (targetEncryptionModule != null)
                         {
-                            Console.Write(" reencrypting ...");
-                            using (var m = Library.DynamicLoader.EncryptionLoader.GetModule(remoteFile.EncryptionModule, m_Options.Passphrase, options))
+                            Console.Write(remoteFile.EncryptionModule != null ? " reencrypting ..." : " encrypting ...");
+                            using (var m = Library.DynamicLoader.EncryptionLoader.GetModule(targetEncryptionModule, reencryptPassphrase, options))
                             {
-                                m.Encrypt(localFileTarget, localFileTarget + "." + localFileSourceEncryption);
+                                m.Encrypt(localFileTarget, localFileFinal);
                                 File.Delete(localFileTarget);
-                                localFileTarget = localFileTarget + "." + localFileSourceEncryption;
+                                localFileTarget = localFileFinal;
                             }
 
                             destinationFileInfo = new FileInfo(localFileTarget);
@@ -254,9 +324,19 @@ namespace Duplicati.CommandLine.RecoveryTool
                         if (reupload)
                         {
                             Console.Write(" reuploading ...");
-                            backend.PutAsync((new FileInfo(localFileTarget)).Name, localFileTarget, CancellationToken.None).Wait();
-                            backend.Delete(remoteFile.File.Name);
-                            File.Delete(localFileTarget);
+                            var uploadName = new FileInfo(localFileTarget).Name;
+                            backend.PutAsync(uploadName, localFileTarget, CancellationToken.None).Await();
+
+                            // When the format is unchanged the upload overwrote the original, so deleting it would remove the new file
+                            if (!string.Equals(uploadName, remoteFile.File.Name, StringComparison.Ordinal))
+                                backend.DeleteAsync(remoteFile.File.Name, CancellationToken.None).Await();
+
+                            if (remoteFile.FileType == RemoteVolumeType.Blocks && indexes.Length > 0)
+                                retainedReuploadedBlockFiles.Add(localFileTarget);
+                            else
+                                File.Delete(localFileTarget);
+
+                            reuploaded++;
                         }
 
                         Console.WriteLine(" done!");
@@ -276,9 +356,13 @@ namespace Duplicati.CommandLine.RecoveryTool
                     if (remoteverificationfileexist)
                     {
                         Console.WriteLine("Found verification file {0} - deleting", m_Options.Prefix + "-verification.json");
-                        backend.Delete(m_Options.Prefix + "-verification.json");
+                        backend.DeleteAsync(m_Options.Prefix + "-verification.json", CancellationToken.None).Await();
                     }
                 }
+
+                foreach (var retainedFile in retainedReuploadedBlockFiles)
+                    if (File.Exists(retainedFile))
+                        File.Delete(retainedFile);
 
                 if (needspass > 0 && downloaded == 0)
                 {
@@ -299,6 +383,14 @@ namespace Duplicati.CommandLine.RecoveryTool
                 return 0;
             }
         }
+
+        private static void RestoreOptionsFromLocalDatabaseIfAvailable(string backendUrl, Options options)
+        {
+            var dbpath = CLIDatabaseLocator.GetDatabasePathForCLI(backendUrl, options, false, false, false);
+            if (string.IsNullOrWhiteSpace(dbpath) || !File.Exists(dbpath))
+                return;
+
+            Duplicati.Library.Main.Utility.UpdateOptionsFromDatabaseAsync(dbpath, options, "RecoveryTool Recompress", CancellationToken.None).Await();
+        }
     }
 }
-

@@ -1,0 +1,361 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using NUnit.Framework;
+using Duplicati.Library.Main;
+using Duplicati.Library.Main.Database.Local;
+using Duplicati.Library.Interface;
+using System.IO;
+using Assert = NUnit.Framework.Legacy.ClassicAssert;
+using NUnit.Framework.Legacy;
+using TempFile = Duplicati.Library.Utility.TempFile;
+
+#nullable enable
+
+namespace Duplicati.UnitTest
+{
+    [TestFixture]
+    public class UtilityExtraTests
+    {
+        [Test]
+        [Category("Utility")]
+        public void WrapMetadataReturnsExpectedValues()
+        {
+            var options = new Options(new Dictionary<string, string?>
+            {
+                { "file-hash-algorithm", Library.Utility.HashFactory.MD5 }
+            });
+            var values = new Dictionary<string, string> { { "a", "b" } };
+
+            var metahash = Utility.WrapMetadata(values, options);
+
+            var json = System.Text.Json.JsonSerializer.Serialize(values);
+
+            using var ms = new MemoryStream();
+            ms.Write(Encoding.UTF8.GetPreamble());
+            ms.Write(Encoding.UTF8.GetBytes(json));
+            ms.Position = 0; // Reset position for reading
+
+            using var hasher = Library.Utility.HashFactory.CreateHasher(Library.Utility.HashFactory.MD5);
+            var expectedHash = Convert.ToBase64String(hasher.ComputeHash(ms));
+
+            Assert.AreEqual(expectedHash, metahash.FileHash);
+            var decodedString = Encoding.UTF8.GetString(metahash.Blob.AsSpan(Encoding.UTF8.GetPreamble().Length));
+            Assert.AreEqual(json, decodedString);
+            CollectionAssert.AreEquivalent(values, metahash.Values);
+        }
+
+        [Test]
+        [Category("Utility")]
+        public void WrapMetadataWithInvalidAlgorithmThrows()
+        {
+            var options = new Options(new Dictionary<string, string?>
+            {
+                { "file-hash-algorithm", "invalid" }
+            });
+            Assert.Throws<ArgumentException>(() => Utility.WrapMetadata(new Dictionary<string, string>(), options));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task UpdateOptionsFromDbPopulatesMissingValuesAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+            await db.SetDbOptionsAsync(new Dictionary<string, string>
+            {
+                { "prefix", "custom-prefix" },
+                { "blocksize", "16384" },
+                { "blockhash", Library.Utility.HashFactory.MD5 },
+                { "filehash", "SHA512" },
+                { "dblock-size", "1048576" },
+                { "compression-module", "zip" },
+                { "encryption-module", "gpg" }
+            }, CancellationToken.None);
+
+            var options = new Options(new Dictionary<string, string?>());
+
+            await Utility.UpdateOptionsFromDbAsync(db, options, CancellationToken.None);
+
+            Assert.That(options.RawOptions.TryGetValue("prefix", out var prefix), Is.True);
+            Assert.That(prefix, Is.EqualTo("custom-prefix"));
+            Assert.That(options.RawOptions.TryGetValue("blocksize", out var blocksize), Is.True);
+            Assert.That(blocksize, Is.EqualTo("16384b"));
+            Assert.That(options.RawOptions.TryGetValue("block-hash-algorithm", out var blockHash), Is.True);
+            Assert.That(blockHash, Is.EqualTo(Library.Utility.HashFactory.MD5));
+            Assert.That(options.RawOptions.TryGetValue("file-hash-algorithm", out var fileHash), Is.True);
+            Assert.That(fileHash, Is.EqualTo("SHA512"));
+            Assert.That(options.RawOptions.TryGetValue("dblock-size", out var dblockSize), Is.True);
+            Assert.That(dblockSize, Is.EqualTo("1048576b"));
+            Assert.That(options.RawOptions.TryGetValue("compression-module", out var compressionModule), Is.True);
+            Assert.That(compressionModule, Is.EqualTo("zip"));
+            Assert.That(options.RawOptions.TryGetValue("encryption-module", out var encryptionModule), Is.True);
+            Assert.That(encryptionModule, Is.EqualTo("gpg"));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task UpdateOptionsFromDbRespectsExistingValuesAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+            await db.SetDbOptionsAsync(new Dictionary<string, string>
+            {
+                { "prefix", "stored-prefix" },
+                { "blocksize", "4096" },
+                { "blockhash", Library.Utility.HashFactory.SHA1 },
+                { "filehash", "SHA256" },
+                { "dblock-size", "1048576" },
+                { "compression-module", "zip" },
+                { "encryption-module", "aes" }
+            }, CancellationToken.None);
+
+            var options = new Options(new Dictionary<string, string?>
+            {
+                { "prefix", "cli-prefix" },
+                { "blocksize", "32kb" },
+                { "block-hash-algorithm", Library.Utility.HashFactory.SHA512 },
+                { "file-hash-algorithm", "RIPEMD160" },
+                { "dblock-size", "2mb" },
+                { "compression-module", "zip" },
+                { "encryption-module", "gpg" }
+            });
+
+            await Utility.UpdateOptionsFromDbAsync(db, options, CancellationToken.None);
+
+            Assert.That(options.RawOptions["prefix"], Is.EqualTo("cli-prefix"));
+            Assert.That(options.RawOptions["blocksize"], Is.EqualTo("32kb"));
+            Assert.That(options.RawOptions["block-hash-algorithm"], Is.EqualTo(Library.Utility.HashFactory.SHA512));
+            Assert.That(options.RawOptions["file-hash-algorithm"], Is.EqualTo("RIPEMD160"));
+            Assert.That(options.RawOptions["dblock-size"], Is.EqualTo("2mb"));
+            Assert.That(options.RawOptions["compression-module"], Is.EqualTo("zip"));
+            Assert.That(options.RawOptions["encryption-module"], Is.EqualTo("gpg"));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task UpdateOptionsFromDbRestoresNoEncryptionWhenStoredBackupIsUnencryptedAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+            await db.SetDbOptionsAsync(new Dictionary<string, string>
+            {
+                { "passphrase", "no-encryption" }
+            }, CancellationToken.None);
+
+            var options = new Options(new Dictionary<string, string?>());
+
+            await Utility.UpdateOptionsFromDbAsync(db, options, CancellationToken.None);
+
+            Assert.That(options.RawOptions.TryGetValue("no-encryption", out var noEncryption), Is.True);
+            Assert.That(noEncryption, Is.EqualTo("true"));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task ContainsOptionsForVerificationDetectsSensitiveEntriesAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+            await db.SetDbOptionsAsync(new Dictionary<string, string>
+            {
+                { "compression-module", "zip" }
+            }, CancellationToken.None);
+
+            var result = await Utility.ContainsOptionsForVerificationAsync(db, CancellationToken.None);
+
+            Assert.That(result, Is.True);
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task ContainsOptionsForVerificationReturnsFalseWhenOptionsAbsentAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+            await db.SetDbOptionsAsync(new Dictionary<string, string>(), CancellationToken.None);
+
+            var result = await Utility.ContainsOptionsForVerificationAsync(db, CancellationToken.None);
+
+            Assert.That(result, Is.False);
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task VerifyOptionsThrowsWhenAddingPassphraseWithoutPermissionAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+            await db.SetDbOptionsAsync(new Dictionary<string, string>
+            {
+                { "blocksize", "16384" },
+                { "blockhash", Library.Utility.HashFactory.SHA256 },
+                { "filehash", Library.Utility.HashFactory.SHA256 },
+                { "passphrase", "no-encryption" },
+                { "passphrase-salt", "existing-salt" }
+            }, CancellationToken.None);
+
+            var options = new Options(new Dictionary<string, string?>
+            {
+                { "blocksize", "16kb" },
+                { "block-hash-algorithm", Library.Utility.HashFactory.SHA256 },
+                { "file-hash-algorithm", Library.Utility.HashFactory.SHA256 },
+                { "passphrase", "secret" }
+            });
+
+            var ex = Assert.ThrowsAsync<UserInformationException>(async () =>
+                await Utility.VerifyOptionsAndUpdateDatabaseAsync(db, options, CancellationToken.None));
+
+            Assert.That(ex?.Message, Does.Contain("add a passphrase"));
+
+            var storedOptions = await db.GetDbOptionsAsync(CancellationToken.None);
+            Assert.That(storedOptions["passphrase"], Is.EqualTo("no-encryption"));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task VerifyOptionsAndUpdateDatabasePersistsWritePathValuesAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+
+            var options = new Options(new Dictionary<string, string?>
+            {
+                { "prefix", "persisted-prefix" },
+                { "blocksize", "16kb" },
+                { "block-hash-algorithm", Library.Utility.HashFactory.SHA256 },
+                { "file-hash-algorithm", Library.Utility.HashFactory.SHA512 },
+                { "dblock-size", "25mb" },
+                { "compression-module", "zip" },
+                { "encryption-module", "gpg" },
+                { "passphrase", "secret" }
+            });
+
+            await Utility.VerifyOptionsAndUpdateDatabaseAsync(db, options, CancellationToken.None);
+
+            var storedOptions = await db.GetDbOptionsAsync(CancellationToken.None);
+            Assert.That(storedOptions["prefix"], Is.EqualTo("persisted-prefix"));
+            Assert.That(storedOptions["blocksize"], Is.EqualTo(options.Blocksize.ToString()));
+            Assert.That(storedOptions["blockhash"], Is.EqualTo(Library.Utility.HashFactory.SHA256));
+            Assert.That(storedOptions["filehash"], Is.EqualTo(Library.Utility.HashFactory.SHA512));
+            Assert.That(storedOptions["dblock-size"], Is.EqualTo(options.VolumeSize.ToString()));
+            Assert.That(storedOptions["compression-module"], Is.EqualTo("zip"));
+            Assert.That(storedOptions["encryption-module"], Is.EqualTo("gpg"));
+            Assert.That(storedOptions.ContainsKey("passphrase"), Is.True);
+            Assert.That(storedOptions.ContainsKey("passphrase-salt"), Is.True);
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task VerifyOptionsAllowsChangingWritePathValuesAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+
+            var originalOptions = new Options(new Dictionary<string, string?>
+            {
+                { "prefix", "original-prefix" },
+                { "blocksize", "16kb" },
+                { "dblock-size", "25mb" },
+                { "compression-module", "zip" },
+                { "encryption-module", "aes" },
+                { "passphrase", "secret" }
+            });
+
+            await Utility.VerifyOptionsAndUpdateDatabaseAsync(db, originalOptions, CancellationToken.None);
+
+            var changedOptions = new Options(new Dictionary<string, string?>
+            {
+                { "prefix", "changed-prefix" },
+                { "blocksize", "16kb" },
+                { "dblock-size", "100mb" },
+                { "compression-module", "7z" },
+                { "encryption-module", "gpg" },
+                { "passphrase", "secret" }
+            });
+
+            await Utility.VerifyOptionsAndUpdateDatabaseAsync(db, changedOptions, CancellationToken.None);
+
+            var storedOptions = await db.GetDbOptionsAsync(CancellationToken.None);
+            Assert.That(storedOptions["prefix"], Is.EqualTo("changed-prefix"));
+            Assert.That(storedOptions["dblock-size"], Is.EqualTo(changedOptions.VolumeSize.ToString()));
+            Assert.That(storedOptions["compression-module"], Is.EqualTo("7z"));
+            Assert.That(storedOptions["encryption-module"], Is.EqualTo("gpg"));
+            Assert.That(storedOptions["blocksize"], Is.EqualTo(originalOptions.Blocksize.ToString()));
+
+            var restoredOptions = new Options(new Dictionary<string, string?>());
+            await Utility.UpdateOptionsFromDbAsync(db, restoredOptions, CancellationToken.None);
+            Assert.That(restoredOptions.Prefix, Is.EqualTo("changed-prefix"));
+            Assert.That(restoredOptions.VolumeSize, Is.EqualTo(changedOptions.VolumeSize));
+            Assert.That(restoredOptions.CompressionModule, Is.EqualTo("7z"));
+            Assert.That(restoredOptions.EncryptionModule, Is.EqualTo("gpg"));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task VerifyOptionsThrowsWhenChangingBlockHashAsync()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+
+            await Utility.VerifyOptionsAndUpdateDatabaseAsync(db, new Options(new Dictionary<string, string?>
+            {
+                { "block-hash-algorithm", Library.Utility.HashFactory.SHA256 },
+                { "dblock-size", "25mb" },
+                { "passphrase", "secret" }
+            }), CancellationToken.None);
+
+            var changedOptions = new Options(new Dictionary<string, string?>
+            {
+                { "block-hash-algorithm", Library.Utility.HashFactory.SHA512 },
+                { "dblock-size", "100mb" },
+                { "passphrase", "secret" }
+            });
+
+            var ex = Assert.ThrowsAsync<UserInformationException>(async () =>
+                await Utility.VerifyOptionsAndUpdateDatabaseAsync(db, changedOptions, CancellationToken.None));
+            Assert.That(ex?.HelpID, Is.EqualTo("ParameterChangeNotSupported"));
+
+            var storedOptions = await db.GetDbOptionsAsync(CancellationToken.None);
+            Assert.That(storedOptions["blockhash"], Is.EqualTo(Library.Utility.HashFactory.SHA256));
+            Assert.That(storedOptions["dblock-size"], Is.EqualTo(new Options(new Dictionary<string, string?> { { "dblock-size", "25mb" } }).VolumeSize.ToString()));
+        }
+
+        [Test]
+        [Category("Utility")]
+        public async Task PersistOptionsToDatabaseRemovesStaleEncryptionMarkersForUnencryptedBackup_Async()
+        {
+            using var tempDb = new TempFile();
+            await using var db = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "test", true, null, CancellationToken.None);
+            await db.SetDbOptionsAsync(new Dictionary<string, string>
+            {
+                { "compression-module", "zip" },
+                { "encryption-module", "aes" },
+                { "passphrase", "old-hash" },
+                { "passphrase-salt", "v1:oldsalt" },
+                { "unrelated-key", "keep-me" }
+            }, CancellationToken.None);
+            await db.Transaction.CommitAsync(CancellationToken.None);
+
+            var options = new Options(new Dictionary<string, string?>
+            {
+                { "dbpath", tempDb },
+                { "compression-module", "zip" },
+                { "no-encryption", bool.TrueString }
+            });
+
+            await Utility.PersistOptionsToDatabaseWithoutValidationAsync(tempDb, options, "UnitTestPersistOptions", CancellationToken.None);
+
+            await using var reopened = await LocalDatabase.CreateLocalDatabaseAsync(tempDb, "verify", true, null, CancellationToken.None);
+            var storedOptions = await reopened.GetDbOptionsAsync(CancellationToken.None);
+
+            Assert.That(storedOptions["compression-module"], Is.EqualTo("zip"));
+            Assert.That(storedOptions["passphrase"], Is.EqualTo("no-encryption"));
+            Assert.That(storedOptions.ContainsKey("encryption-module"), Is.False);
+            Assert.That(storedOptions.ContainsKey("passphrase-salt"), Is.False);
+            Assert.That(storedOptions["unrelated-key"], Is.EqualTo("keep-me"));
+        }
+    }
+}

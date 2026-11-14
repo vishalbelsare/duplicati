@@ -1,9 +1,31 @@
-﻿using System;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Main.Database;
+using Duplicati.Library.Main.Database.Local;
 using Duplicati.Library.Main.Volumes;
 using Duplicati.Library.Utility;
 
@@ -16,79 +38,94 @@ namespace Duplicati.Library.Main.Operation
         /// </summary>
         private static readonly string LOGTAG = Logging.Log.LogTagFromType<ListFilesHandler>();
 
-        private readonly string m_backendurl;
         private readonly Options m_options;
         private readonly ListResults m_result;
 
-        public ListFilesHandler(string backend, Options options, ListResults result)
+        public ListFilesHandler(Options options, ListResults result)
         {
-            m_backendurl = backend;
             m_options = options;
             m_result = result;
         }
 
-        public void Run(IEnumerable<string> filterstrings = null, Library.Utility.IFilter compositefilter = null)
+        public async Task RunAsync(IBackendManager backendManager, IEnumerable<string> filterstrings, IFilter compositefilter)
         {
-            var parsedfilter = new Library.Utility.FilterExpression(filterstrings);
-            var filter = Library.Utility.JoinedFilterExpression.Join(parsedfilter, compositefilter);
-            var simpleList = !((filter is FilterExpression expression && expression.Type == Library.Utility.FilterType.Simple) || m_options.AllVersions);
+            var cancellationToken = m_result.TaskControl.ProgressToken;
+            var parsedfilter = new FilterExpression(filterstrings);
+            var filter = JoinedFilterExpression.Join(parsedfilter, compositefilter);
+            var simpleList = !((filter is FilterExpression expression && expression.Type == FilterType.Simple) || m_options.AllVersions);
 
             //Use a speedy local query
             if (!m_options.NoLocalDb && System.IO.File.Exists(m_options.Dbpath))
-                using (var db = new Database.LocalListDatabase(m_options.Dbpath))
+                await using (var db = await LocalListDatabase.CreateAsync(m_options.Dbpath, null, m_result.TaskControl.ProgressToken).ConfigureAwait(false))
                 {
-                    m_result.SetDatabase(db);
-                    using (var filesets = db.SelectFileSets(m_options.Time, m_options.Version))
+                    await using var filesets = await db.SelectFileSetsAsync(m_options.Time, m_options.Version, m_result.TaskControl.ProgressToken).ConfigureAwait(false);
+                    if (!filter.Empty)
                     {
-                        if (!filter.Empty)
+                        if (simpleList || (m_options.ListFolderContents && !m_options.AllVersions))
                         {
-                            if (simpleList || (m_options.ListFolderContents && !m_options.AllVersions))
-                            {
-                                filesets.TakeFirst();
-                            }
+                            await filesets
+                                .TakeFirstAsync(m_result.TaskControl.ProgressToken)
+                                .ConfigureAwait(false);
                         }
-
-                        IEnumerable<Database.LocalListDatabase.IFileversion> files;
-                        if (m_options.ListFolderContents)
-                        {
-                            files = filesets.SelectFolderContents(filter);
-                        }
-                        else if (m_options.ListPrefixOnly)
-                        {
-                            files = filesets.GetLargestPrefix(filter);
-                        }
-                        else if (filter.Empty)
-                        {
-                            files = null;
-                        }
-                        else
-                        {
-                            files = filesets.SelectFiles(filter);
-                        }
-
-                        if (m_options.ListSetsOnly)
-                        {
-                            m_result.SetResult(
-                                filesets.QuickSets.Select(x => new ListResultFileset(x.Version, x.IsFullBackup, x.Time, x.FileCount, x.FileSizes)).ToArray(),
-                                null
-                            );
-                        }
-                        else
-                        {
-                            m_result.SetResult(
-                                filesets.Sets.Select(x =>
-                                    new ListResultFileset(x.Version, x.IsFullBackup, x.Time, x.FileCount, x.FileSizes)).ToArray(),
-                                files == null
-                                    ? null
-                                    : (from n in files
-                                       select (Duplicati.Library.Interface.IListResultFile)(new ListResultFile(n.Path,
-                                           n.Sizes.ToArray())))
-                                    .ToArray()
-                            );
-                        }
-
-                        return;
                     }
+
+                    IAsyncEnumerable<LocalListDatabase.IFileversion> files;
+                    if (m_options.ListFolderContents)
+                    {
+                        files = filesets.SelectFolderContentsAsync(filter, m_result.TaskControl.ProgressToken);
+                    }
+                    else if (m_options.ListPrefixOnly)
+                    {
+                        files = filesets.GetLargestPrefixAsync(filter, m_result.TaskControl.ProgressToken);
+                    }
+                    else if (filter.Empty)
+                    {
+                        files = null;
+                    }
+                    else
+                    {
+                        files = filesets.SelectFilesAsync(filter, m_result.TaskControl.ProgressToken);
+                    }
+
+                    if (m_options.ListSetsOnly)
+                    {
+                        m_result.SetResult(
+                            await filesets
+                                .QuickSetsAsync(m_result.TaskControl.ProgressToken)
+                                .Select(x => new ListResultFileset(x.Version, x.IsFullBackup, x.Time, x.FileCount, x.FileSizes, x.Label))
+                                .ToArrayAsync(cancellationToken: m_result.TaskControl.ProgressToken)
+                                .ConfigureAwait(false),
+                            null
+                        );
+                    }
+                    else
+                    {
+                        m_result.SetResult(
+                            await filesets
+                                .SetsAsync(m_result.TaskControl.ProgressToken)
+                                .Select(x => new ListResultFileset(x.Version, x.IsFullBackup, x.Time, x.FileCount, x.FileSizes, x.Label))
+                                .ToArrayAsync(cancellationToken: m_result.TaskControl.ProgressToken)
+                                .ConfigureAwait(false),
+                            files == null
+                                ? null
+                                :
+                                await files.Select(async n =>
+                                    new ListResultFile(
+                                        n.Path,
+                                        await n
+                                            .SizesAsync(m_result.TaskControl.ProgressToken)
+                                            .ToArrayAsync(cancellationToken: m_result.TaskControl.ProgressToken)
+                                            .ConfigureAwait(false)
+                                    )
+                                )
+                                    .Select(x => x.Result)
+                                    .Cast<IListResultFile>()
+                                    .ToArrayAsync(cancellationToken: m_result.TaskControl.ProgressToken)
+                                    .ConfigureAwait(false)
+                        );
+                    }
+
+                    return;
                 }
 
             Logging.Log.WriteInformationMessage(LOGTAG, "NoLocalDatabase", "No local database, accessing remote store");
@@ -100,17 +137,15 @@ namespace Duplicati.Library.Main.Operation
                 throw new UserInformationException("Listing prefixes is not supported without a local database, consider using the \"repair\" option to rebuild the database.", "PrefixListingRequiresLocalDatabase");
 
             // Otherwise, grab info from remote location
-            using (var tmpdb = new Library.Utility.TempFile())
-            using (var db = new Database.LocalDatabase(tmpdb, "List", true))
-            using (var backend = new BackendManager(m_backendurl, m_options, m_result.BackendWriter, db))
+            using (var tmpdb = new TempFile())
+            await using (var db = await LocalDatabase.CreateLocalDatabaseAsync(tmpdb, "List", true, null, m_result.TaskControl.ProgressToken).ConfigureAwait(false))
             {
-                m_result.SetDatabase(db);
-
-                var filteredList = ParseAndFilterFilesets(backend.List(), m_options);
+                var filteredList = ParseAndFilterFilesets(await backendManager.ListAsync(null, cancellationToken).ConfigureAwait(false), m_options);
                 if (filteredList.Count == 0)
                     throw new UserInformationException("No filesets found on remote target", "EmptyRemoteFolder");
 
-                var numberSeq = CreateResultSequence(filteredList, backend, m_options);
+                var numberSeq = await CreateResultSequenceAsync(filteredList, backendManager, m_options, cancellationToken)
+                    .ConfigureAwait(false);
                 if (filter.Empty)
                 {
                     m_result.SetResult(numberSeq, null);
@@ -122,46 +157,53 @@ namespace Duplicati.Library.Main.Operation
                 filteredList.RemoveAt(0);
                 Dictionary<string, List<long>> res;
 
-                if (m_result.TaskControlRendevouz() == TaskControlState.Stop)
+                if (!await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
                     return;
 
-                using (var tmpfile = backend.Get(firstEntry.File.Name, firstEntry.File.Size, null))
-                using (var rd = new Volumes.FilesetVolumeReader(RestoreHandler.GetCompressionModule(firstEntry.File.Name), tmpfile, m_options))
-                    if (simpleList)
-                    {
-                        m_result.SetResult(
-                            numberSeq.Take(1),
-                            (from n in rd.Files
-                             where Library.Utility.FilterExpression.Matches(filter, n.Path)
-                             orderby n.Path
-                             select new ListResultFile(n.Path, new long[] { n.Size }))
-                                  .ToArray()
-                        );
+                using (var tmpfile = await backendManager.GetAsync(firstEntry.File.Name, null, firstEntry.File.Size, allowParityRepair: true, cancellationToken).ConfigureAwait(false))
+                {
+                    VolumeReaderBase.UpdateOptionsFromManifest(RestoreHandler.GetCompressionModule(firstEntry.File.Name), tmpfile, m_options);
+                    using (var rd = new FilesetVolumeReader(RestoreHandler.GetCompressionModule(firstEntry.File.Name), tmpfile, m_options))
+                        if (simpleList)
+                        {
+                            m_result.SetResult(
+                                numberSeq.Take(1),
+                                (from n in rd.Files
+                                 where Library.Utility.FilterExpression.Matches(filter, n.Path)
+                                 orderby n.Path
+                                 select new ListResultFile(n.Path, new long[] { n.Size }))
+                                      .ToArray()
+                            );
 
-                        return;
-                    }
-                    else
-                    {
-                        res = rd.Files
-                              .Where(x => Library.Utility.FilterExpression.Matches(filter, x.Path))
-                              .ToDictionary(
-                                    x => x.Path,
-                                    y =>
-                                    {
-                                        var lst = new List<long>();
-                                        lst.Add(y.Size);
-                                        return lst;
-                                    },
-                                    Library.Utility.Utility.ClientFilenameStringComparer
-                              );
-                    }
+                            return;
+                        }
+                        else
+                        {
+                            res = rd.Files
+                                  .Where(x => Library.Utility.FilterExpression.Matches(filter, x.Path))
+                                  .ToDictionary(
+                                        x => x.Path,
+                                        y =>
+                                        {
+                                            var lst = new List<long>();
+                                            lst.Add(y.Size);
+                                            return lst;
+                                        },
+                                        // The paths are told apart by their exact casing, as in the database
+                                        System.StringComparer.Ordinal
+                                  );
+                        }
+                }
 
                 long flindex = 1;
-                foreach (var flentry in filteredList)
-                    using (var tmpfile = backend.Get(flentry.Value.File.Name, flentry.Value.File == null ? -1 : flentry.Value.File.Size, null))
-                    using (var rd = new Volumes.FilesetVolumeReader(flentry.Value.CompressionModule, tmpfile, m_options))
+                var filteredListMap = filteredList.ToDictionary(x => x.Value.File.Name, x => x.Value);
+                await foreach (var (tmpfile, hash, size, name) in backendManager.GetFilesOverlappedAsync(filteredList.Select(x => new RemoteVolumeMapper(x.Value)), allowParityRepair: true, cancellationToken).ConfigureAwait(false))
+                {
+                    var flentry = filteredListMap[name];
+                    using (tmpfile)
+                    using (var rd = new FilesetVolumeReader(flentry.CompressionModule, tmpfile, m_options))
                     {
-                        if (m_result.TaskControlRendevouz() == TaskControlState.Stop)
+                        if (!await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
                             return;
 
                         foreach (var p in from n in rd.Files where Library.Utility.FilterExpression.Matches(filter, n.Path) select n)
@@ -183,6 +225,7 @@ namespace Duplicati.Library.Main.Operation
 
                         flindex++;
                     }
+                }
 
                 m_result.SetResult(
                     numberSeq,
@@ -200,26 +243,33 @@ namespace Duplicati.Library.Main.Operation
                               where p != null && p.FileType == RemoteVolumeType.Files
                               orderby p.Time descending
                               select p).ToArray();
-            var filelistFilter = RestoreHandler.FilterNumberedFilelist(options.Time, options.Version);
-            return filelistFilter(parsedlist).ToList();
+            return RestoreHandler.FilterNumberedFilelist(parsedlist, options.Time, options.Version).ToList();
         }
 
-        private static IEnumerable<IListResultFileset> CreateResultSequence(IEnumerable<KeyValuePair<long, IParsedVolume>> filteredList, BackendManager backendManager, Options options)
+        private class RemoteVolumeMapper(IParsedVolume Volume) : IRemoteVolume
         {
-            List<IListResultFileset> list = new List<IListResultFileset>();
-            foreach (KeyValuePair<long, IParsedVolume> entry in filteredList)
+            public string Name => Volume.File.Name;
+            public string Hash => null;
+            public long Size => Volume.File.Size;
+        }
+
+        private static async Task<IEnumerable<IListResultFileset>> CreateResultSequenceAsync(IEnumerable<KeyValuePair<long, IParsedVolume>> filteredList, IBackendManager backendManager, Options options, CancellationToken cancelToken)
+        {
+            var list = new List<IListResultFileset>();
+            var map = filteredList.ToDictionary(x => x.Value.File.Name, x => x);
+            await foreach (var (file, hash, size, name) in backendManager.GetFilesOverlappedAsync(filteredList.Select(x => new RemoteVolumeMapper(x.Value)), allowParityRepair: true, cancelToken).ConfigureAwait(false))
             {
-                AsyncDownloader downloader = new AsyncDownloader(new IRemoteVolume[] {new RemoteVolume(entry.Value.File)}, backendManager);
-                foreach (IAsyncDownloadedFile file in downloader)
+                // We must obtain the partial/full status from the fileset file in the dlist files.
+                // Without this, the restore dialog will show all versions as full, or all versions
+                // as partial. While the dlist files are already downloaded elsewhere, doing so again
+                // here is the most direct way to obtain the partial/full status without a major
+                // refactoring. Since restoring directly from the backend files should be a relatively
+                // rare event, we can work on improving the performance later.
+                using (file)
                 {
-                    // We must obtain the partial/full status from the fileset file in the dlist files.
-                    // Without this, the restore dialog will show all versions as full, or all versions
-                    // as partial.  While the dlist files are already downloaded elsewhere, doing so again
-                    // here is the most direct way to obtain the partial/full status without a major
-                    // refactoring.  Since restoring directly from the backend files should be a relatively
-                    // rare event, we can work on improving the performance later.
-                    VolumeBase.FilesetData filesetData = VolumeReaderBase.GetFilesetData(entry.Value.CompressionModule, file.TempFile, options);
-                    list.Add(new ListResultFileset(entry.Key, filesetData.IsFullBackup ? BackupType.FULL_BACKUP : BackupType.PARTIAL_BACKUP, entry.Value.Time.ToLocalTime(), -1, -1));
+                    var ent = map[name];
+                    var filesetData = VolumeReaderBase.GetFilesetData(ent.Value.CompressionModule, file, options);
+                    list.Add(new ListResultFileset(ent.Key, filesetData.IsFullBackup ? BackupType.FULL_BACKUP : BackupType.PARTIAL_BACKUP, ent.Value.Time.ToLocalTime(), -1, -1));
                 }
             }
 

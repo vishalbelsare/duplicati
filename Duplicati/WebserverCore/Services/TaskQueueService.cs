@@ -1,0 +1,168 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+using Duplicati.Server;
+using Duplicati.WebserverCore.Abstractions;
+using Duplicati.WebserverCore.Dto;
+using Duplicati.WebserverCore.Exceptions;
+
+namespace Duplicati.WebserverCore.Services;
+
+/// <summary>
+/// Provides functionality to manage and retrieve information about tasks in the task queue.
+/// </summary>
+/// <param name="queueRunnerService">The service responsible for running and managing tasks in the queue.</param>
+public class TaskQueueService(IQueueRunnerService queueRunnerService) : ITaskQueueService
+{
+
+    /// <inheritdoc/>
+    public GetTaskStateDto GetTaskInfo(long taskid)
+    {
+        // A task moves from the queue to running, so the queue is read first. In the other order
+        // a task that starts between the two reads is in neither, and would be reported as unknown.
+        var tasks = queueRunnerService.GetCurrentTasks();
+        var task = queueRunnerService.GetCurrentTask();
+
+        if (task != null && task.TaskID == taskid)
+        {
+            // The runner stamps TaskFinished before it clears the current task, so a task
+            // can be current and finished at the same time. A task that fails is stamped
+            // before its failure is cached, so until the result is cached the task is still
+            // reported as running, without TaskFinished, as a task without a result would
+            // otherwise be reported as completed.
+            var finished = task.TaskFinished == null ? null : queueRunnerService.GetCachedTaskResults(taskid);
+            if (finished == null)
+                return new Dto.GetTaskStateDto("Running", taskid, task.TaskStarted, null);
+
+            // Report the cached result the way GetTaskQueue does, so a client that stops
+            // waiting at TaskFinished sees the outcome and not "Running" without one
+            return new GetTaskStateDto(
+                Status: finished.Exception == null ? "Completed" : "Failed",
+                ID: taskid,
+                TaskStarted: task.TaskStarted,
+                TaskFinished: task.TaskFinished,
+                ErrorMessage: finished.Exception?.Message ?? finished.ErrorMessage,
+                Exception: finished.Exception?.ToString()
+            );
+        }
+
+        // The list of waiting tasks was read first, so a task in it can have run to the end since.
+        // A task with a result has finished, whatever the list says.
+        var res = queueRunnerService.GetCachedTaskResults(taskid);
+        if (res != null)
+            return new GetTaskStateDto(
+                Status: res.Exception == null ? "Completed" : "Failed",
+                ID: taskid,
+                TaskStarted: res.TaskStarted,
+                TaskFinished: res.TaskFinished,
+                ErrorMessage: res.Exception?.Message ?? res.ErrorMessage,
+                Exception: res.Exception?.ToString()
+            );
+
+        if (tasks.FirstOrDefault(x => x.TaskID == taskid) == null)
+            throw new NotFoundException("No such task found");
+
+        return new GetTaskStateDto("Waiting", taskid, null, null);
+    }
+
+    /// <inheritdoc/>
+    public IEnumerable<GetTaskStateDto> GetTaskQueue()
+    {
+        var cur = queueRunnerService.GetCurrentTask();
+        var n = queueRunnerService.GetCurrentTasks();
+
+        if (cur != null)
+            n.Insert(0, cur);
+
+        return n.Select(x =>
+        {
+            var res = queueRunnerService.GetCachedTaskResults(x.TaskID);
+
+            // The task at the front is the running one; the ones behind it have not started.
+            // A finished task (the runner stamps TaskFinished before clearing it) is reported
+            // from its result once that is cached, the way GetTaskInfo does
+            var finished = x.TaskFinished != null && res != null;
+            var status = finished
+                ? (res!.Exception == null ? "Completed" : "Failed")
+                : x == cur ? "Running" : "Waiting";
+
+            return new GetTaskStateDto(
+                Status: status,
+                ID: x.TaskID,
+                TaskStarted: x.TaskStarted,
+                TaskFinished: finished ? x.TaskFinished : null,
+                ErrorMessage: res?.Exception?.Message ?? res?.ErrorMessage,
+                Exception: res?.Exception?.ToString()
+            );
+        });
+    }
+
+    /// <inheritdoc/>
+    public IEnumerable<SystemStatusQueueItemDto> GetTaskQueueDetails()
+    {
+        var cur = queueRunnerService.GetCurrentTask();
+        var n = queueRunnerService.GetCurrentTasks();
+
+        if (cur != null)
+            n.Insert(0, cur);
+
+        return n.Select(x => new SystemStatusQueueItemDto(
+            TaskID: x.TaskID,
+            BackupID: x.BackupID,
+            BackupName: (x as Runner.IRunnerData)?.Backup?.Name,
+            Operation: x.Operation.ToString(),
+            Status: x == cur ? "Running" : "Waiting",
+            TaskStarted: x.TaskStarted
+        )).ToList();
+    }
+
+    /// <inheritdoc/>
+    public Task StopTaskAsync(long taskid)
+        => StopOrAbortTaskAsync(taskid, false);
+
+    /// <inheritdoc/>
+    public Task AbortTaskAsync(long taskid)
+        => StopOrAbortTaskAsync(taskid, true);
+
+    /// <summary>
+    /// Stops or aborts a task based on the provided task ID.
+    /// </summary>
+    /// <param name="taskid">The ID of the task to stop or abort.</param>
+    /// <param name="abort">If true, the task will be aborted; otherwise, it will be stopped gracefully.</param>
+    private async Task StopOrAbortTaskAsync(long taskid, bool abort)
+    {
+        var task = queueRunnerService.GetCurrentTask();
+        var tasks = queueRunnerService.GetCurrentTasks();
+
+        if (task != null)
+            tasks.Insert(0, task);
+
+        task = tasks.FirstOrDefault(x => x.TaskID == taskid);
+        if (task == null)
+            throw new NotFoundException("No such task found");
+
+        queueRunnerService.CancelCurrentTaskLockWait(task.TaskID);
+
+        if (abort)
+            await task.AbortAsync().ConfigureAwait(false);
+        else
+            await task.StopAsync().ConfigureAwait(false);
+    }
+}

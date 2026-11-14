@@ -1,0 +1,39 @@
+// Copyright (c) 2026 Duplicati Inc. All rights reserved.
+
+using Duplicati.Library.Common.IO;
+using Duplicati.Library.Interface;
+using Google.Apis.Drive.v3;
+using System.Runtime.CompilerServices;
+
+namespace Duplicati.Proprietary.GoogleWorkspace.SourceItems;
+
+internal class SharedDrivesSourceEntry(SourceProvider provider, string parentPath, string? userId, bool userIsInactive, DriveService driveService)
+    : MetaEntryBase(Util.AppendDirSeparator(SystemIO.IO_OS.PathCombine(parentPath, "Shared Drives")), null, null)
+{
+    public override IAsyncEnumerable<ISourceProviderEntry> Enumerate(CancellationToken cancellationToken)
+        => EnumerateSharedDrives(provider, this.Path, userId, userIsInactive, driveService, cancellationToken);
+
+    public static async IAsyncEnumerable<ISourceProviderEntry> EnumerateSharedDrives(SourceProvider provider, string path, string? userId, bool userIsInactive, DriveService driveService, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var drive in SourceProvider.ListAllSharedDrivesAsync(driveService, cancellationToken).ConfigureAwait(false))
+        {
+            if (cancellationToken.IsCancellationRequested) yield break;
+
+            if (provider.LicenseApprovedForEntry(path, GoogleRootType.SharedDrives, drive.Id, increment: false, countsAsSeat: true))
+                yield return new SharedDriveSourceEntry(provider, path, path, userId, userIsInactive, drive, driveService, null);
+        }
+    }
+
+    public override Task<Dictionary<string, string?>> GetMinorMetadata(CancellationToken cancellationToken)
+    {
+        return Task.FromResult(new Dictionary<string, string?>
+        {
+            { "gsuite:v", "1" },
+            { "gsuite:Type", SourceItemType.SharedDrives.ToString() },
+            { "gsuite:Name", "Shared Drives" },
+            { "gsuite:Id", "Shared Drives" }
+        }
+        .Where(kv => !string.IsNullOrEmpty(kv.Value))
+        .ToDictionary(kv => kv.Key, kv => kv.Value));
+    }
+}

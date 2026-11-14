@@ -1,19 +1,133 @@
-﻿using System;
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Linq;
-using Duplicati.Library.Common;
+using System.Threading;
+using System.Threading.Tasks;
+using CoCoL;
+using Duplicati.Library.AutoUpdater;
+using Duplicati.Library.Certificates;
+using Duplicati.Library.ChangeTracking;
 using Duplicati.Library.Common.IO;
+using Duplicati.Library.Crashlog;
+using Duplicati.Library.Encryption;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Logging;
+using Duplicati.Library.Main;
+using Duplicati.Library.Main.Database;
+using Duplicati.Library.Utility;
+using Duplicati.Server.Database;
+using Duplicati.WebserverCore;
+using Duplicati.WebserverCore.Abstractions;
+using Duplicati.WebserverCore.Services;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Duplicati.Server
 {
     public class Program
     {
+        /// <summary>The commandline argument name for parameters file.</summary>
+        private const string PARAMETERS_FILE_OPTION = "parameters-file";
+        /// <summary>Alternative names for the parameters file option.</summary>
+        private static readonly string[] PARAMETERS_FILE_OPTION_EXTRAS = ["parameterfile"];
+        /// <summary>The commandline argument name for ping-pong keepalive.</summary>
+        private const string PING_PONG_KEEPALIVE_OPTION = "ping-pong-keepalive";
+        /// <summary>The commandline argument name for Windows event log.</summary>
+        private const string WINDOWS_EVENTLOG_OPTION = "windows-eventlog";
+        /// <summary>The commandline argument name for Windows event log level.</summary>
+        private const string WINDOWS_EVENTLOG_LEVEL_OPTION = "windows-eventlog-level";
+        /// <summary>The commandline argument name for disabling database encryption.</summary>
+        private const string DISABLE_DB_ENCRYPTION_OPTION = "disable-db-encryption";
+        /// <summary>The commandline argument name for disabling the default secret provider.</summary>
+        private const string DISABLE_DEFAULT_SECRET_PROVIDER_OPTION = SecretProviderHelper.DISABLE_DEFAULT_SECRET_PROVIDER_OPTION;
+        /// <summary>The commandline argument name for requiring database encryption key.</summary>
+        private const string REQUIRE_DB_ENCRYPTION_KEY_OPTION = "require-db-encryption-key";
+        /// <summary>The commandline argument name for settings encryption key.</summary>
+        private const string SETTINGS_ENCRYPTION_KEY_OPTION = "settings-encryption-key";
+        /// <summary>The commandline argument name for disabling update check.</summary>
+        private const string DISABLE_UPDATE_CHECK_OPTION = "disable-update-check";
+        private const string DISABLE_FILE_WATCHER_OPTION = "disable-file-watcher";
+        private const string FILE_WATCHER_FLUSH_INTERVAL_OPTION = "file-watcher-flush-interval";
+        private const string FILE_WATCHER_HIGH_WATER_OPTION = "file-watcher-high-water";
+        private const string FILE_WATCHER_MAX_CHANGES_OPTION = "file-watcher-max-changes";
+        private const string FILE_WATCHER_GRACE_DELAY_OPTION = "file-watcher-grace-delay";
+        /// <summary>The commandline argument name for registering remote control.</summary>
+        private const string REGISTER_REMOTE_CONTROL_OPTION = "register-remote-control";
+        /// <summary>The commandline argument name for forcing remote control reregistration.</summary>
+        private const string REGISTER_REMOTE_CONTROL_REREGISTER_OPTION = "register-remote-control-force";
+        /// <summary>The commandline argument name for allowed backend modules.</summary>
+        private const string ALLOWED_BACKEND_MODULES = "allowed-backend-modules";
+        /// <summary>The commandline argument name for allowed encryption modules.</summary>
+        private const string ALLOWED_ENCRYPTION_MODULES = "allowed-encryption-modules";
+        /// <summary>The commandline argument name for allowed compression modules.</summary>
+        private const string ALLOWED_COMPRESSION_MODULES = "allowed-compression-modules";
+        /// <summary>The commandline argument name for log file.</summary>
+        private const string LOG_FILE_OPTION = "log-file";
+        /// <summary> Notification action for CA key stored in unencrypted database.</summary>
+        private const string NOTIFICATION_CA_KEY_UNENCRYPTED_DATABASE = "config:issue:ca-key-unencrypted-database";
+        /// <summary>Notification action for certificate renewal failure.</summary>
+        private const string NOTIFICATION_CERTIFICATE_RENEWAL_FAILED = "config:issue:certificate-renewal-failed";
+        /// <summary>The commandline argument name for log level.</summary>
+        private const string LOG_LEVEL_OPTION = "log-level";
+        /// <summary>The commandline argument name for log console.</summary>
+        private const string LOG_CONSOLE_OPTION = "log-console";
+        /// <summary>The commandline argument name for temp directory.</summary>
+        private const string TEMPDIR_OPTION = "tempdir";
+        /// <summary>The commandline argument name for forcing the locale.</summary>
+        public const string FORCE_LOCALE_OPTION = "force-locale";
+        /// <summary>The commandline argument name for log retention.</summary>
+        private const string LOG_RETENTION_OPTION = "log-retention";
+        /// <summary>The commandline argument name for help.</summary>
+        private const string HELP_OPTION = "help";
 
-        private static readonly List<string> AlternativeHelpStrings = new List<string> { "help", "/help", "usage", "/usage", "--help" };
+        /// <summary>
+        /// The exit code for init password success
+        /// </summary>
+        public const int EXITCODE_INITPASSWORD_SUCCESS = 102;
+        /// <summary>
+        /// The exit code for init password failure
+        /// </summary>
+        public const int EXITCODE_INITPASSWORD_FAILED = 103;
+        /// <summary>
+        /// The exit code when the server crashed, the same code a crash while starting returns
+        /// </summary>
+        public const int EXITCODE_CRASHED = 100;
 
-        private static readonly List<string> ParameterFileOptionStrings = new List<string> { "parameters-file", "parameterfile" };
+        /// <summary>
+        /// The name used in the secret provider for the database encryption key
+        /// </summary>
+        private const string DATABASE_SECRET_VALUE_NAME = "duplicati-server-encryption-key";
 
+#if DEBUG
+        private const bool DEBUG_MODE = true;
+#else
+        private const bool DEBUG_MODE = false;
+#endif
+
+        /// <summary>
+        /// Options to be ignored when validating the command line
+        /// </summary>
+        public static readonly HashSet<string> ValidationIgnoredOptions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         /// <summary>
         /// The log tag for messages from this class
         /// </summary>
@@ -21,22 +135,12 @@ namespace Duplicati.Server
         /// <summary>
         /// The path to the directory that contains the main executable
         /// </summary>
-        public static readonly string StartupPath = Duplicati.Library.AutoUpdater.UpdaterManager.InstalledBaseDir;
+        public static readonly string StartupPath = Duplicati.Library.AutoUpdater.UpdaterManager.INSTALLATIONDIR;
 
         /// <summary>
-        /// The name of the environment variable that holds the path to the data folder used by Duplicati
+        /// The environment variable prefix
         /// </summary>
-        private static readonly string DATAFOLDER_ENV_NAME = Duplicati.Library.AutoUpdater.AutoUpdateSettings.AppName.ToUpper(CultureInfo.InvariantCulture) + "_HOME";
-
-        /// <summary>
-        /// The environment variable that holds the database key used to encrypt the SQLite database
-        /// </summary>
-        private static readonly string DB_KEY_ENV_NAME = Duplicati.Library.AutoUpdater.AutoUpdateSettings.AppName.ToUpper(CultureInfo.InvariantCulture) + "_DB_KEY";
-
-        /// <summary>
-        /// Gets the folder where Duplicati data is stored
-        /// </summary>
-        public static string DataFolder { get; private set; }
+        private static readonly string ENV_NAME_PREFIX = AutoUpdateSettings.AppName.ToUpperInvariant();
 
         /// <summary>
         /// The single instance
@@ -44,354 +148,440 @@ namespace Duplicati.Server
         public static SingleInstance ApplicationInstance = null;
 
         /// <summary>
-        /// This is the only access to the database
-        /// </summary>
-        public static Database.Connection DataConnection;
-
-        /// <summary>
-        /// This is the lock to be used before manipulating the shared resources
-        /// </summary>
-        public static readonly object MainLock = new object();
-
-        /// <summary>
-        /// This is the scheduling thread
-        /// </summary>
-        public static Scheduler Scheduler;
-
-        /// <summary>
-        /// This is the working thread
-        /// </summary>
-        public static Duplicati.Library.Utility.WorkerThread<Runner.IRunnerData> WorkThread;
-
-        /// <summary>
-        /// List of completed task results
-        /// </summary>
-        public static readonly List<KeyValuePair<long, Exception>> TaskResultCache = new List<KeyValuePair<long, Exception>>();
-
-        /// <summary>
-        /// The maximum number of completed task results to keep in memory
-        /// </summary>
-        private static readonly int MAX_TASK_RESULT_CACHE_SIZE = 100;
-
-        /// <summary>
         /// The thread running the ping-pong handler
         /// </summary>
-        private static System.Threading.Thread PingPongThread;
-
-        /// <summary>
-        /// The path to the file that contains the current database
-        /// </summary>
-        private static string DatabasePath;
+        private static Thread PingPongThread;
 
         /// <summary>
         /// The controller interface for pause/resume and throttle options
         /// </summary>
-        public static LiveControls LiveControl;
+        public static LiveControls LiveControl { get => DuplicatiWebserver.Provider.GetRequiredService<LiveControls>(); }
 
         /// <summary>
-        /// The application exit event
+        /// Duplicati webserver instance
         /// </summary>
-        public static System.Threading.ManualResetEvent ApplicationExitEvent;
+        public static DuplicatiWebserver DuplicatiWebserver { get; set; }
 
         /// <summary>
-        /// The webserver instance
+        /// Callback to shutdown the modern webserver
         /// </summary>
-        private static WebServer.Server WebServer;
-
-        /// <summary>
-        /// The update poll thread.
-        /// </summary>
-        public static UpdatePollThread UpdatePoller;
+        private static void ShutdownModernWebserver()
+        {
+            DuplicatiWebserver.StopAsync().Await();
+        }
 
         /// <summary>
         /// An event that is set once the server is ready to respond to requests
         /// </summary>
-        public static readonly System.Threading.ManualResetEvent ServerStartedEvent = new System.Threading.ManualResetEvent(false);
+        public static readonly ManualResetEvent ServerStartedEvent = new ManualResetEvent(false);
 
         /// <summary>
-        /// The status event signaler, used to control long polling of status updates
+        /// Timer for purging temp files and log data
         /// </summary>
-        public static readonly EventPollNotify StatusEventNotifyer = new EventPollNotify();
-
-        /// <summary>
-        /// A delegate method for creating a copy of the current progress state
-        /// </summary>
-        public static Func<Duplicati.Server.Serialization.Interface.IProgressEventData> GenerateProgressState;
-
-        /// <summary>
-        /// An event ID that increases whenever the database is updated
-        /// </summary>
-        public static long LastDataUpdateID = 0;
-
-        /// <summary>
-        /// An event ID that increases whenever a notification is updated
-        /// </summary>
-        public static long LastNotificationUpdateID = 0;
-
-        /// <summary>
-        /// The log redirect handler
-        /// </summary>
-        public static readonly LogWriteHandler LogHandler = new LogWriteHandler();
-
-        /// <summary>
-        /// Used to check the origin of the web server (e.g. Tray icon or a stand alone Server)
-        /// </summary>
-        public static string Origin = "Server";
-
         private static System.Threading.Timer PurgeTempFilesTimer = null;
 
-        public static int ServerPort
-        {
-            get
-            {
-                return WebServer.Port;
-            }
-        }
-
-        public static bool IsFirstRun
-        {
-            get { return DataConnection.ApplicationSettings.IsFirstRun; }
-            set { DataConnection.ApplicationSettings.IsFirstRun = value; }
-        }
-
-        public static string StartedBy
-        {
-            get { return Origin; }
-            set { Origin = value; }
-        }
-
-        public static bool ServerPortChanged
-        {
-            get { return DataConnection.ApplicationSettings.ServerPortChanged; }
-            set { DataConnection.ApplicationSettings.ServerPortChanged = value; }
-        }
+        /// <summary>
+        /// Timer for checking certificate renewal
+        /// </summary>
+        private static System.Threading.Timer CertificateRenewalTimer = null;
 
         /// <summary>
         /// The main entry point for the application.
         /// </summary>
+        /// <param name="_args"> The command line arguments</param>
         [STAThread]
-        public static int Main(string[] args)
-        {
-            return Duplicati.Library.AutoUpdater.UpdaterManager.RunFromMostRecent(typeof(Program).GetMethod("RealMain"), args, Duplicati.Library.AutoUpdater.AutoUpdateStrategy.Never);
-        }
+        public static int Main(string[] _args)
+            => Main(null, _args);
 
-        public static int RealMain(string[] _args)
+        /// <summary>
+        /// The main entry point for the application.
+        /// </summary>
+        /// <param name="applicationSettings"> The application settings</param>
+        /// <param name="_args"> The command line arguments</param>
+        [STAThread]
+        public static int Main(IApplicationSettings applicationSettings, string[] _args)
         {
-            //If we are on Windows, append the bundled "win-tools" programs to the search path
-            //We add it last, to allow the user to override with other versions
-            if (Platform.IsClientWindows)
-            {
-                Environment.SetEnvironmentVariable("PATH",
-                    Environment.GetEnvironmentVariable("PATH") +
-                    System.IO.Path.PathSeparator.ToString() +
-                    System.IO.Path.Combine(
-                        System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location),
-                        "win-tools")
-                );
-            }
+            // Reset the started event and clear any stale webserver reference so that
+            // waiters (e.g. the agent's remote-control callbacks) do not observe a
+            // previous, now-stopped, instance when the local server is restarted.
+            ServerStartedEvent.Reset();
+            DuplicatiWebserver = null;
+
+            PreloadSettingsLoader.ConfigurePreloadSettings(ref _args, PackageHelper.NamedExecutable.Server, out var preloadDbSettings);
+
+            applicationSettings ??= new ApplicationSettings();
 
             //If this executable is invoked directly, write to console, otherwise throw exceptions
-            var writeToConsole = System.Reflection.Assembly.GetEntryAssembly() == System.Reflection.Assembly.GetExecutingAssembly();
+            var writeToConsoleOnException = applicationSettings.Origin == "Server";
+
+            // Prepared for the future, where we might want to have a silent console mode
+            var silentConsole = false;
+            var logMessageToConsole = (string message) => { if (!silentConsole) Console.WriteLine(message); };
 
             //Find commandline options here for handling special startup cases
             var args = new List<string>(_args);
-            var optionsWithFilter = Library.Utility.FilterCollector.ExtractOptions(new List<string>(args));
+            var optionsWithFilter = FilterCollector.ExtractOptions(new List<string>(args));
             var commandlineOptions = optionsWithFilter.Item1;
             var filter = optionsWithFilter.Item2;
 
-            if (_args.Select(s => s.ToLower()).Intersect(AlternativeHelpStrings.ConvertAll(x => x.ToLower())).Any())
+            if (HelpOptionExtensions.IsArgumentAnyHelpString(args))
             {
-                return ShowHelp(writeToConsole);
+                return ShowHelp(writeToConsoleOnException);
             }
 
             if (commandlineOptions.ContainsKey("tempdir") && !string.IsNullOrEmpty(commandlineOptions["tempdir"]))
             {
-                Library.Utility.SystemContextSettings.DefaultTempPath = commandlineOptions["tempdir"];
+                SystemContextSettings.DefaultTempPath = commandlineOptions["tempdir"];
             }
 
-            Library.Utility.SystemContextSettings.StartSession();
+            ApplyForcedLocale(commandlineOptions, logMessageToConsole);
 
-            var parameterFileOption = commandlineOptions.Keys.Select(s => s.ToLower())
-                .Intersect(ParameterFileOptionStrings.ConvertAll(x => x.ToLower())).FirstOrDefault();
+            SystemContextSettings.StartSession();
+
+            ApplyEnvironmentVariables(commandlineOptions);
+            ApplySecretProviderAsync(applicationSettings, commandlineOptions, CancellationToken.None).Await();
+
+            var parameterFileOption = PARAMETERS_FILE_OPTION_EXTRAS.Prepend(PARAMETERS_FILE_OPTION)
+                .FirstOrDefault(x => commandlineOptions.ContainsKey(x));
 
             if (parameterFileOption != null && !string.IsNullOrEmpty(commandlineOptions[parameterFileOption]))
             {
                 string filename = commandlineOptions[parameterFileOption];
                 commandlineOptions.Remove(parameterFileOption);
-                if (!ReadOptionsFromFile(filename, ref filter, args, commandlineOptions))
-                    return 100;
+                ReadOptionsFromFile(filename, ref filter, args, commandlineOptions);
             }
 
-            ConfigureLogging(commandlineOptions);
+            var logHandler = new LogWriteHandler();
+            using var logScope = ConfigureLogging(logHandler, commandlineOptions);
 
+            // Validate after logging is configured
+            CommandLineArgumentValidator.ValidateArguments(SupportedCommands, commandlineOptions, KnownDuplicateOptions, ValidationIgnoredOptions);
+
+            // Unload any modules that are not allowed
+            Library.DynamicLoader.BackendLoader.OnlyAllowBackends(commandlineOptions.GetValueOrDefault(ALLOWED_BACKEND_MODULES));
+            Library.DynamicLoader.EncryptionLoader.OnlyAllowModules(commandlineOptions.GetValueOrDefault(ALLOWED_ENCRYPTION_MODULES));
+            Library.DynamicLoader.CompressionLoader.OnlyAllowModules(commandlineOptions.GetValueOrDefault(ALLOWED_COMPRESSION_MODULES));
+
+
+            var crashed = false;
+            var terminated = false;
+            // Set when the webserver stops with an exception after it was started
+            var webserverFailed = false;
+            IQueueRunnerService queueRunner = null;
+            UpdatePollThread updatePollThread = null;
+            EventPollNotify eventPollNotify = null;
+            ISchedulerService scheduler = null;
+            IChangeTrackingService changeTracking = null;
             try
             {
+                // Opening the database can create or upgrade it, which a second server must not do
+                // while the first one uses it. The data folder is made first, locked down, as the
+                // instance lock would otherwise create it with the default permissions.
+                DataFolderManager.PrepareSecureDataFolder(applicationSettings.DataFolder, createIfMissing: true);
+                CreateApplicationInstance(applicationSettings.DataFolder, writeToConsoleOnException);
 
-                DataConnection = GetDatabaseConnection(commandlineOptions);
+                var connection = GetDatabaseConnection(applicationSettings, commandlineOptions, silentConsole, true);
 
-                if (!DataConnection.ApplicationSettings.FixedInvalidBackupId)
-                    DataConnection.FixInvalidBackupId();
+                if (!connection.ApplicationSettings.FixedInvalidBackupId)
+                    connection.FixInvalidBackupId();
 
-                CreateApplicationInstance(writeToConsole);
+                connection.ApplicationSettings.UpgradePasswordToKBDF();
 
-                StartOrStopUsageReporter();
+                if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_SUPPRESS_WELCOME_PAGE))
+                    connection.ApplicationSettings.SuppressWelcomePage();
 
-                AdjustApplicationSettings(commandlineOptions);
+                // Handle --configure-https option before starting the webserver
+                if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_CONFIGURE_HTTPS))
+                    HandleConfigureHttps(connection, commandlineOptions);
 
-                ApplicationExitEvent = new System.Threading.ManualResetEvent(false);
+                // Check for certificate renewal on startup (only for autogenerated certs)
+                var renewalResult = CheckAndRenewCertificate(connection);
+                if (renewalResult.RenewalFailedReason != null)
+                    RegisterRenewalFailedNotification(connection, renewalResult.RenewalFailedReason);
 
-                Library.AutoUpdater.UpdaterManager.OnError += (Exception obj) =>
+                applicationSettings.StartOrStopUsageReporter = () => StartOrStopUsageReporter(connection);
+                // Bit messy, but the callback needs the connection, and the connection needs the callback
+                connection.UpdateUsageReporterCallback(applicationSettings.StartOrStopUsageReporter);
+                applicationSettings.StartOrStopUsageReporter?.Invoke();
+
+                var adjustres = AdjustApplicationSettings(connection, commandlineOptions);
+                if (adjustres.HasValue)
+                    return adjustres.Value;
+
+                UpdaterManager.OnError += obj =>
                 {
-                    DataConnection.LogError(null, "Error in updater", obj);
+                    connection.LogError(null, "Error in updater", obj);
                 };
-                
-                UpdatePoller = new UpdatePollThread();
 
-                SetPurgeTempFilesTimer(commandlineOptions);
+                // Rewrite the sensitive fields before anything else can use the connection.
+                // Once the webserver is up, the scheduler re-reads every backup on each save,
+                // and the tray icon starts polling, both of which race the VACUUM at the end.
+                connection.ReWriteAllFieldsIfEncryptionChanged();
 
-                SetLiveControls();
+                DuplicatiWebserver = StartWebServerAsync(commandlineOptions, connection, logHandler, applicationSettings).Await();
 
-                SetWorkerThread();
+                connection.SetServiceProvider(DuplicatiWebserver.Provider);
+                queueRunner = DuplicatiWebserver.Provider.GetRequiredService<IQueueRunnerService>();
+                updatePollThread = DuplicatiWebserver.Provider.GetRequiredService<UpdatePollThread>();
+                eventPollNotify = DuplicatiWebserver.Provider.GetRequiredService<EventPollNotify>();
+                scheduler = DuplicatiWebserver.Provider.GetRequiredService<ISchedulerService>();
+                changeTracking = DuplicatiWebserver.Provider.GetRequiredService<IChangeTrackingService>();
 
-                StartWebServer(commandlineOptions);
+                updatePollThread.Init(Library.Utility.Utility.ParseBoolOption(commandlineOptions, DISABLE_UPDATE_CHECK_OPTION));
+                DuplicatiWebserver.Provider.GetRequiredService<IUpdateInstallService>().CompletePendingInstall();
 
-                if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, "ping-pong-keepalive"))
+                SetPurgeTempFilesTimer(connection, commandlineOptions);
+                SetCertificateRenewalTimer(connection);
+
+                LiveControl.StateChanged = (e) => { LiveControl_StateChanged(queueRunner, connection, eventPollNotify, scheduler, e); };
+
+                // Invoke it once to set initial state
+                LiveControl_StateChanged(queueRunner, connection, eventPollNotify, scheduler, new LiveControls.LiveControlEvent
                 {
-                    PingPongThread = new System.Threading.Thread(PingPongMethod) {IsBackground = true};
+                    State = LiveControl.State,
+                    TransfersPaused = LiveControl.TransfersPaused,
+                    WaitTimeExpiration = LiveControl.EstimatedPauseEnd
+                });
+
+                if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, PING_PONG_KEEPALIVE_OPTION))
+                {
+                    PingPongThread = new Thread(() => PingPongMethod(applicationSettings)) { IsBackground = true };
                     PingPongThread.Start();
                 }
 
+                connection.SetPreloadSettingsIfChanged(preloadDbSettings);
+                EmitWarningsForConfigurationIssues(connection, applicationSettings, commandlineOptions);
+
+                Log.WriteInformationMessage(LOGTAG, "ServerStarted", Strings.Program.ServerStarted(DuplicatiWebserver.Interface, DuplicatiWebserver.Port));
+                logMessageToConsole(Strings.Program.ServerStarted(DuplicatiWebserver.Interface, DuplicatiWebserver.Port));
+
+                var remoteControlUrl = commandlineOptions.GetValueOrDefault(REGISTER_REMOTE_CONTROL_OPTION);
+                if (!string.IsNullOrWhiteSpace(remoteControlUrl))
+                    RegisterForRemoteControl(DuplicatiWebserver.Provider.GetRequiredService<IRemoteControllerRegistration>(), DuplicatiWebserver.Provider.GetRequiredService<IRemoteController>(), remoteControlUrl, Library.Utility.Utility.ParseBoolOption(commandlineOptions, REGISTER_REMOTE_CONTROL_REREGISTER_OPTION), logMessageToConsole);
+
+                if (!string.IsNullOrWhiteSpace(connection.ApplicationSettings.ClientLicenseKey))
+                    Proprietary.LicenseChecker.LicenseHelper.SetRemoteClientLicenseKey(connection.ApplicationSettings.ClientLicenseKey);
+
+                if (applicationSettings.Origin == "Server" && connection.ApplicationSettings.AutogeneratedPassphrase)
+                {
+                    var signinToken = DuplicatiWebserver.Provider.GetRequiredService<IJWTTokenProvider>().CreateSigninToken("server-cli");
+                    var hostname = (connection.ApplicationSettings.AllowedHostnames ?? string.Empty).Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(x => x != "*") ?? "localhost";
+                    var scheme = connection.ApplicationSettings.UseHTTPS ? "https" : "http";
+
+                    var url = $"{scheme}://{hostname}:{DuplicatiWebserver.Port}/signin.html?token={signinToken}";
+                    Log.WriteWarningMessage(LOGTAG, "ServerStartedSignin", null, Strings.Program.ServerStartedSignin(url));
+                    logMessageToConsole(Strings.Program.ServerStartedSignin(url));
+                }
+
+                DuplicatiWebserver.TerminationTask.ContinueWith((t) =>
+                {
+                    if (t.Exception != null)
+                    {
+                        webserverFailed = true;
+                        Log.WriteWarningMessage(LOGTAG, "ServerCrashed", t.Exception, Strings.Program.ServerCrashed(t.Exception.Message));
+                        logMessageToConsole(Strings.Program.ServerStartedSignin(Strings.Program.ServerCrashed(t.Exception.ToString())));
+                    }
+
+                    terminated = true;
+                    applicationSettings.SignalApplicationExit();
+                }, TaskScheduler.Default).FireAndForget();
+
+                var stopCounter = 0;
+                Console.CancelKeyPress += (sender, e) =>
+                {
+                    if (Interlocked.Increment(ref stopCounter) <= 1)
+                    {
+                        Log.WriteInformationMessage(LOGTAG, "CancelKeyPressed", "Cancel key pressed, stopping server");
+                        Task.Run(async () => DuplicatiWebserver?.StopAsync() ?? Task.CompletedTask).FireAndForget();
+                    }
+                    else
+                    {
+                        Log.WriteWarningMessage(LOGTAG, "CancelKeyPressed", null, "Cancel key pressed twice, terminating now");
+                        if (OperatingSystem.IsWindows())
+                            Environment.FailFast("Cancel key pressed twice, terminating now");
+                        else
+                            Environment.Exit(0);
+                    }
+                };
+
                 ServerStartedEvent.Set();
-                ApplicationExitEvent.WaitOne();
+                applicationSettings.ApplicationExit.WaitHandle.WaitOne();
             }
             catch (SingleInstance.MultipleInstanceException mex)
             {
+                crashed = true;
+                Log.WriteErrorMessage(LOGTAG, "MultipleInstanceError", mex, Strings.Program.ServerCrashed(mex.Message));
                 System.Diagnostics.Trace.WriteLine(Strings.Program.SeriousError(mex.ToString()));
-                if (!writeToConsole) throw;
-                
+                if (!writeToConsoleOnException) throw;
+
                 Console.WriteLine(Strings.Program.SeriousError(mex.ToString()));
-                return 100;
+                return EXITCODE_CRASHED;
             }
             catch (Exception ex)
             {
+                crashed = true;
+                Log.WriteErrorMessage(LOGTAG, "ServerCrashed", ex, Strings.Program.ServerCrashed(ex.Message));
                 System.Diagnostics.Trace.WriteLine(Strings.Program.SeriousError(ex.ToString()));
-                if (writeToConsole)
+                if (writeToConsoleOnException)
                 {
                     Console.WriteLine(Strings.Program.SeriousError(ex.ToString()));
-                    return 100;
+                    return EXITCODE_CRASHED;
                 }
                 else
                     throw new Exception(Strings.Program.SeriousError(ex.ToString()), ex);
             }
             finally
             {
-                StatusEventNotifyer.SignalNewEvent();
+                Log.WriteInformationMessage(LOGTAG, "ServerStopping", Strings.Program.ServerStopping);
 
-                UpdatePoller?.Terminate();
-                Scheduler?.Terminate(true);
-                WorkThread?.Terminate(true);
-                ApplicationInstance?.Dispose();
-                PurgeTempFilesTimer?.Dispose();
-
-                Library.UsageReporter.Reporter.ShutDown();
-
-                try { PingPongThread?.Abort(); }
-                catch { }
-
-                LogHandler?.Dispose();
-            }
-
-            if (UpdatePoller != null && UpdatePoller.IsUpdateRequested)
-                return Library.AutoUpdater.UpdaterManager.MAGIC_EXIT_CODE;
-
-            return 0;
-        }
-
-        private static void StartWebServer(Dictionary<string, string> commandlineOptions)
-        {
-            WebServer = new WebServer.Server(commandlineOptions);
-
-            ServerPortChanged |= WebServer.Port != DataConnection.ApplicationSettings.LastWebserverPort;
-            DataConnection.ApplicationSettings.LastWebserverPort = WebServer.Port;
-        }
-
-        private static void SetWorkerThread()
-        {
-            WorkThread = new Duplicati.Library.Utility.WorkerThread<Runner.IRunnerData>((x) => { Runner.Run(x, true); },
-                LiveControl.State == LiveControls.LiveControlState.Paused);
-            Scheduler = new Scheduler(WorkThread);
-
-            WorkThread.StartingWork += (worker, task) => { SignalNewEvent(null, null); };
-            WorkThread.CompletedWork += (worker, task) => { SignalNewEvent(null, null); };
-            WorkThread.WorkQueueChanged += (worker) => { SignalNewEvent(null, null); };
-            Scheduler.NewSchedule += new EventHandler(SignalNewEvent);
-            WorkThread.OnError += (worker, task, exception) =>
-            {
-                Program.DataConnection.LogError(task?.BackupID, "Error in worker", exception);
-            };
-
-            var lastScheduleId = LastDataUpdateID;
-            Program.StatusEventNotifyer.NewEvent += (sender, e) =>
-            {
-                if (lastScheduleId == LastDataUpdateID) return;
-                lastScheduleId = LastDataUpdateID;
-                Program.Scheduler.Reschedule();
-            };
-
-            void RegisterTaskResult(long id, Exception ex)
-            {
-                lock (MainLock)
-                {
-                    // If the new results says it crashed, we store that instead of success
-                    if (Program.TaskResultCache.Count > 0 && Program.TaskResultCache.Last().Key == id)
+                var steps = new Action[] {
+                    () => eventPollNotify?.SignalNewEvent(),
+                    () => ShutdownModernWebserver(),
+                    () => updatePollThread?.Terminate(),
+                    () => scheduler?.Terminate(true),
+                    () => queueRunner?.Terminate(true),
+                    () => changeTracking?.DisposeAsync().AsTask().Await(),
+                    () => ApplicationInstance?.Dispose(),
+                    () => PurgeTempFilesTimer?.Dispose(),
+                    () => CertificateRenewalTimer?.Dispose(),
+                    () => Library.UsageReporter.Reporter.ShutDown(),
+                    () => PingPongThread?.Interrupt(),
+                    () =>
                     {
-                        if (ex != null && Program.TaskResultCache.Last().Value == null)
-                            Program.TaskResultCache.RemoveAt(Program.TaskResultCache.Count - 1);
-                        else
-                            return;
+                        Log.WriteInformationMessage(LOGTAG, "ServerStopped", Strings.Program.ServerStopped);
+                        logHandler?.Dispose();
                     }
+                };
 
-                    Program.TaskResultCache.Add(new KeyValuePair<long, Exception>(id, ex));
-                    while (Program.TaskResultCache.Count > MAX_TASK_RESULT_CACHE_SIZE)
-                        Program.TaskResultCache.RemoveAt(0);
+                foreach (var teardownStep in steps)
+                {
+                    try
+                    {
+                        teardownStep();
+                    }
+                    catch (Exception ex)
+                    {
+                        // If the server is already crashed, that is the main error
+                        // If the server crashes during teardown, we log that as an error
+                        if (!(crashed || terminated))
+                        {
+                            System.Diagnostics.Trace.WriteLine(Strings.Program.TearDownError(ex.ToString()));
+                            logMessageToConsole(Strings.Program.TearDownError(ex.ToString()));
+                        }
+                    }
                 }
             }
 
-            Program.WorkThread.CompletedWork += (worker, task) => { RegisterTaskResult(task.TaskID, null); };
-            Program.WorkThread.OnError += (worker, task, exception) => { RegisterTaskResult(task.TaskID, exception); };
+            // A host such as the Windows service must be able to tell a crash from a requested exit
+            return webserverFailed ? EXITCODE_CRASHED : 0;
         }
 
-        private static void SetLiveControls()
+        /// <summary>
+        /// Starts the Duplicati web server
+        /// </summary>
+        /// <param name="options">The commandline options</param>
+        /// <param name="connection">The connection to use</param>
+        /// <param name="logWriteHandler">The log write handler</param>
+        /// <param name="applicationSettings">The application settings</param>
+        /// <returns></returns>
+        private static async Task<DuplicatiWebserver> StartWebServerAsync(IReadOnlyDictionary<string, string> options, Connection connection, ILogWriteHandler logWriteHandler, IApplicationSettings applicationSettings)
         {
-            LiveControl = new LiveControls(DataConnection.ApplicationSettings);
-            LiveControl.StateChanged += LiveControl_StateChanged;
-            LiveControl.ThreadPriorityChanged += LiveControl_ThreadPriorityChanged;
-            LiveControl.ThrottleSpeedChanged += LiveControl_ThrottleSpeedChanged;
+            var server = await WebServerLoader.TryRunServerAsync(options, connection, async parsedOptions =>
+            {
+                var mappedSettings = new DuplicatiWebserver.InitSettings(
+                    parsedOptions.WebRoot,
+                    parsedOptions.Port,
+                    parsedOptions.Interface,
+                    parsedOptions.AllowedHostnames,
+                    parsedOptions.DisableStaticFiles,
+                    parsedOptions.TokenLifetimeInMinutes,
+                    parsedOptions.SPAPaths,
+                    parsedOptions.CorsOrigins,
+                    parsedOptions.PreAuthTokens,
+                    ParseChangeTrackingSettings(options, applicationSettings)
+                );
+
+                var server = DuplicatiWebserver.CreateWebServer(mappedSettings, connection, logWriteHandler, applicationSettings);
+
+                // Start the server, but catch any configuration issues
+                var task = server.StartAsync();
+                await Task.WhenAny(task, Task.Delay(500));
+                if (task.IsCompleted)
+                    await task;
+
+                return server;
+            }).ConfigureAwait(false);
+
+            connection.ApplicationSettings.ServerPortChanged |= server.Port != connection.ApplicationSettings.LastWebserverPort;
+            connection.ApplicationSettings.LastWebserverPort = server.Port;
+
+            return server;
         }
 
-        private static void SetPurgeTempFilesTimer(Dictionary<string, string> commandlineOptions)
+        /// <summary>
+        /// Applies the forced locale from the commandline options, if any, to the current thread and all threads created later
+        /// </summary>
+        /// <param name="commandlineOptions">The commandline options</param>
+        /// <param name="logMessageToConsole">The method used to report problems before logging is configured</param>
+        public static void ApplyForcedLocale(Dictionary<string, string> commandlineOptions, Action<string> logMessageToConsole)
+        {
+            if (!commandlineOptions.TryGetValue(FORCE_LOCALE_OPTION, out var localestring))
+                return;
+
+            try
+            {
+                var culture = string.IsNullOrWhiteSpace(localestring)
+                    ? System.Globalization.CultureInfo.InvariantCulture
+                    : new System.Globalization.CultureInfo(localestring);
+
+                System.Globalization.CultureInfo.DefaultThreadCurrentCulture = culture;
+                System.Globalization.CultureInfo.DefaultThreadCurrentUICulture = culture;
+                System.Globalization.CultureInfo.CurrentCulture = culture;
+                System.Globalization.CultureInfo.CurrentUICulture = culture;
+            }
+            catch (Exception ex)
+            {
+                logMessageToConsole(Strings.Program.FailedForceLocaleError(FORCE_LOCALE_OPTION, localestring, ex.Message));
+            }
+        }
+
+        /// <summary>
+        /// Reads the file watcher settings from the commandline options
+        /// </summary>
+        /// <param name="options">The commandline options</param>
+        /// <param name="applicationSettings">The application settings, for the data folder</param>
+        /// <returns>The settings</returns>
+        private static ChangeTrackingSettings ParseChangeTrackingSettings(IReadOnlyDictionary<string, string> options, IApplicationSettings applicationSettings)
+            => new ChangeTrackingSettings(
+                !Library.Utility.Utility.ParseBoolOption(options, DISABLE_FILE_WATCHER_OPTION),
+                System.IO.Path.Combine(applicationSettings.DataFolder, ChangeTrackingSettings.DATABASE_FILENAME),
+                TempFolder.SystemTempPath,
+                Library.Utility.Utility.ParseTimespanOption(options, FILE_WATCHER_FLUSH_INTERVAL_OPTION, ChangeTrackingSettings.DEFAULT_FLUSH_INTERVAL),
+                Library.Utility.Utility.ParseIntOption(options, FILE_WATCHER_HIGH_WATER_OPTION, ChangeTrackingSettings.DEFAULT_HIGH_WATER_MARK),
+                Library.Utility.Utility.ParseLongOption(options, FILE_WATCHER_MAX_CHANGES_OPTION, ChangeTrackingSettings.DEFAULT_MAX_CHANGES),
+                Library.Utility.Utility.ParseTimespanOption(options, FILE_WATCHER_GRACE_DELAY_OPTION, ChangeTrackingSettings.DEFAULT_GRACE_DELAY));
+
+        /// <summary>
+        /// Sets up the timer for purging temp files and log data
+        /// </summary>
+        /// <param name="connection">The connection to use</param>
+        /// <param name="commandlineOptions">The commandline options</param>
+        private static void SetPurgeTempFilesTimer(Connection connection, Dictionary<string, string> commandlineOptions)
         {
             var lastPurge = new DateTime(0);
 
-            System.Threading.TimerCallback purgeTempFilesCallback = (x) =>
+            TimerCallback purgeTempFilesCallback = (x) =>
             {
                 try
                 {
-#if DEBUG
-                    if (Math.Abs((DateTime.Now - lastPurge).TotalHours) < 1)
+                    if (Math.Abs((DateTime.Now - lastPurge).TotalHours) < (DEBUG_MODE ? 1 : 23))
                     {
                         return;
                     }
-#else
-                    if (Math.Abs((DateTime.Now - lastPurge).TotalHours) < 23)
-                    {
-                        return;
-                    }
-#endif
 
                     lastPurge = DateTime.Now;
 
-                    foreach (var e in DataConnection.GetTempFiles().Where((f) => f.Expires < DateTime.Now))
+                    foreach (var e in connection.GetTempFiles().Where((f) => f.Expires < DateTime.Now))
                     {
                         try
                         {
@@ -400,16 +590,16 @@ namespace Duplicati.Server
                         }
                         catch (Exception ex)
                         {
-                            DataConnection.LogError(null, $"Failed to delete temp file: {e.Path}", ex);
+                            connection.LogError(null, $"Failed to delete temp file: {e.Path}", ex);
                         }
 
-                        DataConnection.DeleteTempFile(e.ID);
+                        connection.DeleteTempFile(e.ID);
                     }
 
 
                     Library.Utility.TempFile.RemoveOldApplicationTempFiles((path, ex) =>
                     {
-                        DataConnection.LogError(null, $"Failed to delete temp file: {path}", ex);
+                        connection.LogError(null, $"Failed to delete temp file: {path}", ex);
                     });
 
                     if (!commandlineOptions.TryGetValue("log-retention", out string pts))
@@ -417,57 +607,445 @@ namespace Duplicati.Server
                         pts = DEFAULT_LOG_RETENTION;
                     }
 
-                    DataConnection.PurgeLogData(Library.Utility.Timeparser.ParseTimeInterval(pts, DateTime.Now, true));
+                    connection.PurgeLogData(Library.Utility.Timeparser.ParseTimeInterval(pts, DateTime.Now, true));
                 }
                 catch (Exception ex)
                 {
-                    DataConnection.LogError(null, "Failed during temp file cleanup", ex);
+                    connection.LogError(null, "Failed during temp file cleanup", ex);
                 }
             };
 
-            try
-            {
-#if DEBUG
-                PurgeTempFilesTimer =
-                    new System.Threading.Timer(purgeTempFilesCallback, null, TimeSpan.FromSeconds(10), TimeSpan.FromHours(1));
-#else
-                PurgeTempFilesTimer =
-                    new System.Threading.Timer(purgeTempFilesCallback, null, TimeSpan.FromHours(1), TimeSpan.FromDays(1));
-#endif
-            }
-            catch (ArgumentOutOfRangeException)
-            {
-                //Bugfix for older Mono, slightly more resources used to avoid large values in the period field
-                PurgeTempFilesTimer =
-                    new System.Threading.Timer(purgeTempFilesCallback, null, TimeSpan.FromHours(1), TimeSpan.FromHours(1));
-            }
+            PurgeTempFilesTimer =
+                new System.Threading.Timer(purgeTempFilesCallback, null,
+                    DEBUG_MODE ? TimeSpan.FromSeconds(10) : TimeSpan.FromHours(1),
+                    DEBUG_MODE ? TimeSpan.FromHours(1) : TimeSpan.FromDays(1));
         }
 
-        private static void AdjustApplicationSettings(Dictionary<string, string> commandlineOptions)
+        /// <summary>
+        /// Sets up a timer to periodically check for certificate renewal.
+        /// This ensures certificates are renewed even if the server runs continuously
+        /// without restarts.
+        /// </summary>
+        /// <param name="connection">The database connection.</param>
+        private static void SetCertificateRenewalTimer(Connection connection)
         {
-            if (commandlineOptions.ContainsKey("webservice-password"))
+            TimerCallback certificateRenewalCallback = (x) =>
             {
-                DataConnection.ApplicationSettings.SetWebserverPassword(commandlineOptions["webservice-password"]);
+                try
+                {
+                    // Only check for autogenerated certificates
+                    if (!connection.ApplicationSettings.ServerSSLCertificateAutogenerated)
+                        return;
+
+                    var renewalResult = CheckAndRenewCertificate(connection);
+
+                    if (renewalResult.Renewed)
+                    {
+                        Log.WriteInformationMessage(LOGTAG, "CertificateRenewedAutomatically",
+                            "SSL certificate was automatically renewed during periodic check.");
+                    }
+                    else if (renewalResult.RenewalFailedReason != null)
+                    {
+                        Log.WriteWarningMessage(LOGTAG, "CertificateRenewalFailed",
+                            null,
+                            $"Automatic certificate renewal failed: {renewalResult.RenewalFailedReason}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.WriteErrorMessage(LOGTAG, "CertificateRenewalCheckFailed", ex,
+                        "Failed to check/renew SSL certificate during periodic check.");
+                }
+            };
+
+            CertificateRenewalTimer =
+                new System.Threading.Timer(certificateRenewalCallback, null,
+                    TimeSpan.FromHours(1),
+                    TimeSpan.FromDays(1));
+        }
+
+        /// <summary>
+        /// Registers the server for remote control
+        /// </summary>
+        /// <param name="remoteControllerRegistration">The remote controller registration</param>
+        /// <param name="remoteController">The remote controller</param>
+        /// <param name="remoteControlUrl">The remote control URL</param>
+        /// <param name="reRegister">Whether to re-register</param>
+        /// <param name="logMessageToConsole">Callback to log messages to console</param>
+        private static void RegisterForRemoteControl(IRemoteControllerRegistration remoteControllerRegistration, IRemoteController remoteController, string remoteControlUrl, bool reRegister, Action<string> logMessageToConsole)
+        {
+            if (remoteController.CanEnable)
+            {
+                if (!reRegister)
+                {
+                    Log.WriteInformationMessage(LOGTAG, "RemoteControlAlreadyRegistered", Strings.Program.RemoteControlAlreadyRegistered);
+                    return;
+                }
+
+                remoteController.DeleteRegistration();
             }
 
-            DataConnection.ApplicationSettings.GenerateWebserverPasswordTrayIcon();
-
-            if (commandlineOptions.ContainsKey("webservice-allowed-hostnames"))
+            Task.Run(async () =>
             {
-                DataConnection.ApplicationSettings.SetAllowedHostnames(commandlineOptions["webservice-allowed-hostnames"]);
+                try
+                {
+                    var regTask = remoteControllerRegistration.RegisterMachineAsync(remoteControlUrl);
+                    while (!regTask.IsCompleted)
+                    {
+                        // Interface does not have events, so poll it every second
+                        await Task.WhenAny(Task.Delay(1000), regTask).ConfigureAwait(false);
+                        if (!string.IsNullOrWhiteSpace(remoteControllerRegistration.RegistrationUrl))
+                        {
+                            Log.WriteWarningMessage(LOGTAG, "RemoteControlRegistrationUrl", null, Strings.Program.RemoteControlRegistrationUrl(remoteControllerRegistration.RegistrationUrl));
+                            logMessageToConsole(Strings.Program.RemoteControlRegistrationUrl(remoteControllerRegistration.RegistrationUrl));
+                            break;
+                        }
+                    }
+
+                    // Await the registration task and ensure any errors are logged
+                    await regTask.ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Log.WriteErrorMessage(LOGTAG, "RemoteControlRegistrationFailed", ex, Strings.Program.RemoteControlRegistrationFailed(ex.Message));
+                }
+            })
+            .FireAndForget();
+        }
+
+        /// <summary>
+        /// Clears the JWT config, so a new one is generated when the webserver starts, invalidating all existing tokens
+        /// </summary>
+        /// <param name="connection">The connection to use</param>
+        private static void ResetJwtConfig(Connection connection)
+        {
+            connection.ApplicationSettings.JWTConfig = null;
+            // Clean up stored tokens as they are now invalid
+            connection.ExecuteWithCommand((con) => con.ExecuteNonQuery("DELETE FROM TokenFamily"));
+            // The MCP tokens are signed with the same key, so the list of them describes tokens that no longer work
+            connection.ApplicationSettings.McpTokens = null;
+        }
+
+        /// <summary>
+        /// Adjusts the application settings based on commandline options
+        /// </summary>
+        /// <param name="connection">The connection to use</param>
+        /// <param name="commandlineOptions">The commandline options</param>
+        /// <returns>The exit code, or null if no exit is required</returns>
+        private static int? AdjustApplicationSettings(Connection connection, Dictionary<string, string> commandlineOptions)
+        {
+            // This clears the JWT config, and a new will be generated, invalidating all existing tokens
+            if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_RESET_JWT_CONFIG))
+                ResetJwtConfig(connection);
+
+            if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_ENABLE_FOREVER_TOKEN))
+                connection.ApplicationSettings.EnableForeverTokens();
+
+            if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_DISABLE_SIGNIN_TOKENS))
+                connection.ApplicationSettings.DisableSigninTokens = Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_DISABLE_SIGNIN_TOKENS);
+
+            if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_REDUCED_REPORTING))
+            {
+                var reducedReporting = Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_REDUCED_REPORTING);
+                // The operator setting is stored either way; a console-enforced value keeps reduced reporting active regardless
+                connection.ApplicationSettings.ReducedReporting = reducedReporting;
+                if (!reducedReporting && connection.ApplicationSettings.ReducedReportingSetByConsole)
+                    Library.Logging.Log.WriteWarningMessage(LOGTAG, "ReducedReportingEnforcedByConsole", null, "reduced reporting is enforced by the console and stays active although --{0}=false was given", WebServerLoader.OPTION_REDUCED_REPORTING);
+            }
+
+            if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_DISABLEAPIEXTENSIONS))
+                connection.ApplicationSettings.DisabledAPIExtensions = commandlineOptions.GetValueOrDefault(WebServerLoader.OPTION_WEBSERVICE_DISABLEAPIEXTENSIONS)?
+                    .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+
+            if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_ENABLE_FOLDER_STATUS_SERVICE))
+                connection.ApplicationSettings.EnableFolderStatusService = Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_ENABLE_FOLDER_STATUS_SERVICE);
+            if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_ENABLE_MCP_SERVER))
+                connection.ApplicationSettings.EnableMcpServer = Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_ENABLE_MCP_SERVER);
+
+            if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_PASSWORD))
+            {
+                var password = commandlineOptions[WebServerLoader.OPTION_WEBSERVICE_PASSWORD];
+                // Only invalidate tokens if the password differs, so passing the same password on every start keeps sessions alive
+                var passwordChanged = !connection.ApplicationSettings.VerifyWebserverPassword(password);
+                connection.ApplicationSettings.SetWebserverPassword(password);
+                if (passwordChanged)
+                    ResetJwtConfig(connection);
+            }
+
+            var initPassword = commandlineOptions.GetValueOrDefault(WebServerLoader.OPTION_WEBSERVICE_PASSWORD_INIT);
+            if (!string.IsNullOrWhiteSpace(initPassword))
+            {
+                // If initPassword is set, we want the initialization to stop now, so we throw an exception
+                if (connection.ApplicationSettings.AutogeneratedPassphrase)
+                {
+                    connection.ApplicationSettings.SetWebserverPassword(initPassword);
+                    ResetJwtConfig(connection);
+                    return EXITCODE_INITPASSWORD_SUCCESS;
+                }
+                else
+                {
+                    return EXITCODE_INITPASSWORD_FAILED;
+                }
+            }
+
+            if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_ALLOWEDHOSTNAMES))
+                connection.ApplicationSettings.SetAllowedHostnames(commandlineOptions[WebServerLoader.OPTION_WEBSERVICE_ALLOWEDHOSTNAMES]);
+            else if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_ALLOWEDHOSTNAMES_ALT))
+                connection.ApplicationSettings.SetAllowedHostnames(commandlineOptions[WebServerLoader.OPTION_WEBSERVICE_ALLOWEDHOSTNAMES_ALT]);
+
+            if (commandlineOptions.ContainsKey(WebServerLoader.OPTION_WEBSERVICE_TIMEZONE) && !string.IsNullOrEmpty(commandlineOptions[WebServerLoader.OPTION_WEBSERVICE_TIMEZONE]))
+            {
+                // FindTimeZone reports an unknown timezone by returning null, not by
+                // throwing; assigning the null would silently clear the stored setting
+                var timezone = TimeZoneHelper.FindTimeZone(commandlineOptions[WebServerLoader.OPTION_WEBSERVICE_TIMEZONE]);
+                if (timezone == null)
+                    throw new UserInformationException(Strings.Program.InvalidTimezone(commandlineOptions[WebServerLoader.OPTION_WEBSERVICE_TIMEZONE]), "InvalidTimeZone");
+                connection.ApplicationSettings.Timezone = timezone;
+            }
+
+            // The database has recorded a new version
+            if (connection.ApplicationSettings.UpdatedVersion != null)
+            {
+                // Check if the running version is newer than the recorded version
+                if (UpdaterManager.TryParseVersion(connection.ApplicationSettings.UpdatedVersion.Version) <= UpdaterManager.TryParseVersion(UpdaterManager.SelfVersion.Version))
+                {
+                    // Clean up lingering update notifications
+                    var updateNotifications = connection.GetNotifications().Where(x => x.Action == "update:new").ToList();
+                    foreach (var n in updateNotifications)
+                        connection.DismissNotification(n.ID);
+
+                    // Clear up the recorded version
+                    connection.ApplicationSettings.UpdatedVersion = null;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Emits warnings for configuration issues
+        /// </summary>
+        /// <param name="connection">The connection</param>
+        /// <param name="applicationSettings">The application settings</param>
+        /// <param name="commandlineOptions">The commandline options</param>
+        private static void EmitWarningsForConfigurationIssues(Connection connection, IApplicationSettings applicationSettings, Dictionary<string, string> commandlineOptions)
+        {
+            // First, remove any pending notifications, if the issue is resolved
+            if (connection.IsEncryptingFields)
+            {
+                // Remove any existing unencrypted database notification
+                var updateNotifications = connection.GetNotifications().Where(x => x.Action == "config:issue:unencrypted-database").ToList();
+                foreach (var n in updateNotifications)
+                    connection.DismissNotification(n.ID);
+
+                // Remove any existing HTTPS related notifications
+                var caKeyNotifications = connection.GetNotifications().Where(x => x.Action == NOTIFICATION_CA_KEY_UNENCRYPTED_DATABASE || x.Action == NOTIFICATION_CERTIFICATE_RENEWAL_FAILED).ToList();
+                foreach (var n in caKeyNotifications)
+                    connection.DismissNotification(n.ID);
+            }
+
+            if (OperatingSystem.IsWindows() && !applicationSettings.DataFolder.StartsWith(Util.AppendDirSeparator(Environment.GetFolderPath(Environment.SpecialFolder.Windows)), StringComparison.OrdinalIgnoreCase))
+            {
+                // Remove any existing windows folder used notification
+                var updateNotifications = connection.GetNotifications().Where(x => x.Action == "config:issue:windows-folder-used").ToList();
+                foreach (var n in updateNotifications)
+                    connection.DismissNotification(n.ID);
+            }
+
+            // Check tempdir free space against volume sizes
+            CheckTempDirFreeSpace(connection, commandlineOptions);
+
+            // Emit warnings if the application has been updated
+            if (connection.ApplicationSettings.LastConfigIssueCheckVersion != UpdaterManager.SelfVersion.Version)
+            {
+                var updateNotifications = connection.GetNotifications().Where(x => x.Action.StartsWith("config:issue:")).ToList();
+                foreach (var n in updateNotifications)
+                    connection.DismissNotification(n.ID);
+
+                if (!connection.IsEncryptingFields && !Library.Utility.Utility.ParseBoolOption(commandlineOptions, DISABLE_DB_ENCRYPTION_OPTION))
+                {
+                    connection.RegisterNotification(
+                        Serialization.NotificationType.Warning,
+                        "Unencrypted database",
+                        "The database is not encrypted. This is a security risk and should be fixed as soon as possible.",
+                        null,
+                        null,
+                        "config:issue:unencrypted-database",
+                        null,
+                        "UnencryptedDatabase",
+                        null,
+                        (self, all) =>
+                        {
+                            return all.FirstOrDefault(x => x.Action == "config:issue:unencrypted-database") ?? self;
+                        }
+                    );
+                }
+
+                if (OperatingSystem.IsWindows() && applicationSettings.DataFolder.StartsWith(Util.AppendDirSeparator(Environment.GetFolderPath(Environment.SpecialFolder.Windows)), StringComparison.OrdinalIgnoreCase))
+                {
+                    connection.RegisterNotification(
+                        Serialization.NotificationType.Warning,
+                        "Incorrect storage folder",
+                        "The server configuration is stored inside the Windows folder. Please move the configuration to a different location, or it may be deleted on Windows version upgrades.",
+                        null,
+                        null,
+                        "config:issue:windows-folder-used",
+                        null,
+                        "UnencryptedDatabase",
+                        null,
+                        (self, all) =>
+                        {
+                            return all.FirstOrDefault(x => x.Action == "config:issue:windows-folder-used") ?? self;
+                        }
+                    );
+                }
+
+                connection.ApplicationSettings.LastConfigIssueCheckVersion = UpdaterManager.SelfVersion.Version;
             }
         }
 
-        private static void CreateApplicationInstance(bool writeConsole)
+        /// <summary>
+        /// Checks if the tempdir has enough free space relative to the volume sizes of configured backups.
+        /// Emits a warning if free space is less than 4 times the volume size.
+        /// </summary>
+        /// <param name="connection">The database connection</param>
+        /// <param name="commandlineOptions">The commandline options</param>
+        private static void CheckTempDirFreeSpace(Connection connection, Dictionary<string, string> commandlineOptions)
+        {
+            const string TEMPDIR_WARNING_ACTION = "config:issue:tempdir-low-space";
+
+            // Get the tempdir path - check Connection settings first, then fall back to system default
+            var tempDir = TempFolder.SystemTempPath;
+            var serverSettings = connection.GetSettings(Connection.ANY_BACKUP_ID);
+            var tempDirSetting = serverSettings?.FirstOrDefault(s =>
+                string.Equals(s.Name, "tempdir", StringComparison.OrdinalIgnoreCase) || string.Equals(s.Name, "--tempdir", StringComparison.OrdinalIgnoreCase));
+            if (tempDirSetting != null && !string.IsNullOrEmpty(tempDirSetting.Value))
+                tempDir = tempDirSetting.Value;
+
+            // Get free space in tempdir using the Utility method
+            var spaceInfo = Library.Utility.Utility.GetFreeSpaceForPath(tempDir);
+            // Could not determine free space, skip the check
+            if (spaceInfo == null)
+                return;
+
+            // Get the maximum volume size from all configured backups
+            var maxVolumeSize = GetMaxVolumeSize(connection, commandlineOptions);
+
+            // Check if free space is less than 4 times the volume size
+            if (spaceInfo.Value.FreeSpace < maxVolumeSize * Library.Utility.Utility.VOLUME_SIZE_FREE_SPACE_MULTIPLIER)
+            {
+                // Emit warning
+                connection.RegisterNotification(
+                    Serialization.NotificationType.Warning,
+                    "Low temporary folder space",
+                    $"The temporary folder '{tempDir}' has limited free space ({Library.Utility.Utility.FormatSizeString(spaceInfo.Value.FreeSpace)}). " +
+                    $"It is recommended to have at least {Library.Utility.Utility.VOLUME_SIZE_FREE_SPACE_MULTIPLIER} times the volume size ({Library.Utility.Utility.FormatSizeString(maxVolumeSize * Library.Utility.Utility.VOLUME_SIZE_FREE_SPACE_MULTIPLIER)}) available for optimal operation.",
+                    null,
+                    null,
+                    TEMPDIR_WARNING_ACTION,
+                    null,
+                    "TempDirLowSpace",
+                    null,
+                    (self, all) =>
+                    {
+                        return all.FirstOrDefault(x => x.Action == TEMPDIR_WARNING_ACTION) ?? self;
+                    }
+                );
+            }
+            else
+            {
+                // Clear any existing warning
+                var existingNotifications = connection.GetNotifications().Where(x => x.Action == TEMPDIR_WARNING_ACTION).ToList();
+                foreach (var n in existingNotifications)
+                    connection.DismissNotification(n.ID);
+            }
+        }
+
+        /// <summary>
+        /// Gets the maximum volume size from all configured backups.
+        /// </summary>
+        /// <param name="connection">The database connection</param>
+        /// <param name="commandlineOptions">The commandline options</param>
+        /// <returns>The maximum volume size in bytes</returns>
+        private static long GetMaxVolumeSize(Connection connection, Dictionary<string, string> commandlineOptions)
+        {
+            const string DEFAULT_VOLUME_SIZE = "50mb";
+            long maxVolumeSize = 0;
+
+            // Check if there's a global dblock-size in commandline options
+            if (commandlineOptions.TryGetValue("dblock-size", out var globalDblockSize) && !string.IsNullOrEmpty(globalDblockSize))
+            {
+                try
+                {
+                    maxVolumeSize = Sizeparser.ParseSize(globalDblockSize, "mb");
+                }
+                catch
+                {
+                    // Ignore parsing errors
+                }
+            }
+
+            // Check if there's a global dblock-size in the database settings
+            var serverSettings = connection.GetSettings(Connection.ANY_BACKUP_ID);
+            var defaultDblockSize = serverSettings?.FirstOrDefault(s => string.Equals(s.Name, "dblock-size", StringComparison.OrdinalIgnoreCase) || string.Equals(s.Name, "--dblock-size", StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrEmpty(defaultDblockSize?.Value))
+                try
+                {
+                    maxVolumeSize = Math.Max(Sizeparser.ParseSize(defaultDblockSize.Value, "mb"), maxVolumeSize);
+                }
+                catch
+                {
+                    // Ignore parsing errors
+                }
+
+            // If no global setting, use default
+            maxVolumeSize = Math.Max(maxVolumeSize, Sizeparser.ParseSize(DEFAULT_VOLUME_SIZE, "mb"));
+
+            // Check all configured backups for their volume sizes
+            foreach (var backup in connection.Backups)
+            {
+                try
+                {
+                    // Get settings for this backup
+                    var backupId = long.Parse(backup.ID);
+                    var settings = connection.GetSettings(backupId);
+
+                    // Look for dblock-size setting
+                    var dblockSizeSetting = settings?.FirstOrDefault(s =>
+                        string.Equals(s.Name, "dblock-size", StringComparison.OrdinalIgnoreCase) || string.Equals(s.Name, "--dblock-size", StringComparison.OrdinalIgnoreCase));
+
+                    if (dblockSizeSetting != null && !string.IsNullOrEmpty(dblockSizeSetting.Value))
+                    {
+                        var backupVolumeSize = Sizeparser.ParseSize(dblockSizeSetting.Value, "mb");
+                        if (backupVolumeSize > maxVolumeSize)
+                            maxVolumeSize = backupVolumeSize;
+                    }
+                }
+                catch
+                {
+                    // Ignore errors for individual backups
+                }
+            }
+
+            return maxVolumeSize;
+        }
+
+        /// <summary>
+        /// Creates the application instance to ensure a single instance is running for the current user
+        /// </summary>
+        /// <param name="dataFolder">The data folder to use for single instance locking</param>
+        /// <param name="writeToConsoleOnException">Write to console on exception</param>
+        private static void CreateApplicationInstance(string dataFolder, bool writeToConsoleOnException)
         {
             try
             {
                 //This will also create DATAFOLDER if it does not exist
-                ApplicationInstance = new SingleInstance(DataFolder);
+                ApplicationInstance = new SingleInstance(dataFolder);
             }
             catch (Exception ex)
             {
-                if (writeConsole)
+                if (writeToConsoleOnException)
                 {
                     Console.WriteLine(Strings.Program.StartupFailure(ex));
                     Environment.Exit(200);
@@ -478,7 +1056,7 @@ namespace Duplicati.Server
 
             if (!ApplicationInstance.IsFirstInstance)
             {
-                if (writeConsole)
+                if (writeToConsoleOnException)
                 {
                     Console.WriteLine(Strings.Program.AnotherInstanceDetected);
                     Environment.Exit(200);
@@ -488,43 +1066,140 @@ namespace Duplicati.Server
             }
         }
 
-        private static void ConfigureLogging(Dictionary<string, string> commandlineOptions)
+        /// <summary>
+        /// Applies environment variables by converting them to commandline options
+        /// </summary>
+        /// <param name="commandlineOptions">The commandline options</param>
+        private static void ApplyEnvironmentVariables(Dictionary<string, string> commandlineOptions)
         {
-
-#if DEBUG
-            //Log various information in the logfile
-            if (!commandlineOptions.ContainsKey("log-file"))
+            foreach (var key in SupportedCommands.SelectMany(x => (x.Aliases ?? []).Prepend(x.Name)).Distinct())
             {
-                commandlineOptions["log-file"] = System.IO.Path.Combine(StartupPath, "Duplicati.debug.log");
-                commandlineOptions["log-level"] = Duplicati.Library.Logging.LogMessageType.Profiling.ToString();
-                if (System.IO.File.Exists(commandlineOptions["log-file"]))
-                {
-                    System.IO.File.Delete(commandlineOptions["log-file"]);
-                }
+                // Commandline options take precedence
+                if (commandlineOptions.ContainsKey(key))
+                    continue;
+
+                var envkey = $"{ENV_NAME_PREFIX}__{key.Replace('-', '_').ToUpperInvariant()}";
+                var envval = Environment.GetEnvironmentVariable(envkey);
+                if (!string.IsNullOrWhiteSpace(envval))
+                    commandlineOptions[key] = envval;
             }
-#endif
 
-            // Setup the log redirect
-            Library.Logging.Log.StartScope(LogHandler, null);
+            // Set the encryption key from the environment variable
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME)) && string.IsNullOrWhiteSpace(commandlineOptions.GetValueOrDefault(SETTINGS_ENCRYPTION_KEY_OPTION)))
+                commandlineOptions[SETTINGS_ENCRYPTION_KEY_OPTION] = Environment.GetEnvironmentVariable(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME);
+        }
 
-            if (commandlineOptions.ContainsKey("log-file"))
+        /// <summary>
+        /// Applies the secret provider to the commandline options and application settings
+        /// </summary>
+        /// <param name="applicationSettings">The application settings</param>
+        /// <param name="commandlineOptions">The commandline options</param>
+        /// <param name="cancellationToken">The cancellation token</param>
+        /// <returns>A task that represents the asynchronous operation</returns>
+        private static async Task ApplySecretProviderAsync(IApplicationSettings applicationSettings, Dictionary<string, string> commandlineOptions, CancellationToken cancellationToken)
+            => applicationSettings.SecretProvider = await SecretProviderHelper.ApplySecretProviderAsync([], [], commandlineOptions, TempFolder.SystemTempPath, applicationSettings.SecretProvider, cancellationToken).ConfigureAwait(false);
+
+        /// <summary>
+        /// A log destination that writes to the console
+        /// </summary>
+        /// <param name="level">The minimum log level</param>
+        private class ConsoleLogDestination(LogMessageType level) : ILogDestination
+        {
+            /// <inheritdoc />
+            public void WriteMessage(LogEntry entry)
             {
-                var loglevel = Library.Logging.LogMessageType.Error;
-
-                if (commandlineOptions.ContainsKey("log-level"))
-                    Enum.TryParse(commandlineOptions["log-level"], true, out loglevel);
-
-                LogHandler.SetServerFile(commandlineOptions["log-file"], loglevel);
+                if (entry.Level >= level)
+                    Console.WriteLine(entry.AsString(true));
             }
         }
 
-        private static int ShowHelp(bool writeConsole)
+        /// <summary>
+        /// Configures logging based on commandline options
+        /// </summary>
+        /// <param name="logWriteHandler">The log write handler</param>
+        /// <param name="commandlineOptions">The commandline options</param>
+        /// <returns>A disposable log scope</returns>
+        private static IDisposable ConfigureLogging(ILogWriteHandler logWriteHandler, Dictionary<string, string> commandlineOptions)
         {
-            if (writeConsole)
+            IDisposable logScope;
+            //Log various information in the logfile
+            if (DEBUG_MODE && !commandlineOptions.ContainsKey(LOG_FILE_OPTION))
+            {
+                var prefix = System.Reflection.Assembly.GetEntryAssembly().GetName().Name.StartsWith("Duplicati.Server") ? "server" : "trayicon";
+                commandlineOptions[LOG_FILE_OPTION] = System.IO.Path.Combine(StartupPath, $"Duplicati-{prefix}.debug.log");
+                commandlineOptions[LOG_LEVEL_OPTION] = Duplicati.Library.Logging.LogMessageType.Profiling.ToString();
+                if (System.IO.File.Exists(commandlineOptions[LOG_FILE_OPTION]))
+                    System.IO.File.Delete(commandlineOptions[LOG_FILE_OPTION]);
+            }
+
+            logScope = Log.StartScope(logWriteHandler, null);
+
+            if (commandlineOptions.ContainsKey(LOG_FILE_OPTION))
+            {
+                var loglevel = Library.Logging.LogMessageType.Warning;
+                if (commandlineOptions.ContainsKey(LOG_LEVEL_OPTION))
+                    Enum.TryParse(commandlineOptions[LOG_LEVEL_OPTION], true, out loglevel);
+
+                logWriteHandler.SetServerFile(commandlineOptions[LOG_FILE_OPTION], loglevel);
+            }
+
+            if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, LOG_CONSOLE_OPTION))
+            {
+                var loglevel = Library.Logging.LogMessageType.Information;
+                if (commandlineOptions.ContainsKey(LOG_LEVEL_OPTION))
+                    Enum.TryParse(commandlineOptions[LOG_LEVEL_OPTION], true, out loglevel);
+
+                logWriteHandler.AppendLogDestination(new ConsoleLogDestination(loglevel), loglevel);
+            }
+
+            if (commandlineOptions.TryGetValue(WINDOWS_EVENTLOG_OPTION, out var source) && !string.IsNullOrEmpty(source))
+            {
+                if (!OperatingSystem.IsWindows())
+                {
+                    Log.WriteWarningMessage(LOGTAG, "WindowsLogNotSupported", null, Strings.Program.WindowsEventLogNotSupported);
+                }
+                else
+                {
+                    if (!WindowsEventLogSource.SourceExists(source))
+                    {
+                        Log.WriteInformationMessage(LOGTAG, "WindowsLogMissingCreating", Strings.Program.WindowsEventLogSourceNotFound(source));
+                        try
+                        {
+                            WindowsEventLogSource.CreateEventSource(source);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.WriteWarningMessage(LOGTAG, "WindowsLogFailedCreate", ex, Strings.Program.WindowsEventLogSourceNotCreated(source));
+                        }
+                    }
+
+                    if (WindowsEventLogSource.SourceExists(source))
+                    {
+                        var loglevel = LogMessageType.Information;
+                        if (commandlineOptions.ContainsKey(WINDOWS_EVENTLOG_LEVEL_OPTION))
+                            Enum.TryParse(commandlineOptions[WINDOWS_EVENTLOG_LEVEL_OPTION], true, out loglevel);
+
+                        logWriteHandler.AppendLogDestination(new WindowsEventLogSource(source), loglevel);
+                    }
+                }
+            }
+
+            CrashlogHelper.OnUnobservedTaskException += (ex) => logWriteHandler.WriteMessage(new LogEntry(ex.Message, null, Library.Logging.LogMessageType.Error, LOGTAG, "UnobservedTaskException", ex));
+            return logScope;
+        }
+
+        /// <summary>
+        /// Shows the help information
+        /// </summary>
+        /// <param name="writeToConsoleOnException">Whether to write to console on exception</param>
+        /// <returns>An integer indicating the result</returns>
+        private static int ShowHelp(bool writeToConsoleOnException)
+        {
+            if (writeToConsoleOnException)
             {
                 Console.WriteLine(Strings.Program.HelpDisplayDialog);
 
-                foreach (Library.Interface.ICommandLineArgument arg in SupportedCommands)
+                foreach (var arg in SupportedCommands)
                     Console.WriteLine(Strings.Program.HelpDisplayFormat(arg.Name, arg.LongDescription));
 
                 return 0;
@@ -533,91 +1208,23 @@ namespace Duplicati.Server
             throw new Exception("Server invoked with --help");
         }
 
-        public static Database.Connection GetDatabaseConnection(Dictionary<string, string> commandlineOptions)
+        /// <summary>
+        /// Gets the database connection, upgrading the database if needed
+        /// </summary>
+        /// <param name="applicationSettings">The application settings</param>
+        /// <param name="commandlineOptions">The commandline options</param>
+        /// <param name="silentConsole">Whether to suppress console output</param>
+        /// <param name="changeDbEncryption">Whether to change the database encryption state if the arguments require it</param>
+        /// <returns>The database connection</returns>
+        public static Connection GetDatabaseConnection(IApplicationSettings applicationSettings, Dictionary<string, string> commandlineOptions, bool silentConsole, bool changeDbEncryption)
         {
-            var dbPassword = Environment.GetEnvironmentVariable(DB_KEY_ENV_NAME);
+            // Emit a warning if the database is stored in the Windows folder
+            if (Util.IsPathUnderWindowsFolder(applicationSettings.DataFolder))
+                Log.WriteWarningMessage(LOGTAG, "DatabaseInWindowsFolder", null, "The database is stored in the Windows folder, this is not recommended as it will be deleted on Windows upgrades.");
 
-            //If we are on windows we encrypt the database by default
-            //We do not encrypt on Linux as most distros use a SQLite library without encryption support,
-            //Linux users can use an encrypted home folder, or install a SQLite library with encryption support
+            CrashlogHelper.DefaultLogDir = applicationSettings.DataFolder;
 
-            //Note that the password here is a default password and public knowledge
-            //
-            //The purpose of this is to prevent casual read of the database, as well
-            // as protect from harddisk string scans, not to protect from determined
-            // attacks.
-            //
-            //If you desire better security, start Duplicati once with the commandline option
-            // --unencrypted-database to decrypt the database.
-            //Then set the environment variable DUPLICATI_DB_KEY to the desired key,
-            // and run Duplicati again without the --unencrypted-database option
-            // to re-encrypt it with the new key
-            //
-            //If you change the key, please note that you need to supply the same
-            // key when restoring the setup, as the setup being backed up will
-            // be encrypted as well.
-            if (!Platform.IsClientPosix && string.IsNullOrEmpty(dbPassword))
-                dbPassword = Library.AutoUpdater.AutoUpdateSettings.AppName + "_Key_42";
-
-            // Allow override of the environment variables from the commandline
-            if (commandlineOptions.ContainsKey("server-encryption-key"))
-                dbPassword = commandlineOptions["server-encryption-key"];
-
-            var serverDataFolder = Environment.GetEnvironmentVariable(DATAFOLDER_ENV_NAME);
-            if (commandlineOptions.ContainsKey("server-datafolder"))
-                serverDataFolder = commandlineOptions["server-datafolder"];
-
-            if (string.IsNullOrEmpty(serverDataFolder))
-            {
-#if DEBUG
-                //debug mode uses a lock file located in the app folder
-                DataFolder = StartupPath;
-#else
-                bool portableMode = commandlineOptions.ContainsKey("portable-mode") ? Library.Utility.Utility.ParseBool(commandlineOptions["portable-mode"], true) : false;
-
-                if (portableMode)
-                {
-                    //Portable mode uses a data folder in the application home dir
-                    DataFolder = System.IO.Path.Combine(StartupPath, "data");
-                    System.IO.Directory.SetCurrentDirectory(StartupPath);
-                }
-                else
-                {
-                    //Normal release mode uses the systems "(Local) Application Data" folder
-                    // %LOCALAPPDATA% on Windows, ~/.config on Linux
-
-                    // Special handling for Windows:
-                    //   - Older versions use %APPDATA%
-                    //   - but new versions use %LOCALAPPDATA%
-                    //
-                    //  If we find a new version, lets use that
-                    //    otherwise use the older location
-                    //
-
-                    serverDataFolder = System.IO.Path.Combine(System.Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), Library.AutoUpdater.AutoUpdateSettings.AppName);
-                    if (Platform.IsClientWindows)
-                    {
-                        var localappdata = System.IO.Path.Combine(System.Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), Library.AutoUpdater.AutoUpdateSettings.AppName);
-
-                        var prefile = System.IO.Path.Combine(serverDataFolder, "Duplicati-server.sqlite");
-                        var curfile = System.IO.Path.Combine(localappdata, "Duplicati-server.sqlite");
-
-                        // If the new file exists, we use that
-                        // If the new file does not exist, and the old file exists we use the old
-                        // Otherwise we use the new location
-                        if (System.IO.File.Exists(curfile) || !System.IO.File.Exists(prefile))
-                            serverDataFolder = localappdata;
-                    }
-
-                    DataFolder = serverDataFolder;
-                }
-#endif
-            }
-            else
-                DataFolder = Util.AppendDirSeparator(Environment.ExpandEnvironmentVariables(serverDataFolder).Trim('"'));
-
-            var sqliteVersion = new Version((string)Duplicati.Library.SQLiteHelper.SQLiteLoader.SQLiteConnectionType.GetProperty("SQLiteVersion").GetValue(null, null));
-
+            var sqliteVersion = new Version(Duplicati.Library.SQLiteHelper.SQLiteLoader.SQLiteVersion);
             if (sqliteVersion < new Version(3, 6, 3))
             {
                 //The official Mono SQLite provider is also broken with less than 3.6.3
@@ -627,23 +1234,26 @@ namespace Duplicati.Server
             //Create the connection instance
             var con = Library.SQLiteHelper.SQLiteLoader.LoadConnection();
 
+            var databasePath = System.IO.Path.Combine(applicationSettings.DataFolder, DataFolderManager.SERVER_DATABASE_FILENAME);
+
+            // If the user has requested that the database is not automatically created,
+            // verify that it exists before attempting to open it
+            if (Library.Utility.Utility.ParseBoolOption(commandlineOptions, WebServerLoader.OPTION_WEBSERVICE_DONT_AUTOCREATE_DATABASE)
+                && !System.IO.File.Exists(databasePath))
+                throw new UserInformationException(Strings.Program.DatabaseMissingAndAutocreateDisabled(databasePath, WebServerLoader.OPTION_WEBSERVICE_DONT_AUTOCREATE_DATABASE), "DatabaseMissingAutocreateDisabled");
+
             try
             {
-                DatabasePath = System.IO.Path.Combine(DataFolder, "Duplicati-server.sqlite");
+                // Ensure the directory holding the database exists and has secure permissions.
+                // This creates and locks down a missing folder, and verifies (rejecting an
+                // insecure, non-canonical folder unless the user has opted out) an existing one,
+                // guarding against the database being written into an unprotected directory.
+                DataFolderManager.PrepareSecureDataFolder(System.IO.Path.GetDirectoryName(databasePath), createIfMissing: true);
 
-                if (!System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(DatabasePath)))
-                    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(DatabasePath));
-#if DEBUG
-                //Default is to not use encryption for debugging
-                var useDatabaseEncryption = commandlineOptions.ContainsKey("unencrypted-database") && !Library.Utility.Utility.ParseBool(commandlineOptions["unencrypted-database"], true);
-#else
-                var useDatabaseEncryption = !commandlineOptions.ContainsKey("unencrypted-database") || !Library.Utility.Utility.ParseBool(commandlineOptions["unencrypted-database"], true);
-#endif
+                // Attempt to open the database, removing any encryption present
+                Library.SQLiteHelper.SQLiteLoader.OpenDatabaseAsync(con, databasePath, Library.SQLiteHelper.SQLiteRC4Decrypter.GetEncryptionPassword(commandlineOptions)).Await();
 
-                //Attempt to open the database, handling any encryption present
-                Duplicati.Library.SQLiteHelper.SQLiteLoader.OpenDatabase(con, DatabasePath, useDatabaseEncryption, dbPassword);
-
-                Duplicati.Library.SQLiteHelper.DatabaseUpgrader.UpgradeDatabase(con, DatabasePath, typeof(Database.Connection));
+                Library.SQLiteHelper.DatabaseUpgrader.UpgradeDatabase(con, databasePath, typeof(Library.RestAPI.Database.DatabaseSchemaMarker));
             }
             catch (Exception ex)
             {
@@ -651,92 +1261,185 @@ namespace Duplicati.Server
                 if (ex is System.Reflection.TargetInvocationException && ex.InnerException != null)
                     ex = ex.InnerException;
 
-                throw new Exception(Strings.Program.DatabaseOpenError(ex.Message));
+                throw new Exception(Strings.Program.DatabaseOpenError(ex.Message), ex);
             }
 
-            return new Database.Connection(con);
+            var disableDbEncryption = Library.Utility.Utility.ParseBoolOption(commandlineOptions, DISABLE_DB_ENCRYPTION_OPTION);
+            var requireDbEncryptionKey = Library.Utility.Utility.ParseBoolOption(commandlineOptions, REQUIRE_DB_ENCRYPTION_KEY_OPTION);
+            var encKey = EncryptedFieldHelper.KeyInstance.CreateKeyIfValid(commandlineOptions.GetValueOrDefault(SETTINGS_ENCRYPTION_KEY_OPTION));
+            var hasValidEncryptionKey = encKey != null;
+
+            // Don't encrypt the database in debug mode, unless explicitly requested
+            if (DEBUG_MODE)
+            {
+                if (string.IsNullOrWhiteSpace(commandlineOptions.GetValueOrDefault(DISABLE_DB_ENCRYPTION_OPTION)))
+                    disableDbEncryption = true;
+            }
+
+            var hasEncryptedFields = false;
+            var warnedAboutEncryptedDb = false;
+            try
+            {
+                using (var cmd = con.CreateCommand(@$"SELECT ""Value"" FROM ""Option"" WHERE ""Name"" = @Name AND ""BackupID"" = @BackupId"))
+                    hasEncryptedFields = Library.Utility.Utility.ParseBool(cmd
+                        .SetParameterValue("@Name", Database.ServerSettings.CONST.ENCRYPTED_FIELDS)
+                        .SetParameterValue("@BackupId", Connection.SERVER_SETTINGS_ID).ExecuteScalar()?.ToString(), false);
+            }
+            catch
+            {
+                // Ignore errors here, as we are just checking for a potential issue
+                // Only negative effect is that we do not show a potentially helpful warning
+            }
+
+            var defaultSecretProvider = SecretProviderHelper.GetDefaultSecretProviderAsync(commandlineOptions, CancellationToken.None).Await();
+            applicationSettings.DefaultSecretProvider = defaultSecretProvider;
+
+            // If we are supposed to have an encryption key, but do not, try to get it from the (default) secret provider
+            if (!hasValidEncryptionKey && defaultSecretProvider != null)
+            {
+                string encryptionKey = null;
+                try
+                {
+                    encryptionKey = defaultSecretProvider.ResolveSecretAsync(DATABASE_SECRET_VALUE_NAME, CancellationToken.None).Await();
+                }
+                catch
+                {
+                    Log.WriteInformationMessage(LOGTAG, "SecretProviderFailedToGetEncryptionKey", Strings.Program.SecretProviderFailedToGetEncryptionKey);
+                    if (!silentConsole)
+                        Console.WriteLine(Strings.Program.SecretProviderFailedToGetEncryptionKey);
+                }
+
+                // If there is no encryption key, and the secret provider supports setting secrets, try to set the encryption key
+                // Avoid generating a new key if the database is already encrypted as this will make a new key that will not work
+                if (!disableDbEncryption && string.IsNullOrWhiteSpace(encryptionKey) && defaultSecretProvider.IsSetSupported && !hasEncryptedFields)
+                {
+                    var tmpkey = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
+                    try
+                    {
+                        defaultSecretProvider.SetSecretAsync(
+                            DATABASE_SECRET_VALUE_NAME, tmpkey, false,
+                            CancellationToken.None).Await();
+
+                        // For some cloud providers, this can sometimes fail due to eventual consistency
+                        // For now, the solution is that settings will be encrypted in the next run
+                        var tmp = defaultSecretProvider.ResolveSecretAsync(DATABASE_SECRET_VALUE_NAME, CancellationToken.None).Await();
+
+                        if (tmp != tmpkey)
+                            throw new Exception("Secret provider did not return the expected value");
+
+                        encryptionKey = tmpkey;
+                    }
+                    catch
+                    {
+                        Log.WriteVerboseMessage(LOGTAG, "SecretProviderFailedToSetEncryptionKey", null, Strings.Program.SecretProviderFailedToSetEncryptionKey);
+                        if (!silentConsole)
+                            Console.WriteLine(Strings.Program.SecretProviderFailedToSetEncryptionKey);
+                    }
+                }
+
+                // If we got an encryption key (or created one), apply it
+                if (!string.IsNullOrWhiteSpace(encryptionKey))
+                {
+                    encKey = EncryptedFieldHelper.KeyInstance.CreateKeyIfValid(encryptionKey);
+                    hasValidEncryptionKey = encKey != null;
+                }
+            }
+
+            if (requireDbEncryptionKey && !(hasValidEncryptionKey || disableDbEncryption))
+                throw new UserInformationException(Strings.Program.DatabaseEncryptionKeyRequired(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME, DISABLE_DB_ENCRYPTION_OPTION), "RequireDbEncryptionKey");
+
+            applicationSettings.SettingsEncryptionKeyProvidedExternally = hasValidEncryptionKey;
+
+            if (hasEncryptedFields && !hasValidEncryptionKey)
+            {
+                warnedAboutEncryptedDb = true;
+                Log.WriteWarningMessage(LOGTAG, "EncryptionKeyMissing", null, Strings.Program.EncryptionKeyMissing(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME));
+                if (!silentConsole)
+                    Console.WriteLine(Strings.Program.EncryptionKeyMissing(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME));
+            }
+
+            if (!hasValidEncryptionKey && !disableDbEncryption)
+            {
+                disableDbEncryption = true;
+                if (!warnedAboutEncryptedDb)
+                {
+                    warnedAboutEncryptedDb = true;
+                    Log.WriteWarningMessage(LOGTAG, "MissingEncryptionKey", null, Strings.Program.NoEncryptionKeySpecified(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME, DISABLE_DB_ENCRYPTION_OPTION));
+                    if (!silentConsole)
+                        Console.WriteLine(Strings.Program.NoEncryptionKeySpecified(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME, DISABLE_DB_ENCRYPTION_OPTION));
+                }
+            }
+
+            var usingBlacklistedKey = encKey?.IsBlacklisted ?? false;
+            if (usingBlacklistedKey && !disableDbEncryption)
+            {
+                disableDbEncryption = true;
+                Log.WriteErrorMessage(LOGTAG, "BlacklistedEncryptionKey", null, Strings.Program.BlacklistedEncryptionKey(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME, DISABLE_DB_ENCRYPTION_OPTION));
+                if (!silentConsole)
+                    Console.WriteLine(Strings.Program.BlacklistedEncryptionKey(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME, DISABLE_DB_ENCRYPTION_OPTION));
+            }
+
+            return new Connection(con, disableDbEncryption, encKey, applicationSettings.DataFolder, applicationSettings.StartOrStopUsageReporter);
         }
 
-        public static void StartOrStopUsageReporter()
+        /// <summary>
+        /// Starts or stops the usage reporter based on application settings
+        /// </summary>
+        /// <param name="connection">The connection</param>
+        private static void StartOrStopUsageReporter(Connection connection)
         {
             var disableUsageReporter =
-                string.Equals(DataConnection.ApplicationSettings.UsageReporterLevel, "none", StringComparison.OrdinalIgnoreCase)
+                string.Equals(connection.ApplicationSettings.UsageReporterLevel, "none", StringComparison.OrdinalIgnoreCase)
                 ||
-                string.Equals(DataConnection.ApplicationSettings.UsageReporterLevel, "disabled", StringComparison.OrdinalIgnoreCase);
+                string.Equals(connection.ApplicationSettings.UsageReporterLevel, "disabled", StringComparison.OrdinalIgnoreCase);
 
-            Library.UsageReporter.ReportType reportLevel;
-            if (!Enum.TryParse<Library.UsageReporter.ReportType>(DataConnection.ApplicationSettings.UsageReporterLevel, true, out reportLevel))
+            if (!Enum.TryParse<Library.UsageReporter.ReportType>(connection.ApplicationSettings.UsageReporterLevel, true, out var reportLevel))
                 Library.UsageReporter.Reporter.SetReportLevel(null, disableUsageReporter);
             else
                 Library.UsageReporter.Reporter.SetReportLevel(reportLevel, disableUsageReporter);
         }
 
-        public static void UpdateThrottleSpeeds()
-        {
-            if (Program.WorkThread == null)
-                return;
-
-            var cur = Program.WorkThread.CurrentTask;
-            if (cur != null)
-                cur.UpdateThrottleSpeed();
-        }
-
-        private static void SignalNewEvent(object sender, EventArgs e)
-        {
-            StatusEventNotifyer.SignalNewEvent();
-        }
-
-
-        /// <summary>
-        /// Handles a change in the LiveControl and updates the Runner
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        private static void LiveControl_ThreadPriorityChanged(object sender, EventArgs e)
-        {
-            StatusEventNotifyer.SignalNewEvent();
-        }
-
-        /// <summary>
-        /// Handles a change in the LiveControl and updates the Runner
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        private static void LiveControl_ThrottleSpeedChanged(object sender, EventArgs e)
-        {
-            StatusEventNotifyer.SignalNewEvent();
-        }
-
         /// <summary>
         /// This event handler updates the trayicon menu with the current state of the runner.
         /// </summary>
-        static void LiveControl_StateChanged(object sender, EventArgs e)
+        /// <exception cref="ArgumentOutOfRangeException"></exception>
+        private static void LiveControl_StateChanged(IQueueRunnerService queueRunnerService, Connection connection, EventPollNotify eventPollNotify, ISchedulerService schedulerService, LiveControls.LiveControlEvent e)
         {
-            switch (LiveControl.State)
+            var appSettings = connection.ApplicationSettings;
+            switch (e.State)
             {
                 case LiveControls.LiveControlState.Paused:
                     {
-                        WorkThread.Pause();
-                        var t = WorkThread.CurrentTask;
-                        t?.Pause();
+                        queueRunnerService.Pause();
+                        queueRunnerService.GetCurrentTask()?.PauseAsync(e.TransfersPaused).Await();
+                        // A pause for a suspend ends when the system resumes, and has no expiration
+                        // of its own. Stored, it would be read at the next start as a pause with no
+                        // end, so a restart before the resume would leave the server paused.
+                        appSettings.PausedUntil = e.PausedForSuspend ? null : e.WaitTimeExpiration;
                         break;
                     }
                 case LiveControls.LiveControlState.Running:
                     {
-                        WorkThread.Resume();
-                        var t = WorkThread.CurrentTask;
-                        t?.Resume();
+                        queueRunnerService.Resume();
+                        queueRunnerService.GetCurrentTask()?.ResumeAsync().Await();
+                        schedulerService?.Reschedule();
+                        appSettings.PausedUntil = null;
                         break;
                     }
+                default:
+                    Log.WriteWarningMessage(LOGTAG, "InvalidPauseResumeState", null, Strings.Program.InvalidPauseResumeState(LiveControl.State));
+                    break;
             }
 
-            StatusEventNotifyer.SignalNewEvent();
+            eventPollNotify.SignalNewEvent();
+
         }
-               
+
         /// <summary>
         /// Simple method for tracking if the server has crashed
         /// </summary>
-        private static void PingPongMethod()
+        /// <param name="applicationSettings">The application settings</param>
+        private static void PingPongMethod(IApplicationSettings applicationSettings)
         {
             var rd = new System.IO.StreamReader(Console.OpenStandardInput());
             var wr = new System.IO.StreamWriter(Console.OpenStandardOutput());
@@ -747,7 +1450,7 @@ namespace Duplicati.Server
                 {
                     // TODO: All calls to ApplicationExitEvent and TrayIcon->Quit
                     // should check if we are running something
-                    ApplicationExitEvent.Set();
+                    applicationSettings.SignalApplicationExit();
                 }
                 else
                 {
@@ -758,57 +1461,296 @@ namespace Duplicati.Server
         }
 
         /// <summary>
+        /// Handles the --configure-https option by generating and installing HTTPS certificates.
+        /// </summary>
+        /// <param name="connection">The database connection.</param>
+        /// <param name="commandlineOptions">The commandline options.</param>
+        private static void HandleConfigureHttps(Connection connection, Dictionary<string, string> commandlineOptions)
+        {
+            var hostnames = commandlineOptions.GetValueOrDefault(WebServerLoader.OPTION_CONFIGURE_HTTPS_HOSTNAMES);
+
+            // Read existing certificate data from database
+            var isAutogenerated = connection.ApplicationSettings.ServerSSLCertificateAutogenerated;
+            var serverCert = connection.ApplicationSettings.ServerSSLCertificate;
+            var caCert = connection.ApplicationSettings.ServerCACertificate;
+            var caKey = connection.ApplicationSettings.ServerCACertificateKey;
+            var caPassword = connection.ApplicationSettings.ServerCACertificatePassword;
+
+            CACertificateData caData = null;
+            if (!string.IsNullOrEmpty(caCert) && !string.IsNullOrEmpty(caKey) && !string.IsNullOrEmpty(caPassword))
+            {
+                caData = new CACertificateData
+                {
+                    CACertificate = caCert,
+                    CAKey = caKey,
+                    CAPassword = caPassword
+                };
+            }
+
+            var result = CertificateRenewalChecker.GenerateAndInstallCertificates(
+                isAutogenerated,
+                serverCert,
+                caData,
+                hostnames,
+                skipTrustInstallation: false);
+
+            if (result.Success)
+            {
+                Log.WriteInformationMessage(LOGTAG, "ConfigureHttpsComplete", "HTTPS certificates configured successfully.");
+
+                // Store generated/renewed certificates in database
+                if (result.CACertificate != null && result.ServerCertificate != null)
+                {
+                    // New CA + server certificate generated
+                    var settings = new Dictionary<string, string>
+                    {
+                        [Database.ServerSettings.CONST.SERVER_CA_CERTIFICATE] = result.CACertificate.CACertificate,
+                        [Database.ServerSettings.CONST.SERVER_CA_CERTIFICATE_KEY] = result.CACertificate.CAKey,
+                        [Database.ServerSettings.CONST.SERVER_CA_CERTIFICATE_PASSWORD] = result.CACertificate.CAPassword,
+                        [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATE] = result.ServerCertificate.ServerCertificate,
+                        [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATEPASSWORD] = result.ServerCertificate.Password,
+                        [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATE_AUTOGENERATED] = "true"
+                    };
+
+                    connection.ApplicationSettings.UpdateSettings(settings, false);
+
+                    // Check if database is encrypted and emit warning if not
+                    if (!connection.IsEncryptingFields)
+                        EmitUnencryptedDatabaseWarning(connection);
+                }
+                else if (result.ServerCertificate != null)
+                {
+                    // Server certificate renewed using existing CA
+                    var settings = new Dictionary<string, string>
+                    {
+                        [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATE] = result.ServerCertificate.ServerCertificate,
+                        [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATEPASSWORD] = result.ServerCertificate.Password,
+                        [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATE_AUTOGENERATED] = "true"
+                    };
+
+                    connection.ApplicationSettings.UpdateSettings(settings, false);
+
+                    // Check if database is encrypted and emit warning if not
+                    if (!connection.IsEncryptingFields)
+                        EmitUnencryptedDatabaseWarning(connection);
+                }
+            }
+            else
+            {
+                Log.WriteErrorMessage(LOGTAG, "ConfigureHttpsFailed", null, "Failed to configure HTTPS certificates.");
+            }
+        }
+
+        /// <summary>
+        /// Checks if the server certificate needs renewal and performs renewal if necessary.
+        /// Handles database I/O for the renewal process.
+        /// </summary>
+        /// <param name="connection">The database connection.</param>
+        /// <returns>A result object containing renewal status and any failure reason.</returns>
+        private static CertificateRenewalResult CheckAndRenewCertificate(Connection connection)
+        {
+            // Read certificate data from database
+            var isAutogenerated = connection.ApplicationSettings.ServerSSLCertificateAutogenerated;
+            var serverCert = connection.ApplicationSettings.ServerSSLCertificate;
+            var caCert = connection.ApplicationSettings.ServerCACertificate;
+            var caKey = connection.ApplicationSettings.ServerCACertificateKey;
+            var caPassword = connection.ApplicationSettings.ServerCACertificatePassword;
+
+            CACertificateData caData = null;
+            if (!string.IsNullOrEmpty(caCert) && !string.IsNullOrEmpty(caKey) && !string.IsNullOrEmpty(caPassword))
+            {
+                caData = new CACertificateData
+                {
+                    CACertificate = caCert,
+                    CAKey = caKey,
+                    CAPassword = caPassword
+                };
+            }
+
+            // Check and renew if needed
+            var result = CertificateRenewalChecker.CheckAndRenewIfNeeded(isAutogenerated, serverCert, caData);
+
+            // If renewed, store the new certificate in database
+            if (result.Renewed && result.RenewedCertificate != null)
+            {
+                var settings = new Dictionary<string, string>
+                {
+                    [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATE] = result.RenewedCertificate.ServerCertificate,
+                    [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATEPASSWORD] = result.RenewedCertificate.Password,
+                    [Database.ServerSettings.CONST.SERVER_SSL_CERTIFICATE_AUTOGENERATED] = "true"
+                };
+
+                connection.ApplicationSettings.UpdateSettings(settings, false);
+
+                // Check if database is encrypted and emit warning if not
+                if (!connection.IsEncryptingFields)
+                    EmitUnencryptedDatabaseWarning(connection);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Emits a warning notification if the database is not encrypted.
+        /// </summary>
+        /// <param name="connection">The database connection.</param>
+        private static void EmitUnencryptedDatabaseWarning(Connection connection)
+        {
+            connection.RegisterNotification(
+                Serialization.NotificationType.Warning,
+                "Unencrypted database with CA key",
+                "The database is not encrypted and contains the CA private key. This is a major security risk and could allow MitM attacks on all HTTPS connections. Consider enabling database encryption.",
+                null,
+                null,
+                NOTIFICATION_CA_KEY_UNENCRYPTED_DATABASE,
+                null,
+                "UnencryptedDatabaseWithCAKey",
+                null,
+                (self, all) =>
+                {
+                    return all.FirstOrDefault(x => x.Action == NOTIFICATION_CA_KEY_UNENCRYPTED_DATABASE) ?? self;
+                }
+            );
+        }
+
+        /// <summary>
+        /// Registers a notification for certificate renewal failure.
+        /// </summary>
+        /// <param name="connection">The database connection.</param>
+        /// <param name="reason">The reason for the failure.</param>
+        private static void RegisterRenewalFailedNotification(Connection connection, string reason)
+        {
+            connection.RegisterNotification(
+                Serialization.NotificationType.Error,
+                "Certificate renewal failed",
+                $"The automatic renewal of the HTTPS certificate failed: {reason}. Please run '{PackageHelper.GetExecutableName(PackageHelper.NamedExecutable.ConfigureTool)} https regenerate-ca' to generate new certificates.",
+                null,
+                null,
+                NOTIFICATION_CERTIFICATE_RENEWAL_FAILED,
+                null,
+                "CertificateRenewalFailed",
+                null,
+                (self, all) =>
+                {
+                    return all.FirstOrDefault(x => x.Action == NOTIFICATION_CERTIFICATE_RENEWAL_FAILED) ?? self;
+                }
+            );
+        }
+
+        /// <summary>
         /// The default log retention
         /// </summary>
         private static readonly string DEFAULT_LOG_RETENTION = "30D";
 
         /// <summary>
+        /// The options related to the secret provider
+        /// </summary>
+        /// <remarks>
+        /// This call will invoke the DataFolderManager and read the installid/machineid, which are not yet created.
+        /// Keeping this as a property ensures we delay-load this instead of statically initialize it.
+        /// </remarks>
+        private static IReadOnlyList<ICommandLineArgument> SECRET_PROVIDER_OPTIONS => new Options(new Dictionary<string, string>())
+            .SupportedCommands.Where(x => x.Name.StartsWith("secret-provider") || x.Name == SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION).ToList();
+
+        /// <summary>
+        /// Gets additional commandline arguments support on Windows
+        /// </summary>
+        private static ICommandLineArgument[] WindowsOptions => OperatingSystem.IsWindows()
+            ? [
+                new CommandLineArgument(WINDOWS_EVENTLOG_OPTION, CommandLineArgument.ArgumentType.String, Strings.Program.LogwindowseventlogShort, Strings.Program.LogwindowseventlogLong),
+                new CommandLineArgument(WINDOWS_EVENTLOG_LEVEL_OPTION, CommandLineArgument.ArgumentType.Enumeration, Strings.Program.LogwindowseventloglevelShort, Strings.Program.LogwindowseventloglevelLong, Library.Logging.LogMessageType.Information.ToString(), null, Enum.GetNames(typeof(Duplicati.Library.Logging.LogMessageType)))
+            ]
+            : [];
+
+        /// <summary>
         /// Gets a list of all supported commandline options
         /// </summary>
-        public static Library.Interface.ICommandLineArgument[] SupportedCommands
-        {
-            get
-            {
-                var lst = new List<Duplicati.Library.Interface.ICommandLineArgument> (new Duplicati.Library.Interface.ICommandLineArgument[] {
-                    new Duplicati.Library.Interface.CommandLineArgument("tempdir", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Path, Strings.Program.TempdirShort, Strings.Program.TempdirLong, System.IO.Path.GetTempPath()),
-                    new Duplicati.Library.Interface.CommandLineArgument("help", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Boolean, Strings.Program.HelpCommandDescription, Strings.Program.HelpCommandDescription),
-                    new Duplicati.Library.Interface.CommandLineArgument("parameters-file", Library.Interface.CommandLineArgument.ArgumentType.Path, Strings.Program.ParametersFileOptionShort, Strings.Program.ParametersFileOptionLong2, "", new string[] {"parameter-file", "parameterfile"}),
-                    new Duplicati.Library.Interface.CommandLineArgument("unencrypted-database", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Boolean, Strings.Program.UnencrypteddatabaseCommandDescription, Strings.Program.UnencrypteddatabaseCommandDescription),
-                    new Duplicati.Library.Interface.CommandLineArgument("portable-mode", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Boolean, Strings.Program.PortablemodeCommandDescription, Strings.Program.PortablemodeCommandDescription),
-                    new Duplicati.Library.Interface.CommandLineArgument("log-file", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Path, Strings.Program.LogfileCommandDescription, Strings.Program.LogfileCommandDescription),
-                    new Duplicati.Library.Interface.CommandLineArgument("log-level", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Enumeration, Strings.Program.LoglevelCommandDescription, Strings.Program.LoglevelCommandDescription, "Warning", null, Enum.GetNames(typeof(Duplicati.Library.Logging.LogMessageType))),
-                    new Duplicati.Library.Interface.CommandLineArgument(Duplicati.Server.WebServer.Server.OPTION_WEBROOT, Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Path, Strings.Program.WebserverWebrootDescription, Strings.Program.WebserverWebrootDescription, Duplicati.Server.WebServer.Server.DEFAULT_OPTION_WEBROOT),
-                    new Duplicati.Library.Interface.CommandLineArgument(Duplicati.Server.WebServer.Server.OPTION_PORT, Duplicati.Library.Interface.CommandLineArgument.ArgumentType.String, Strings.Program.WebserverPortDescription, Strings.Program.WebserverPortDescription, Duplicati.Server.WebServer.Server.DEFAULT_OPTION_PORT.ToString()),
-                    new Duplicati.Library.Interface.CommandLineArgument(Duplicati.Server.WebServer.Server.OPTION_SSLCERTIFICATEFILE, Duplicati.Library.Interface.CommandLineArgument.ArgumentType.String, Strings.Program.WebserverCertificateFileDescription, Strings.Program.WebserverCertificateFileDescription, Duplicati.Server.WebServer.Server.OPTION_SSLCERTIFICATEFILE),
-                    new Duplicati.Library.Interface.CommandLineArgument(Duplicati.Server.WebServer.Server.OPTION_SSLCERTIFICATEFILEPASSWORD, Duplicati.Library.Interface.CommandLineArgument.ArgumentType.String, Strings.Program.WebserverCertificatePasswordDescription, Strings.Program.WebserverCertificatePasswordDescription, Duplicati.Server.WebServer.Server.OPTION_SSLCERTIFICATEFILEPASSWORD),
-                    new Duplicati.Library.Interface.CommandLineArgument(Duplicati.Server.WebServer.Server.OPTION_INTERFACE, Duplicati.Library.Interface.CommandLineArgument.ArgumentType.String, Strings.Program.WebserverInterfaceDescription, Strings.Program.WebserverInterfaceDescription, Duplicati.Server.WebServer.Server.DEFAULT_OPTION_INTERFACE),
-                    new Duplicati.Library.Interface.CommandLineArgument("webservice-password", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Password, Strings.Program.WebserverPasswordDescription, Strings.Program.WebserverPasswordDescription),
-                    new Duplicati.Library.Interface.CommandLineArgument("webservice-allowed-hostnames", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.String, Strings.Program.WebserverAllowedhostnamesDescription, Strings.Program.WebserverAllowedhostnamesDescription),
-                    new Duplicati.Library.Interface.CommandLineArgument("ping-pong-keepalive", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Boolean, Strings.Program.PingpongkeepaliveShort, Strings.Program.PingpongkeepaliveLong),
-                    new Duplicati.Library.Interface.CommandLineArgument("log-retention", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Timespan, Strings.Program.LogretentionShort, Strings.Program.LogretentionLong, DEFAULT_LOG_RETENTION),
-                    new Duplicati.Library.Interface.CommandLineArgument("server-datafolder", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Path, Strings.Program.ServerdatafolderShort, Strings.Program.ServerdatafolderLong(DATAFOLDER_ENV_NAME), System.IO.Path.Combine(System.Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), Library.AutoUpdater.AutoUpdateSettings.AppName)),
+        public static ICommandLineArgument[] SupportedCommands =>
+        [
+            .. WindowsOptions,
+            new CommandLineArgument(TEMPDIR_OPTION, CommandLineArgument.ArgumentType.Path, Strings.Program.TempdirShort, Strings.Program.TempdirLong, System.IO.Path.GetTempPath()),
+            new CommandLineArgument(FORCE_LOCALE_OPTION, CommandLineArgument.ArgumentType.String, Strings.Program.ForcelocaleShort, Strings.Program.ForcelocaleLong),
+            new CommandLineArgument(HELP_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.HelpCommandDescription, Strings.Program.HelpCommandDescription),
+            new CommandLineArgument(PARAMETERS_FILE_OPTION, CommandLineArgument.ArgumentType.Path, Strings.Program.ParametersFileOptionShort, Strings.Program.ParametersFileOptionLong, "", PARAMETERS_FILE_OPTION_EXTRAS),
+            new CommandLineArgument(DataFolderManager.PORTABLE_MODE_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.PortablemodeCommandDescription, Strings.Program.PortablemodeCommandDescription, DataFolderManager.PORTABLE_MODE.ToString().ToLowerInvariant()),
+            new CommandLineArgument(LOG_FILE_OPTION, CommandLineArgument.ArgumentType.Path, Strings.Program.LogfileCommandDescription, Strings.Program.LogfileCommandDescription),
+            new CommandLineArgument(LOG_LEVEL_OPTION, CommandLineArgument.ArgumentType.Enumeration, Strings.Program.LoglevelCommandDescription, Strings.Program.LoglevelCommandDescription, Library.Logging.LogMessageType.Warning.ToString(), null, Enum.GetNames(typeof(Duplicati.Library.Logging.LogMessageType))),
+            new CommandLineArgument(LOG_CONSOLE_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.LogConsoleDescription, Strings.Program.LogConsoleDescription, false.ToString()),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBROOT, CommandLineArgument.ArgumentType.Path, Strings.Program.WebserverWebrootDescription, Strings.Program.WebserverWebrootDescription, WebServerLoader.DEFAULT_OPTION_WEBROOT),
+            new CommandLineArgument(WebServerLoader.OPTION_PORT, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverPortDescription, Strings.Program.WebserverPortDescription, WebServerLoader.DEFAULT_OPTION_PORT.ToString()),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_DISABLEHTTPS, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverDisableHTTPSDescription, Strings.Program.WebserverDisableHTTPSDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_REMOVESSLCERTIFICATE, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverRemoveCertificateDescription, Strings.Program.WebserverRemoveCertificateDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_SSLCERTIFICATEFILE, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverCertificateFileDescription, Strings.Program.WebserverCertificateFileDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_SSLCERTIFICATEFILEPASSWORD, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverCertificatePasswordDescription, Strings.Program.WebserverCertificatePasswordDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_INTERFACE, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverInterfaceDescription, Strings.Program.WebserverInterfaceDescription, WebServerLoader.DEFAULT_OPTION_INTERFACE),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_PASSWORD, CommandLineArgument.ArgumentType.Password, Strings.Program.WebserverPasswordDescription, Strings.Program.WebserverPasswordDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_PASSWORD_INIT, CommandLineArgument.ArgumentType.Password, Strings.Program.WebserverPasswordInitDescription, Strings.Program.WebserverPasswordInitDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_ALLOWEDHOSTNAMES, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverAllowedhostnamesDescription, Strings.Program.WebserverAllowedhostnamesDescription, null, [WebServerLoader.OPTION_WEBSERVICE_ALLOWEDHOSTNAMES_ALT]),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_RESET_JWT_CONFIG, CommandLineArgument.ArgumentType.Boolean, Strings.Program.WebserverResetJwtConfigDescription, Strings.Program.WebserverResetJwtConfigDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_ENABLE_FOREVER_TOKEN, CommandLineArgument.ArgumentType.Boolean, Strings.Program.WebserverEnableForeverTokenDescription, Strings.Program.WebserverEnableForeverTokenDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_DISABLEAPIEXTENSIONS, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverDisableApiExtensionsDescription, Strings.Program.WebserverDisableApiExtensionsDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_API_ONLY, CommandLineArgument.ArgumentType.Boolean, Strings.Program.WebserverApiOnlyDescription, Strings.Program.WebserverApiOnlyDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_DONT_AUTOCREATE_DATABASE, CommandLineArgument.ArgumentType.Boolean, Strings.Program.WebserverDontAutocreateDatabaseDescription, Strings.Program.WebserverDontAutocreateDatabaseDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_DISABLE_SIGNIN_TOKENS, CommandLineArgument.ArgumentType.Boolean, Strings.Program.WebserverDisableSigninTokensDescription, Strings.Program.WebserverDisableSigninTokensDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_REDUCED_REPORTING, CommandLineArgument.ArgumentType.Boolean, Strings.Program.ReducedReportingShort, Strings.Program.ReducedReportingLong),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_SPAPATHS, CommandLineArgument.ArgumentType.Path, Strings.Program.WebserverSpaPathsDescription, Strings.Program.WebserverSpaPathsDescription, WebServerLoader.DEFAULT_OPTION_SPAPATHS),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_TIMEZONE, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverTimezoneDescription, Strings.Program.WebserverTimezoneDescription, TimeZoneHelper.GetLocalTimeZone(), null, TimeZoneHelper.GetTimeZones().Select(x => x.Id).ToArray()),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_CORS_ORIGINS, CommandLineArgument.ArgumentType.Path, Strings.Program.WebserverCorsOriginsDescription, Strings.Program.WebserverCorsOriginsDescription, WebServerLoader.DEFAULT_OPTION_SPAPATHS),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_PRE_AUTH_TOKENS, CommandLineArgument.ArgumentType.String, Strings.Program.WebserverPreAuthTokensDescription, Strings.Program.WebserverPreAuthTokensDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_TOKENDURATION, CommandLineArgument.ArgumentType.Timespan, Strings.Program.WebserverTokenDurationDescription, Strings.Program.WebserverTokenDurationDescription, WebServerLoader.DEFAULT_OPTION_TOKENDURATION),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_ENABLE_FOLDER_STATUS_SERVICE, CommandLineArgument.ArgumentType.Boolean, Strings.Program.WebserverEnableFolderStatusServiceDescription, Strings.Program.WebserverEnableFolderStatusServiceDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_WEBSERVICE_ENABLE_MCP_SERVER, CommandLineArgument.ArgumentType.Boolean, Strings.Program.WebserverEnableMcpServerDescription, Strings.Program.WebserverEnableMcpServerDescription),
+            new CommandLineArgument(WebServerLoader.OPTION_CONFIGURE_HTTPS, CommandLineArgument.ArgumentType.Boolean, Strings.Program.ConfigureHttpsShort, Strings.Program.ConfigureHttpsLong),
+            new CommandLineArgument(WebServerLoader.OPTION_CONFIGURE_HTTPS_HOSTNAMES, CommandLineArgument.ArgumentType.String, Strings.Program.ConfigureHttpsHostnamesShort, Strings.Program.ConfigureHttpsHostnamesLong),
+            new CommandLineArgument(WebServerLoader.OPTION_SUPPRESS_WELCOME_PAGE, CommandLineArgument.ArgumentType.Boolean, Strings.Program.SuppressWelcomePageShort, Strings.Program.SuppressWelcomePageLong),
+            new CommandLineArgument(PING_PONG_KEEPALIVE_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.PingpongkeepaliveShort, Strings.Program.PingpongkeepaliveLong),
+            new CommandLineArgument(DISABLE_UPDATE_CHECK_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.DisableupdatecheckShort, Strings.Program.DisableupdatecheckLong),
+            new CommandLineArgument(DISABLE_FILE_WATCHER_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.DisablefilewatcherShort, Strings.Program.DisablefilewatcherLong, "false"),
+            new CommandLineArgument(FILE_WATCHER_FLUSH_INTERVAL_OPTION, CommandLineArgument.ArgumentType.Timespan, Strings.Program.FilewatcherflushintervalShort, Strings.Program.FilewatcherflushintervalLong, ChangeTrackingSettings.DEFAULT_FLUSH_INTERVAL),
+            new CommandLineArgument(FILE_WATCHER_HIGH_WATER_OPTION, CommandLineArgument.ArgumentType.Integer, Strings.Program.FilewatcherhighwaterShort, Strings.Program.FilewatcherhighwaterLong, ChangeTrackingSettings.DEFAULT_HIGH_WATER_MARK.ToString()),
+            new CommandLineArgument(FILE_WATCHER_MAX_CHANGES_OPTION, CommandLineArgument.ArgumentType.Integer, Strings.Program.FilewatchermaxchangesShort, Strings.Program.FilewatchermaxchangesLong, ChangeTrackingSettings.DEFAULT_MAX_CHANGES.ToString()),
+            new CommandLineArgument(FILE_WATCHER_GRACE_DELAY_OPTION, CommandLineArgument.ArgumentType.Timespan, Strings.Program.FilewatchergracedelayShort, Strings.Program.FilewatchergracedelayLong, ChangeTrackingSettings.DEFAULT_GRACE_DELAY),
+            new CommandLineArgument(LOG_RETENTION_OPTION, CommandLineArgument.ArgumentType.Timespan, Strings.Program.LogretentionShort, Strings.Program.LogretentionLong, DEFAULT_LOG_RETENTION),
+            new CommandLineArgument(DataFolderManager.SERVER_DATAFOLDER_OPTION, CommandLineArgument.ArgumentType.Path, Strings.Program.ServerdatafolderShort, Strings.Program.ServerdatafolderLong(DataFolderManager.DATAFOLDER_ENV_NAME), DataFolderManager.GetDataFolder(DataFolderManager.AccessMode.ProbeOnly)),
+            new CommandLineArgument(DataFolderManager.ALLOW_INSECURE_DATAFOLDER_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.AllowInsecureDatafolderShort, Strings.Program.AllowInsecureDatafolderLong, false.ToString()),
+            new CommandLineArgument(DISABLE_DB_ENCRYPTION_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.DisabledbencryptionShort, Strings.Program.DisabledbencryptionLong),
+            new CommandLineArgument(DISABLE_DEFAULT_SECRET_PROVIDER_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.DisabledefaultsecretproviderShort, Strings.Program.DisabledefaultsecretproviderLong, "false", null, null, Strings.Program.DisabledefaultsecretproviderDeprecated(SecretProviderHelper.DISABLE_SECRET_PROVIDER_OPTION, Enum.GetName(SecretProviderHelper.DisableSecretProviderMode.Default))),
+            new CommandLineArgument(REQUIRE_DB_ENCRYPTION_KEY_OPTION, CommandLineArgument.ArgumentType.Boolean, Strings.Program.RequiredbencryptionShort, Strings.Program.RequiredbencryptionLong),
+            new CommandLineArgument(SETTINGS_ENCRYPTION_KEY_OPTION, CommandLineArgument.ArgumentType.Password, Strings.Program.SettingsencryptionkeyShort, Strings.Program.SettingsencryptionkeyLong(EncryptedFieldHelper.ENVIROMENT_VARIABLE_NAME)),
+            new CommandLineArgument(REGISTER_REMOTE_CONTROL_OPTION, CommandLineArgument.ArgumentType.String, Strings.Program.RegisterRemoteControlShort, Strings.Program.RegisterRemoteControlLong),
+            new CommandLineArgument(REGISTER_REMOTE_CONTROL_REREGISTER_OPTION, CommandLineArgument.ArgumentType.String, Strings.Program.RegisterRemoteControlReregisterShort, Strings.Program.RegisterRemoteControlReregisterLong),
+            new CommandLineArgument(ALLOWED_BACKEND_MODULES, CommandLineArgument.ArgumentType.String, Strings.Program.AllowedBackendModulesShort, Strings.Program.AllowedBackendModulesLong),
+            new CommandLineArgument(ALLOWED_ENCRYPTION_MODULES, CommandLineArgument.ArgumentType.String, Strings.Program.AllowedEncryptionModulesShort, Strings.Program.AllowedEncryptionModulesLong),
+            new CommandLineArgument(ALLOWED_COMPRESSION_MODULES, CommandLineArgument.ArgumentType.String, Strings.Program.AllowedCompressionModulesShort, Strings.Program.AllowedCompressionModulesLong),
+            .. SECRET_PROVIDER_OPTIONS
+        ];
 
-                });
+        /// <summary>
+        /// List of known duplicate option names
+        /// </summary>
+        public static readonly HashSet<string> KnownDuplicateOptions = new(StringComparer.OrdinalIgnoreCase);
 
-                if (!Platform.IsClientPosix)
-                    lst.Add(new Duplicati.Library.Interface.CommandLineArgument("server-encryption-key", Duplicati.Library.Interface.CommandLineArgument.ArgumentType.Password, Strings.Program.ServerencryptionkeyShort, Strings.Program.ServerencryptionkeyLong(DB_KEY_ENV_NAME, "unencrypted-database"), Library.AutoUpdater.AutoUpdateSettings.AppName + "_Key_42"));
-
-                return lst.ToArray();
-            }
-        }
-
-        private static bool ReadOptionsFromFile(string filename, ref Library.Utility.IFilter filter, List<string> cargs, Dictionary<string, string> options)
+        /// <summary>
+        /// Reads options from a file and applies them to the current commandline arguments and options
+        /// </summary>
+        /// <param name="filename">The filename</param>
+        /// <param name="filter">The filter</param>
+        /// <param name="cargs">The commandline arguments</param>
+        /// <param name="options">The options</param>
+        /// <returns>True if successful</returns>
+        private static void ReadOptionsFromFile(string filename, ref IFilter filter, List<string> cargs, Dictionary<string, string> options)
         {
             try
             {
-                List<string> fargs = new List<string>(Library.Utility.Utility.ReadFileWithDefaultEncoding(Environment.ExpandEnvironmentVariables(filename)).Replace("\r\n", "\n").Replace("\r", "\n").Split(new String[] { "\n" }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()));
+                var fargs = new List<string>(Library.Utility.Utility.ReadFileWithDefaultEncoding(Environment.ExpandEnvironmentVariables(filename)).Replace("\r\n", "\n").Replace("\r", "\n").Split(new String[] { "\n" }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()));
                 var newsource = new List<string>();
                 string newtarget = null;
                 string prependfilter = null;
                 string appendfilter = null;
                 string replacefilter = null;
 
-                var tmpparsed = Library.Utility.FilterCollector.ExtractOptions(fargs, (key, value) => {
+                var tmpparsed = FilterCollector.ExtractOptions(fargs, (key, value) =>
+                {
                     if (key.Equals("source", StringComparison.OrdinalIgnoreCase))
                     {
                         newsource.Add(value);
@@ -844,21 +1786,21 @@ namespace Duplicati.Server
                 // If the user specifies parameters-file, all filters must be in the file.
                 // Allowing to specify some filters on the command line could result in wrong filter ordering
                 if (!filter.Empty && !newfilter.Empty)
-                    throw new Duplicati.Library.Interface.UserInformationException(Strings.Program.FiltersCannotBeUsedWithFileError2, "FiltersCannotBeUsedOnCommandLineAndInParameterFile");
+                    throw new UserInformationException(Strings.Program.FiltersCannotBeUsedWithFileError2, "FiltersCannotBeUsedOnCommandLineAndInParameterFile");
 
                 if (!newfilter.Empty)
                     filter = newfilter;
 
                 if (!string.IsNullOrWhiteSpace(prependfilter))
-                    filter = Library.Utility.FilterExpression.Combine(Library.Utility.FilterExpression.Deserialize(prependfilter.Split(new string[] { System.IO.Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries)), filter);
+                    filter = FilterExpression.Combine(FilterExpression.Deserialize(prependfilter.Split([System.IO.Path.PathSeparator.ToString()], StringSplitOptions.RemoveEmptyEntries)), filter);
 
                 if (!string.IsNullOrWhiteSpace(appendfilter))
-                    filter = Library.Utility.FilterExpression.Combine(filter, Library.Utility.FilterExpression.Deserialize(appendfilter.Split(new string[] { System.IO.Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries)));
+                    filter = FilterExpression.Combine(filter, FilterExpression.Deserialize(appendfilter.Split([System.IO.Path.PathSeparator.ToString()], StringSplitOptions.RemoveEmptyEntries)));
 
                 if (!string.IsNullOrWhiteSpace(replacefilter))
-                    filter = Library.Utility.FilterExpression.Deserialize(replacefilter.Split(new string[] { System.IO.Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries));
+                    filter = FilterExpression.Deserialize(replacefilter.Split([System.IO.Path.PathSeparator.ToString()], StringSplitOptions.RemoveEmptyEntries));
 
-                foreach (KeyValuePair<String, String> keyvalue in opt)
+                foreach (var keyvalue in opt)
                     options[keyvalue.Key] = keyvalue.Value;
 
                 if (!string.IsNullOrEmpty(newtarget))
@@ -872,9 +1814,7 @@ namespace Duplicati.Server
                 if (cargs.Count >= 1 && cargs[0].Equals("backup", StringComparison.OrdinalIgnoreCase))
                     cargs.AddRange(newsource);
                 else if (newsource.Count > 0)
-                    Library.Logging.Log.WriteVerboseMessage(LOGTAG, "NotUsingBackupSources", Strings.Program.SkippingSourceArgumentsOnNonBackupOperation);
-
-                return true;
+                    Log.WriteVerboseMessage(LOGTAG, "NotUsingBackupSources", Strings.Program.SkippingSourceArgumentsOnNonBackupOperation);
             }
             catch (Exception e)
             {

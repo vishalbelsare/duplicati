@@ -1,27 +1,33 @@
-#region Disclaimer / License
-// Copyright (C) 2015, The Duplicati Team
-// http://www.duplicati.com, info@duplicati.com
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
 // 
-// This library is free software; you can redistribute it and/or
-// modify it under the terms of the GNU Lesser General Public
-// License as published by the Free Software Foundation; either
-// version 2.1 of the License, or (at your option) any later version.
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
 // 
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-// Lesser General Public License for more details.
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
 // 
-// You should have received a copy of the GNU Lesser General Public
-// License along with this library; if not, write to the Free Software
-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-// 
-#endregion
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
 using Duplicati.Library.Interface;
+using Duplicati.Library.Utility;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Globalization;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Duplicati.CommandLine.BackendTool
 {
@@ -31,17 +37,13 @@ namespace Duplicati.CommandLine.BackendTool
         /// The main entry point for the application.
         /// </summary>
         [STAThread]
-        public static int Main(string[] args)
-        {
-            Duplicati.Library.AutoUpdater.UpdaterManager.IgnoreWebrootFolder = true;
-            return Duplicati.Library.AutoUpdater.UpdaterManager.RunFromMostRecent(typeof(Program).GetMethod("RealMain"), args);
-        }
-
-        public static int RealMain(string[] _args)
+        public static int Main(string[] _args)
         {
             bool debugoutput = false;
             try
             {
+                Library.AutoUpdater.PreloadSettingsLoader.ConfigurePreloadSettings(ref _args, Library.AutoUpdater.PackageHelper.NamedExecutable.BackendTool);
+
                 List<string> args = new List<string>(_args);
                 Dictionary<string, string> options = Library.Utility.CommandLineParser.ExtractOptions(args);
 
@@ -67,6 +69,10 @@ namespace Duplicati.CommandLine.BackendTool
                         command = "put";
                     else if (args[0].Equals("delete", StringComparison.OrdinalIgnoreCase))
                         command = "delete";
+                    else if (args[0].Equals("get-lock", StringComparison.OrdinalIgnoreCase) || args[0].Equals("getlock", StringComparison.OrdinalIgnoreCase))
+                        command = "get-lock";
+                    else if (args[0].Equals("set-lock", StringComparison.OrdinalIgnoreCase) || args[0].Equals("setlock", StringComparison.OrdinalIgnoreCase))
+                        command = "set-lock";
                     else if (args[0].Equals("create-folder", StringComparison.OrdinalIgnoreCase))
                         command = "create";
                     else if (args[0].Equals("createfolder", StringComparison.OrdinalIgnoreCase))
@@ -74,35 +80,60 @@ namespace Duplicati.CommandLine.BackendTool
                 }
 
 
-                if (args.Count < 2 || String.Equals(args[0], "help", StringComparison.OrdinalIgnoreCase) || args[0] == "?" || command == null)
+                if (args.Count < 2 || HelpOptionExtensions.IsArgumentAnyHelpString(args) || command == null)
                 {
                     if (command == null && args.Count >= 2)
                     {
                         Console.WriteLine("Unsupported command: {0}", args[0]);
                         Console.WriteLine();
-                    }   
-                    
-                    Console.WriteLine("Usage: <command> <protocol>://<username>:<password>@<path> [filename]");
+                    }
+
+                    Console.WriteLine("Usage: <command> <protocol>://<username>:<password>@<path> [filename] [lock-duration]");
                     Console.WriteLine("Example: LIST ftp://user:pass@server/folder");
                     Console.WriteLine();
                     Console.WriteLine("Supported backends: " + string.Join(",", Duplicati.Library.DynamicLoader.BackendLoader.Keys));
-                    Console.WriteLine("Supported commands: GET PUT LIST DELETE CREATEFOLDER");
+                    Console.WriteLine("Supported commands: GET PUT LIST DELETE CREATEFOLDER GET-LOCK SET-LOCK");
+                    Console.WriteLine();
+                    Console.WriteLine("GET-LOCK requires a filename argument and prints the object lock expiration in ISO 8601 UTC (or 'null' if unset/unknown)");
+                    Console.WriteLine("SET-LOCK requires a filename and a lock duration timespan (e.g. 30D or 12h)");
 
                     return 200;
                 }
-                
-                using(var backend = Library.DynamicLoader.BackendLoader.GetBackend(args[1], options))
+
+                var modules = (from n in Library.DynamicLoader.GenericLoader.Modules
+                               where n is Library.Interface.IConnectionModule
+                               select n).ToArray();
+
+                var uri = new Library.Utility.RelaxedUri(args[1]);
+                var qp = uri.QueryParameters;
+
+                var backendOpts = new Dictionary<string, string>();
+                foreach (var k in qp.Keys.Cast<string>())
+                    backendOpts[k] = qp[k];
+
+                foreach (var k in backendOpts.Keys)
+                {
+                    options.Remove(k);
+                }
+
+                foreach (var n in modules)
+                {
+                    n.Configure(options);
+                    n.Configure(backendOpts);
+                }
+
+                using (var backend = Library.DynamicLoader.BackendLoader.GetBackend(args[1], options))
                 {
                     if (backend == null)
                         throw new UserInformationException("Backend not supported", "InvalidBackend");
-                        
+
                     if (command == "list")
                     {
                         if (args.Count != 2)
                             throw new UserInformationException(string.Format("too many arguments: {0}", string.Join(",", args)), "BackendToolTooManyArguments");
                         Console.WriteLine("{0}\t{1}\t{2}\t{3}", "Name", "Dir/File", "LastChange", "Size");
-                    
-                        foreach(var e in backend.List())
+
+                        foreach (var e in backend.ListAsync(CancellationToken.None).ToBlockingEnumerable())
                             Console.WriteLine("{0}\t{1}\t{2}\t{3}", e.Name, e.IsFolder ? "Dir" : "File", e.LastModification, e.Size < 0 ? "" : Library.Utility.Utility.FormatSizeString(e.Size));
 
                         return 0;
@@ -112,8 +143,8 @@ namespace Duplicati.CommandLine.BackendTool
                         if (args.Count != 2)
                             throw new UserInformationException(string.Format("too many arguments: {0}", string.Join(",", args)), "BackendToolTooManyArguments");
 
-                        backend.CreateFolder();
-                        
+                        backend.CreateFolderAsync(CancellationToken.None).Await();
+
                         return 0;
                     }
                     else if (command == "delete")
@@ -122,8 +153,8 @@ namespace Duplicati.CommandLine.BackendTool
                             throw new UserInformationException("DELETE requires a filename argument", "BackendToolDeleteRequiresAnArgument");
                         if (args.Count > 3)
                             throw new Exception(string.Format("too many arguments: {0}", string.Join(",", args)));
-                        backend.Delete(Path.GetFileName(args[2]));
-                        
+                        backend.DeleteAsync(Path.GetFileName(args[2]), CancellationToken.None).Await();
+
                         return 0;
                     }
                     else if (command == "get")
@@ -134,25 +165,69 @@ namespace Duplicati.CommandLine.BackendTool
                             throw new UserInformationException(string.Format("too many arguments: {0}", string.Join(",", args)), "BackendToolTooManyArguments");
                         if (File.Exists(args[2]))
                             throw new UserInformationException("File already exists, not overwriting!", "BackendToolFileAlreadyExists");
-                        backend.Get(Path.GetFileName(args[2]), args[2]);
-                        
+                        backend.GetAsync(Path.GetFileName(args[2]), args[2], CancellationToken.None).Await();
+
                         return 0;
                     }
                     else if (command == "put")
                     {
                         if (args.Count < 3)
-                            throw new UserInformationException("PUT requires a filename argument","BackendToolPutRequiresAndArgument");
+                            throw new UserInformationException("PUT requires a filename argument", "BackendToolPutRequiresAndArgument");
                         if (args.Count > 3)
                             throw new UserInformationException(string.Format("too many arguments: {0}", string.Join(",", args)), "BackendToolTooManyArguments");
-                           
-                        backend.PutAsync(Path.GetFileName(args[2]), args[2], CancellationToken.None).Wait();
-                        
+
+                        backend.PutAsync(Path.GetFileName(args[2]), args[2], CancellationToken.None).Await();
+
                         return 0;
                     }
-                    
+                    else if (command == "get-lock")
+                    {
+                        if (args.Count < 3)
+                            throw new UserInformationException("GET-LOCK requires a filename argument", "BackendToolGetLockRequiresAnArgument");
+                        if (args.Count > 3)
+                            throw new UserInformationException(string.Format("too many arguments: {0}", string.Join(",", args)), "BackendToolTooManyArguments");
+
+                        if (backend is not ILockingBackend lockingBackend)
+                            throw new ObjectLockNotSupportedException();
+
+                        var lockUntilUtc = lockingBackend.GetObjectLockUntilAsync(Path.GetFileName(args[2]), CancellationToken.None).Await();
+                        Console.WriteLine(lockUntilUtc.HasValue
+                            ? lockUntilUtc.Value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
+                            : "null");
+
+                        return 0;
+                    }
+                    else if (command == "set-lock")
+                    {
+                        if (args.Count < 4)
+                            throw new UserInformationException("SET-LOCK requires a filename and a lock duration argument", "BackendToolSetLockRequiresArguments");
+                        if (args.Count > 4)
+                            throw new UserInformationException(string.Format("too many arguments: {0}", string.Join(",", args)), "BackendToolTooManyArguments");
+
+                        if (backend is not ILockingBackend lockingBackend)
+                            throw new ObjectLockNotSupportedException();
+
+                        TimeSpan lockDuration;
+                        try
+                        {
+                            lockDuration = Timeparser.ParseTimeSpan(args[3]);
+                        }
+                        catch (Exception ex)
+                        {
+                            throw new UserInformationException($"Invalid lock duration: {ex.Message}", "BackendToolInvalidLockTimespan");
+                        }
+
+                        if (lockDuration < TimeSpan.Zero)
+                            throw new UserInformationException("Lock duration must not be negative", "BackendToolNegativeLockTimespan");
+
+                        var lockUntilUtc = DateTime.UtcNow.Add(lockDuration);
+                        lockingBackend.SetObjectLockUntilAsync(Path.GetFileName(args[2]), lockUntilUtc, CancellationToken.None).Await();
+
+                        return 0;
+                    }
+
                     throw new Exception("Internal error");
                 }
-                
             }
             catch (Exception ex)
             {

@@ -1,0 +1,76 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using CoCoL;
+using Duplicati.Library.Main.Volumes;
+using Duplicati.Library.Utility;
+
+namespace Duplicati.Library.Main.Operation.Restore
+{
+
+    /// <summary>
+    /// Named channels for the restore operation.
+    /// </summary>
+    internal class Channels(Options options)
+    {
+        /// <summary>
+        /// Channel between <see cref="FileLister"/> and <see cref="FileProcessor"/>.
+        /// </summary>
+        public readonly IChannel<FileRequest> FilesToRestore = ChannelManager.CreateChannel<FileRequest>(buffersize: 0 /* CoCoL deadlocks on retire if this is not zero */);
+
+        /// <summary>
+        /// Channel between <see cref="VolumeManager"/> and <see cref="VolumeDownloader"/>.
+        /// </summary>
+        public readonly IChannel<long> DownloadRequest = ChannelManager.CreateChannel<long>(buffersize: options.RestoreChannelBufferSize);
+
+        /// <summary>
+        /// Channel between <see cref="VolumeDownloader"/> and <see cref="VolumeDecryptor"/>
+        /// </summary>
+        public readonly IChannel<(long, string, TempFile)> DecryptRequest = ChannelManager.CreateChannel<(long, string, TempFile)>(buffersize: options.RestoreChannelBufferSize);
+
+        /// <summary>
+        /// Channel between <see cref="BlockManager"/> and <see cref="VolumeManager"/> to keep track of volumes that are actively being read.
+        ///
+        /// Size is computed as '2 * options.RestoreChannelBufferSize + options.RestoreVolumeDecompressors + 1' to avoid deadlocks.
+        /// </summary>
+        public readonly IChannel<long> DecompressionAck = ChannelManager.CreateChannel<long>(buffersize: 2 * options.RestoreChannelBufferSize + options.RestoreVolumeDecompressors + 1);
+
+        /// <summary>
+        /// Channel between <see cref="VolumeManager"/> and <see cref="VolumeDecompressor"/>
+        /// </summary>
+        public readonly IChannel<(BlockRequest, VolumeWrapper)> DecompressionRequest = ChannelManager.CreateChannel<(BlockRequest, VolumeWrapper)>(buffersize: options.RestoreChannelBufferSize);
+
+        /// <summary>
+        /// Channel between <see cref="VolumeDecompressor"/> and <see cref="BlockManager"/> holding the decompressed blocks.
+        /// </summary>
+        public readonly IChannel<(BlockRequest, DataBlock)> DecompressedBlock = ChannelManager.CreateChannel<(BlockRequest, DataBlock)>(buffersize: options.RestoreChannelBufferSize);
+
+        /// <summary>
+        /// Channel between <see cref="VolumeManager"/> <see cref="VolumeDecryptor"/>, used for requesting and responding volumes to the manager.
+        /// </summary>
+        public readonly IChannel<object> VolumeResponse = ChannelManager.CreateChannel<object>(buffersize: options.RestoreChannelBufferSize);
+        /// <summary>
+        /// Channel between <see cref="VolumeManager"/> and <see cref="BlockManager"/>, used for requesting and responding volumes to the manager.
+        /// </summary>
+        public readonly IChannel<object> VolumeRequest = ChannelManager.CreateChannel<object>(buffersize: options.RestoreChannelBufferSize);
+    }
+
+}

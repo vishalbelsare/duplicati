@@ -1,0 +1,250 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+using System;
+using System.Buffers;
+using System.Threading;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Main.Volumes;
+using Duplicati.Library.Utility;
+
+#nullable enable
+
+namespace Duplicati.Library.Main.Operation.Restore
+{
+
+    /// <summary>
+    /// Helper for telling a requested shutdown apart from a genuine failure in the restore
+    /// process network.
+    /// </summary>
+    internal static class RestoreCancellation
+    {
+        /// <summary>
+        /// Returns whether the restore is winding down because it was asked to, rather than
+        /// because something failed. Covers both an abort and an orderly stop.
+        /// </summary>
+        /// <param name="taskReader">The task reader whose tokens to consult.</param>
+        /// <returns><c>true</c> if the shutdown was requested.</returns>
+        /// <remarks>
+        /// The tokens are consulted rather than the exception type. A cancellation is not
+        /// identifiable from its exception: <see cref="System.Net.Http.HttpClient"/> reports its
+        /// own request timeouts as <see cref="System.Threading.Tasks.TaskCanceledException"/>, so
+        /// keying off the type would silently reclassify real backend timeouts as a requested
+        /// shutdown. Consulting the token instead follows the existing precedent in
+        /// <c>BackendManager.Handler</c>.
+        ///
+        /// <see cref="Common.ITaskReader.StopToken"/> is consulted because a stop leaves the same
+        /// traces an abort does. It stops the restore with work outstanding, so the invariant
+        /// checks in <c>BlockManager</c> see leftovers; and a download that had already failed
+        /// once is cancelled rather than retried by <c>BackendManager</c>, which is not evidence
+        /// that the backup is broken.
+        /// </remarks>
+        public static bool IsShutdownRequested(Common.ITaskReader taskReader)
+            => taskReader.ProgressToken.IsCancellationRequested
+                || taskReader.TransferToken.IsCancellationRequested
+                || taskReader.StopToken.IsCancellationRequested;
+    }
+
+    /// <summary>
+    /// Represents the type of block request.
+    /// </summary>
+    public enum BlockRequestType
+    {
+        Download, // Request to download a block
+        CacheEvict, // Request to evict a block from cache
+    }
+
+    /// <summary>
+    /// Represents a block of data where the byte[] buffer is returned to the ArrayPool when the DataBlock is finalized.
+    /// </summary>
+    public class DataBlock(byte[] data) : IDisposable
+    {
+        /// <summary>
+        /// The data buffer for this block. This buffer is returned to the ArrayPool when the DataBlock is finalized, which will make this field null.
+        /// </summary>
+        public byte[]? Data = data;
+
+        /// <summary>
+        /// The reference count for this DataBlock. When the reference count reaches zero, the byte[] buffer is returned to the ArrayPool.
+        /// </summary>
+        private int references = 1;
+
+        /// <summary>
+        /// References this DataBlock, incrementing the reference count.
+        /// </summary>
+        /// <remarks>The method returns the DataBlock instance for `using` statements.</remarks>
+        /// <returns>This DataBlock instance.</returns>
+        public DataBlock Reference(int count = 1)
+        {
+            Interlocked.Add(ref references, count);
+            return this;
+        }
+
+        public void Dispose()
+        {
+            Dereference();
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Dereferences this DataBlock, returning the byte[] buffer to the ArrayPool if the reference count reaches zero.
+        /// </summary>
+        /// <returns>true if the buffer was returned to the ArrayPool; otherwise, false.</returns>
+        private void Dereference()
+        {
+            if (Interlocked.Decrement(ref references) == 0)
+            {
+                if (Data != null)
+                {
+                    ArrayPool<byte>.Shared.Return(Data);
+                    Data = null;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Represents a block of data where the byte[] buffer is returned to the ArrayPool when the DataBlock is finalized.
+    /// </summary>
+    public class VolumeWrapper(TempFile file, BlockVolumeReader reader) : IDisposable
+    {
+        /// <summary>
+        /// The TempFile for this volume.
+        /// </summary>
+        private TempFile? File = file;
+
+        /// <summary>
+        /// The BlockVolumeReader for this volume.
+        /// </summary>
+        public BlockVolumeReader? Reader = reader;
+
+        /// <summary>
+        /// The size of the volume file in bytes.
+        /// </summary>
+        public long Size { init; get; } = new System.IO.FileInfo(file).Length;
+
+        /// <summary>
+        /// The reference count for this DataBlock. When the reference count reaches zero, the byte[] buffer is returned to the ArrayPool.
+        /// </summary>
+        private int references = 1;
+
+        /// <summary>
+        /// References this DataBlock, incrementing the reference count.
+        /// </summary>
+        /// <remarks>The method returns the DataBlock instance for `using` statements.</remarks>
+        /// <returns>This DataBlock instance.</returns>
+        public VolumeWrapper Reference(int count = 1)
+        {
+            Interlocked.Add(ref references, count);
+            return this;
+        }
+
+        public void Dispose()
+        {
+            Dereference();
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Dereferences this DataBlock, returning the byte[] buffer to the ArrayPool if the reference count reaches zero.
+        /// </summary>
+        /// <returns>true if the buffer was returned to the ArrayPool; otherwise, false.</returns>
+        private void Dereference()
+        {
+            if (Interlocked.Decrement(ref references) == 0)
+            {
+                Reader?.Dispose();
+                Reader = null;
+                File?.Dispose();
+                File = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Represents a block request that the `VolumeDownloader` process will use to download a block from the backend.
+    /// </summary>
+    /// <param name="blockID">The block ID in the database.</param>
+    /// <param name="blockOffset">The offset in blocks this block represents in the target file.</param>
+    /// <param name="blockHash">The hash of the block.</param>
+    /// <param name="blockSize">The size of the block.</param>
+    /// <param name="volumeID">The ID of the volume in which the block is stored remotely.</param>
+    /// <param name="requestType">The type of request: a download, or a request to decrement the block counter for BlockID (for BlockManager) / evict the VolumeID (for VolumeDownloader).</param>
+    public class BlockRequest(long blockID, long blockOffset, string blockHash, long blockSize, long volumeID, BlockRequestType requestType)
+    { // Total = 81 bytes
+        public long BlockID { get; } = blockID;
+        public long BlockOffset { get; } = blockOffset;
+        public string BlockHash { get; } = blockHash;
+        public long BlockSize { get; } = blockSize;
+        public long VolumeID { get; } = volumeID;
+        public BlockRequestType RequestType { get; set; } = requestType;
+        public DateTime TimestampMilliseconds { get; } = DateTime.Now;
+    }
+
+    /// <summary>
+    /// Represents a file request that the `FileLister` process sends to the `FileProcessor` process.
+    /// </summary>
+    /// <param name="ID">The File ID.</param>
+    /// <param name="OriginalPath">The original path of the file.</param>
+    /// <param name="TargetPath">The target path of the file.</param>
+    /// <param name="Hash">The file hash.</param>
+    /// <param name="Length">The length of the file.</param>
+    /// <param name="BlocksetID">The BlocksetID of the file.</param>
+    /// <param name="HasRestoredEntriesBelow">Whether this request is a symbolic link to a folder with other entries restored below it, such as the files of a source that is itself a link. Such a link is made only after everything else is restored.</param>
+    /// <param name="IsPriorityFile">Whether this is a priority file that should be processed before other files.</param>
+    /// <param name="IsAlternateDataStream">Whether this request is for an alternate data stream that must be restored after its host file/folder.</param>
+    /// <param name="Version">The 0-based backup version index this file is being restored from (0 = newest). Defaults to 0.</param>
+    /// <param name="BackupTimestamp">The timestamp of the backup version this file is being restored from, in UTC. Defaults to <see cref="DateTime.MinValue"/>.</param>
+    public class FileRequest(long ID, string OriginalPath, string TargetPath, string Hash, long Length, long BlocksetID, bool HasRestoredEntriesBelow, bool IsPriorityFile, bool IsAlternateDataStream, long Version, DateTime BackupTimestamp)
+    {
+        public long ID { get; } = ID;
+        public string OriginalPath { get; } = OriginalPath;
+        public string TargetPath { get; } = TargetPath;
+        public string Hash { get; } = Hash;
+        public long Length { get; } = Length;
+        public long BlocksetID { get; } = BlocksetID;
+        public bool HasRestoredEntriesBelow { get; } = HasRestoredEntriesBelow;
+        public bool IsPriorityFile { get; } = IsPriorityFile;
+        public bool IsAlternateDataStream { get; } = IsAlternateDataStream;
+        /// <summary>
+        /// The 0-based backup version index this file is being restored from (0 = newest).
+        /// Used to report the version to <see cref="IRestoreCallbackModule"/> modules.
+        /// </summary>
+        public long Version { get; } = Version;
+        /// <summary>
+        /// The timestamp of the backup version this file is being restored from, in UTC.
+        /// Used to report the backup timestamp to <see cref="IRestoreCallbackModule"/> modules.
+        /// </summary>
+        public DateTime BackupTimestamp { get; } = BackupTimestamp;
+
+        /// <summary>
+        /// Returns a copy of this <see cref="FileRequest"/> with the <see cref="Version"/>
+        /// and <see cref="BackupTimestamp"/> fields set to the supplied values, keeping all
+        /// other fields unchanged.
+        /// </summary>
+        /// <param name="version">The 0-based backup version index to set.</param>
+        /// <param name="backupTimestamp">The backup version timestamp (UTC) to set.</param>
+        /// <returns>A copy of this request with the version and backup timestamp updated.</returns>
+        public FileRequest WithVersion(long version, DateTime backupTimestamp)
+            => new FileRequest(ID, OriginalPath, TargetPath, Hash, Length, BlocksetID, HasRestoredEntriesBelow, IsPriorityFile, IsAlternateDataStream, version, backupTimestamp);
+    }
+
+}

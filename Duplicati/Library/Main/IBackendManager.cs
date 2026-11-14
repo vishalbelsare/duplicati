@@ -1,0 +1,293 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Duplicati.Library.Interface;
+using Duplicati.Library.Main.Database;
+using Duplicati.Library.Main.Volumes;
+using Duplicati.Library.Utility;
+using IFileEntry = Duplicati.Library.Interface.IFileEntry;
+
+#nullable enable
+
+namespace Duplicati.Library.Main;
+
+/// <summary>
+/// Interface for the backend manager
+/// </summary>
+internal interface IBackendManager : IDisposable
+{
+    /// <summary>
+    /// Uploads a block volume to the backend, including an optional index volume
+    /// </summary>
+    /// <param name="blockVolume">The block volume to upload</param>
+    /// <param name="indexVolume">The index volume to upload, if any</param>
+    /// <param name="indexVolumeFinished">The action to call when the index volume is finished</param>
+    /// <param name="waitForComplete">Whether to wait for the upload to complete</param>
+    /// <param name="onDbUpdate">The action to call when the database should be updated</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task PutAsync(VolumeWriterBase blockVolume, IndexVolumeWriter? indexVolume, Func<Task>? indexVolumeFinished, bool waitForComplete, Func<Task>? onDbUpdate, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Uploads a file to the backend without encryption
+    /// </summary>
+    /// <param name="remotename">The name of the file to upload to</param>
+    /// <param name="tempFile">The file to upload</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task PutFileUnencryptedAsync(string remotename, TempFile tempFile, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Uploads a file to the backend without encryption, treating the remote name
+    /// as a relative path that may contain sub-folders. For backends without folder
+    /// support the path is split so the upload targets the sub-folder; folder-enabled
+    /// backends receive the path unchanged.
+    /// </summary>
+    /// <param name="remotename">The relative path of the file to upload to, which may contain sub-folders</param>
+    /// <param name="tempFile">The file to upload</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Uploads a file like <see cref="PutFileUnencryptedWithPathAsync(string, TempFile, CancellationToken)"/>,
+    /// and records the given modification time on a backend that supports it.
+    /// </summary>
+    /// <param name="remotename">The relative path of the file to upload to, which may contain sub-folders</param>
+    /// <param name="tempFile">The file to upload</param>
+    /// <param name="lastModifiedUtc">The modification time to record, or null to leave it to the backend</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task PutFileUnencryptedWithPathAsync(string remotename, TempFile tempFile, DateTime? lastModifiedUtc, CancellationToken cancelToken)
+        => PutFileUnencryptedWithPathAsync(remotename, tempFile, cancelToken);
+
+    /// <summary>
+    /// Waits for the backend queue to be empty
+    /// </summary>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task WaitForEmptyAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Waits for the backend queue to be empty and flushes any pending messages to the database
+    /// </summary>
+    /// <param name="database">The database to write pending messages to</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task WaitForEmptyAsync(IBackendManagerDatabase database, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Lists the files on the backend at the specified path
+    /// </summary>
+    /// <param name="path">The path to list, or null for the root folder</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An enumerable of file entries</returns>
+    Task<IEnumerable<IFileEntry>> ListAsync(string? path, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Ensures the folder at the specified relative path exists on the backend,
+    /// creating it (and any missing ancestors as required by the backend) if needed.
+    /// A <c>null</c> or empty path targets the backend root. Callers that upload a
+    /// file into a sub-folder should invoke this first so the destination folder is
+    /// present, since backends are no longer expected to create missing parent
+    /// folders themselves during a put.
+    /// </summary>
+    /// <param name="path">The relative path of the folder to ensure, or null/empty for the backend root.</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task EnsureFolderAsync(string? path, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Decrypts the given file and returns the decrypted file
+    /// </summary>
+    /// <param name="volume">The file to decrypt</param>
+    /// <param name="volume_name">The name of the file. Used for detecting encryption algorithm if not specified in options or if it differs from the options</param>
+    /// <param name="options">The Duplicati options</param>
+    /// <param name="dispose">True if the input file should be disposed after decryption</param>
+    /// <returns>The decrypted file</returns>
+    TempFile DecryptFile(TempFile volume, string volume_name, Options options, bool dispose);
+
+    /// <summary>
+    /// Deletes a file on the backend
+    /// </summary>
+    /// <param name="remotename">The name of the file to delete</param>
+    /// <param name="size">The size of the file to delete, or -1 if not known</param>
+    /// <param name="waitForComplete">Whether to wait for the delete to complete</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task DeleteAsync(string remotename, long size, bool waitForComplete, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Deletes a file on the backend, treating the remote name as a relative path
+    /// that may contain sub-folders. For backends without folder support the path
+    /// is split so the delete targets the sub-folder; folder-enabled backends
+    /// receive the path unchanged.
+    /// </summary>
+    /// <param name="remotename">The relative path of the file to delete, which may contain sub-folders</param>
+    /// <param name="size">The size of the file to delete, or -1 if not known</param>
+    /// <param name="waitForComplete">Whether to wait for the delete to complete</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task DeleteWithPathAsync(string remotename, long size, bool waitForComplete, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Applies or updates an object lock on a remote volume.
+    /// </summary>
+    /// <param name="remotename">The name of the file to lock</param>
+    /// <param name="lockUntilUtc">The UTC time the lock should be in effect until</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    Task SetObjectLockUntilAsync(string remotename, DateTime lockUntilUtc, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Gets the object lock expiration time for a remote volume.
+    /// </summary>
+    /// <param name="remotename">The name of the file to check</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The UTC time the lock expires, or null if no lock is set</returns>
+    Task<DateTime?> GetObjectLockUntilAsync(string remotename, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Gets the quota information for the backend
+    /// </summary>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The quota information, or null if not available or disabled</returns>
+    Task<IQuotaInfo?> GetQuotaInfoAsync(CancellationToken cancelToken);
+
+    /// <summary>
+    /// Gets a file with the hash and size
+    /// </summary>
+    /// <param name="remotename">The name of the file to get</param>
+    /// <param name="hash">The hash of the file to get, or <c>null</c> if not known</param>
+    /// <param name="size">The size of the file to get, or -1 if not known</param>
+    /// <param name="allowParityRepair">Whether a failed download may be repaired using parity data. Disable for the test/verification flow so damaged files are reported.</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The file, hash, and size</returns>
+    Task<(TempFile File, string Hash, long Size)> GetWithInfoAsync(string remotename, string hash, long size, bool allowParityRepair, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Gets a file from the backend
+    /// </summary>
+    /// <param name="remotename">The name of the file to get</param>
+    /// <param name="hash">The hash of the file to get, or <c>null</c> if not known</param>
+    /// <param name="size">The size of the file to get, or -1 if not known</param>
+    /// <param name="allowParityRepair">Whether a failed download may be repaired using parity data. Disable for the test/verification flow so damaged files are reported.</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The downloaded file</returns>
+    Task<TempFile> GetAsync(string remotename, string hash, long size, bool allowParityRepair, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Gets a file from the backend without decrypting it
+    /// </summary>
+    /// <param name="remotename">The name of the remote volume</param>
+    /// <param name="hash">The hash of the volume</param>
+    /// <param name="size">The size of the volume</param>
+    /// <param name="allowParityRepair">Whether a failed download may be repaired using parity data. Disable for the test/verification flow so damaged files are reported.</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The downloaded file</returns>
+    Task<TempFile> GetDirectAsync(string remotename, string hash, long size, bool allowParityRepair, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Performs a download of the files specified, with pre-fetch to overlap the download and processing
+    /// </summary>
+    /// <param name="volumes">The volumes to download</param>
+    /// <param name="allowParityRepair">Whether a failed download may be repaired using parity data. Disable for the test/verification flow so damaged files are reported.</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The downloaded files, hash, size, and name</returns>
+    IAsyncEnumerable<(TempFile File, string Hash, long Size, string Name)> GetFilesOverlappedAsync(IEnumerable<IRemoteVolume> volumes, bool allowParityRepair, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Performs a direct download of the files specified, with pre-fetch to overlap the download and processing
+    /// </summary>
+    /// <param name="volumes">The volumes to download</param>
+    /// <param name="allowParityRepair">Whether a failed download may be repaired using parity data. Disable for the test/verification flow so damaged files are reported.</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The downloaded files and the volume they came from</returns>
+    IAsyncEnumerable<(TempFile File, string Name)> GetFilesOverlappedDirectAsync(IEnumerable<IRemoteVolume> volumes, bool allowParityRepair, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Flushes the database messages to the database
+    /// </summary>
+    /// <param name="database">The database to write to</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <returns></returns>
+    Task FlushPendingMessagesAsync(IBackendManagerDatabase database, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Updates the throttle values for upload and download
+    /// </summary>
+    /// <param name="maxUploadPrSecond">The maximum upload speed in bytes per second</param>
+    /// <param name="maxDownloadPrSecond">The maximum download speed in bytes per second</param>
+    void UpdateThrottleValues(long maxUploadPrSecond, long maxDownloadPrSecond);
+
+    /// <summary>
+    /// Indicates whether the backend supports object locking operations.
+    /// </summary>
+    bool SupportsObjectLocking { get; }
+
+    /// <summary>
+    /// Downloads a file without decrypting it, treating the remote name as a relative
+    /// path that may contain sub-folders (the same translation as
+    /// <see cref="PutFileUnencryptedWithPathAsync"/>). No hash or size is checked.
+    /// </summary>
+    /// <param name="remotename">The relative path of the remote file</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>The downloaded file</returns>
+    Task<TempFile> GetFileUnencryptedWithPathAsync(string remotename, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Indicates whether the backend can create hard links between relative paths
+    /// (see <see cref="ILinkEnabledBackend"/>). A destination filesystem may still
+    /// refuse, in which case <see cref="CreateHardLinkAsync"/> throws
+    /// <see cref="HardLinkNotSupportedException"/>.
+    /// </summary>
+    bool SupportsHardLinks { get; }
+
+    /// <summary>
+    /// Indicates whether the backend can delete a folder and everything below it in one
+    /// call (see <see cref="IFolderDeleteEnabledBackend"/>).
+    /// </summary>
+    bool SupportsFolderDelete { get; }
+
+    /// <summary>
+    /// Creates a hard link at <paramref name="targetPath"/> to the existing remote file
+    /// <paramref name="existingPath"/>. Both are relative paths that may contain sub-folders.
+    /// </summary>
+    /// <param name="existingPath">The relative path of the existing remote file</param>
+    /// <param name="targetPath">The relative path of the link to create</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    /// <exception cref="HardLinkNotSupportedException">The backend or the destination cannot create hard links</exception>
+    Task CreateHardLinkAsync(string existingPath, string targetPath, CancellationToken cancelToken);
+
+    /// <summary>
+    /// Deletes a remote folder and everything below it. Only valid when
+    /// <see cref="SupportsFolderDelete"/> is true.
+    /// </summary>
+    /// <param name="path">The relative path of the folder; must not be empty</param>
+    /// <param name="cancelToken">The cancellation token</param>
+    /// <returns>An awaitable task</returns>
+    Task DeleteFolderRecursiveAsync(string path, CancellationToken cancelToken);
+
+}

@@ -1,0 +1,454 @@
+// Copyright (C) 2026, The Duplicati Team
+// https://duplicati.com, hello@duplicati.com
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in 
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS 
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+// DEALINGS IN THE SOFTWARE.
+using Duplicati.Server.Serialization.Interface;
+
+namespace Duplicati.WebserverCore.Dto;
+
+public sealed record SystemInfoDto
+{
+    /// <summary>
+    /// Gets or sets the API version.
+    /// </summary>
+    public required int APIVersion { get; init; }
+
+    /// <summary>
+    /// Gets or sets the password placeholder.
+    /// </summary>
+    public required string PasswordPlaceholder { get; init; }
+
+    /// <summary>
+    /// Gets or sets the server version.
+    /// </summary>
+    public required string? ServerVersion { get; init; }
+
+    /// <summary>
+    /// Gets or sets the server version name.
+    /// </summary>
+    public required string ServerVersionName { get; init; }
+
+    /// <summary>
+    /// Gets or sets the server version type.
+    /// </summary>
+    public required string? ServerVersionType { get; init; }
+
+    /// <summary>
+    /// The default URL to present for remote control registration
+    /// </summary>
+    public required string RemoteControlRegistrationUrl { get; init; }
+
+    /// <summary>
+    /// The default URL to present for remote control dashboard
+    /// </summary>
+    public required string RemoteControlDashboardUrl { get; init; }
+
+    /// <summary>
+    /// Gets or sets the started by.
+    /// </summary>
+    public required string StartedBy { get; init; }
+
+    /// <summary>
+    /// Gets or sets the default update channel.
+    /// </summary>
+    public required string DefaultUpdateChannel { get; init; }
+
+    /// <summary>
+    /// Gets or sets the default usage report level.
+    /// </summary>
+    public required string DefaultUsageReportLevel { get; init; }
+
+    /// <summary>
+    /// Gets or sets the server time.
+    /// </summary>
+    public required DateTime ServerTime { get; init; }
+
+    /// <summary>
+    /// Gets or sets the server time zone.
+    /// </summary>
+    public required string ServerTimeZone { get; init; }
+
+    /// <summary>
+    /// Gets or sets the OS type.
+    /// </summary>
+    public required string OSType { get; init; }
+
+    /// <summary>
+    /// Gets or sets the OS version.
+    /// </summary>
+    public required string OSVersion { get; init; }
+
+    /// <summary>
+    /// Gets or sets the directory separator.
+    /// </summary>
+    public required char DirectorySeparator { get; init; }
+
+    /// <summary>
+    /// Gets or sets the path separator.
+    /// </summary>
+    public required char PathSeparator { get; init; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the filesystem is case sensitive.
+    /// </summary>
+    public required bool CaseSensitiveFilesystem { get; init; }
+
+    /// <summary>
+    /// Gets or sets the machine name.
+    /// </summary>
+    public required string MachineName { get; init; }
+
+    /// <summary>
+    /// Gets or sets the package type ID.
+    /// </summary>
+    public required string PackageTypeId { get; init; }
+
+    /// <summary>
+    /// Gets or sets the name of the entry assembly, i.e. the executable that hosts the server.
+    /// </summary>
+    public required string EntryAssembly { get; init; }
+
+    /// <summary>
+    /// Gets or sets the installation folder, i.e. the folder holding the entry assembly.
+    /// </summary>
+    public required string InstallationFolder { get; init; }
+
+    /// <summary>
+    /// Gets or sets the data folder used by the server.
+    /// </summary>
+    public required string DataFolder { get; init; }
+
+    /// <summary>
+    /// True if updates can be installed automatically on this installation
+    /// </summary>
+    public required bool UpdateInstallSupported { get; init; }
+
+    /// <summary>
+    /// The reason automatic installation is not available, when it is not
+    /// </summary>
+    public required string? UpdateInstallUnsupportedReason { get; init; }
+
+    /// <summary>
+    /// Gets or sets the user name.
+    /// </summary>
+    public required string UserName { get; init; }
+
+    /// <summary>
+    /// Gets or sets the new line character.
+    /// </summary>
+    public required string NewLine { get; init; }
+
+    /// <summary>
+    /// Gets or sets the CLR version.
+    /// </summary>
+    public required string CLRVersion { get; init; }
+
+    /// <summary>
+    /// Gets or sets the options.
+    /// </summary>
+    public required IEnumerable<Library.Interface.ICommandLineArgument> Options { get; init; }
+
+    /// <summary>
+    /// Gets or sets the server-only options.
+    /// </summary>
+    public required IEnumerable<Library.Interface.ICommandLineArgument> ServerOnlyOptions { get; init; }
+
+    /// <summary>
+    /// Gets or sets the compression modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> CompressionModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the encryption modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> EncryptionModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the backend modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> BackendModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the generic modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> GenericModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the web modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> WebModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the connection modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> ConnectionModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the source provider modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> SourceProviderModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the restore destination provider modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> RestoreDestinationProviderModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the server modules.
+    /// </summary>
+    public required IEnumerable<object> ServerModules { get; init; }
+
+    /// <summary>
+    /// Gets or sets the secret provider modules.
+    /// </summary>
+    public required IEnumerable<IDynamicModule> SecretProviderModules { get; init; }
+
+    /// <summary>
+    /// Describes a secret provider in use by this process.
+    /// </summary>
+    public sealed class SecretProviderDto
+    {
+        /// <summary>
+        /// The module key, i.e. the URL scheme such as "hcv" or "keychain".
+        /// </summary>
+        public required string Key { get; init; }
+
+        /// <summary>
+        /// The human readable module name.
+        /// </summary>
+        public required string DisplayName { get; init; }
+
+        /// <summary>
+        /// Whether the provider can store secrets.
+        /// </summary>
+        public required bool IsSetSupported { get; init; }
+
+        /// <summary>
+        /// The caching level in effect: None, InMemory or Persistent.
+        /// Null for providers that do not resolve option secrets.
+        /// </summary>
+        public required string? CachingLevel { get; init; }
+
+        /// <summary>
+        /// The prefix used to recognise secret references, usually "$".
+        /// Null for providers that do not resolve option secrets.
+        /// </summary>
+        public required string? Pattern { get; init; }
+    }
+
+    /// <summary>
+    /// The secret provider that resolves secrets in options and URLs, or null when none is configured.
+    /// </summary>
+    public required SecretProviderDto? ActiveSecretProvider { get; init; }
+
+    /// <summary>
+    /// The default secret provider that stores and retrieves the settings encryption key,
+    /// or null when disabled or unavailable on this system.
+    /// </summary>
+    public required SecretProviderDto? DefaultSecretProvider { get; init; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether alternate update URLs are being used.
+    /// </summary>
+    public required bool UsingAlternateUpdateURLs { get; init; }
+
+    /// <summary>
+    /// Gets or sets the log levels.
+    /// </summary>
+    public required string[] LogLevels { get; init; }
+
+    /// <summary>
+    /// Gets or sets the special folders.
+    /// </summary>
+    public required IEnumerable<SpecialFolderDto> SpecialFolders { get; init; }
+
+    /// <summary>
+    /// Gets or sets the browser locale.
+    /// </summary>
+    public required LocaleDto BrowserLocale { get; init; }
+
+    /// <summary>
+    /// Gets or sets the supported locales.
+    /// </summary>
+    public required IEnumerable<LocaleDto> SupportedLocales { get; init; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the browser locale is supported.
+    /// </summary>
+    public required bool BrowserLocaleSupported { get; init; }
+
+    /// <summary>
+    /// The timezones available on the system
+    /// </summary>
+    public required IEnumerable<TimeZoneDto> TimeZones { get; init; }
+
+    /// <summary>
+    /// The API extensions available on the system
+    /// </summary>
+    public required IEnumerable<string> APIExtensions { get; init; }
+
+    /// <summary>
+    /// The API scopes available on the system
+    /// </summary>
+    public required IEnumerable<string> APIScopes { get; init; }
+
+    /// <summary>
+    /// The default OAuth URL for authenticating.
+    /// </summary>
+    public required string DefaultOAuthURL { get; init; }
+    /// <summary>
+    /// The new default OAuth URL for v2 authentication.
+    /// </summary>
+    public required string DefaultOAuthURLv2 { get; init; }
+    /// <summary>
+    /// The supported power mode providers
+    /// </summary>
+    public required IEnumerable<string> PowerModeProviders { get; init; }
+
+    /// <summary>
+    /// Gets or sets the local license status (from file or environment only, not server-provided).
+    /// </summary>
+    public required LicenseStatusDto? LocalLicenseStatus { get; init; }
+
+    /// <summary>
+    /// Gets or sets the remote license status (from server-provided license).
+    /// </summary>
+    public required LicenseStatusDto? RemoteLicenseStatus { get; init; }
+
+    /// <summary>
+    /// Represents the license status information.
+    /// </summary>
+    public class LicenseStatusDto
+    {
+        /// <summary>
+        /// Whether a local license is configured (from file or environment).
+        /// </summary>
+        public required bool IsConfigured { get; init; }
+
+        /// <summary>
+        /// Whether the local license is currently valid.
+        /// </summary>
+        public required bool IsValid { get; init; }
+
+        /// <summary>
+        /// Whether the license is in its grace period (expired but still functional).
+        /// </summary>
+        public required bool IsInGracePeriod { get; init; }
+
+        /// <summary>
+        /// The license expiration date (null if no license configured).
+        /// </summary>
+        public required DateTimeOffset? ExpiresAt { get; init; }
+
+        /// <summary>
+        /// The license expiration date including grace period (null if no license configured).
+        /// </summary>
+        public required DateTimeOffset? ExpiresWithGraceAt { get; init; }
+
+        /// <summary>
+        /// The enabled features from the license.
+        /// </summary>
+        public required Dictionary<string, string>? Features { get; init; }
+
+        /// <summary>
+        /// Maps the license data to a DTO.
+        /// </summary>
+        /// <param name="data">The license data to map.</param>
+        /// <returns>The mapped DTO.</returns>
+        public static LicenseStatusDto Map(Proprietary.LicenseChecker.LicenseData? data)
+            => data != null
+                ? new LicenseStatusDto
+                {
+                    IsConfigured = true,
+                    IsValid = data.IsValidNow,
+                    IsInGracePeriod = data.IsInGracePeriod,
+                    ExpiresAt = data.ValidTo,
+                    ExpiresWithGraceAt = data.ValidToWithGrace,
+                    Features = data.Features
+                }
+                : new LicenseStatusDto
+                {
+                    IsConfigured = false,
+                    IsValid = false,
+                    IsInGracePeriod = false,
+                    ExpiresAt = null,
+                    ExpiresWithGraceAt = null,
+                    Features = null
+                };
+    }
+
+    /// <summary>
+    /// Represents a timezone.
+    /// </summary>
+    public class TimeZoneDto
+    {
+        /// <summary>
+        /// Gets or sets the ID.
+        /// </summary>
+        public required string ID { get; init; }
+
+        /// <summary>
+        /// Gets or sets the display name.
+        /// </summary>
+        public required string DisplayName { get; init; }
+
+        /// <summary>
+        /// Gets or sets the base UTC offset.
+        /// </summary>
+        public required string CurrentUTCOffset { get; init; }
+    }
+
+    /// <summary>
+    /// Represents a special folder.
+    /// </summary>
+    public class SpecialFolderDto
+    {
+        /// <summary>
+        /// Gets or sets the ID.
+        /// </summary>
+        public required string ID { get; init; }
+
+        /// <summary>
+        /// Gets or sets the path.
+        /// </summary>
+        public required string Path { get; init; }
+    }
+
+    /// <summary>
+    /// Represents a locale.
+    /// </summary>
+    public class LocaleDto
+    {
+        /// <summary>
+        /// Gets or sets the code.
+        /// </summary>
+        public required string Code { get; init; }
+
+        /// <summary>
+        /// Gets or sets the English name.
+        /// </summary>
+        public required string EnglishName { get; init; }
+
+        /// <summary>
+        /// Gets or sets the display name.
+        /// </summary>
+        public required string DisplayName { get; init; }
+    }
+}
+

@@ -1,0 +1,54 @@
+// Copyright (c) 2026 Duplicati Inc. All rights reserved.
+
+using Duplicati.Library.Common.IO;
+using Duplicati.Library.Interface;
+using Google.Apis.HangoutsChat.v1.Data;
+using Google.Apis.HangoutsChat.v1;
+using System.Runtime.CompilerServices;
+using Google.Apis.Drive.v3;
+
+namespace Duplicati.Proprietary.GoogleWorkspace.SourceItems;
+
+internal class ChatSpaceSourceEntry(SourceProvider provider, string parentPath, Space space, string userId, string userChatName, HangoutsChatService chatService, DriveService driveService)
+    : MetaEntryBase(Util.AppendDirSeparator(SystemIO.IO_OS.PathCombine(parentPath, space.Name.Split('/').Last())), null, null)
+{
+    public override async IAsyncEnumerable<ISourceProviderEntry> Enumerate([EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        yield return new ChatSpaceContentSourceEntry(this.Path, space);
+
+        var request = chatService.Spaces.Messages.List(space.Name);
+
+        string? nextPageToken = null;
+        do
+        {
+            if (cancellationToken.IsCancellationRequested) yield break;
+            request.PageToken = nextPageToken;
+            var messages = await request.ExecuteAsync(cancellationToken);
+
+            if (messages.Messages != null)
+            {
+                foreach (var message in messages.Messages)
+                {
+                    if (cancellationToken.IsCancellationRequested) yield break;
+                    yield return new ChatMessageSourceEntry(provider, this.Path, message, userChatName, chatService, driveService);
+                }
+            }
+            nextPageToken = messages.NextPageToken;
+        } while (!string.IsNullOrEmpty(nextPageToken));
+    }
+
+    public override Task<Dictionary<string, string?>> GetMinorMetadata(CancellationToken cancellationToken)
+    {
+        return Task.FromResult(new Dictionary<string, string?>
+        {
+            { "gsuite:v", "1" },
+            { "gsuite:Type", SourceItemType.ChatSpace.ToString() },
+            { "gsuite:Name", space.DisplayName ?? space.Name },
+            { "gsuite:Id", space.Name },
+            { "gsuite:UserId", userId },
+            { "gsuite:SpaceType", space.Type },
+        }
+        .Where(kv => !string.IsNullOrEmpty(kv.Value))
+        .ToDictionary(kv => kv.Key, kv => kv.Value));
+    }
+}
